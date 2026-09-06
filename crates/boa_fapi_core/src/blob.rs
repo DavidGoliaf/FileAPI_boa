@@ -1,7 +1,14 @@
 //! Blob data model: segmented immutable byte storage with File API slice semantics.
+//!
+//! The segmentation is an internal representation detail. The public API
+//! exposes only `BlobData` semantics (`size`, `media_type`, `snapshot`,
+//! `segment_count`, `slice`, `concat_shared`, `read_all`) and never hands
+//! out raw segments: [`BlobSegment`] fields are public solely so that
+//! `from_segments` can accept caller-owned segments as *input*.
 
 use std::sync::Arc;
 
+use crate::cancellation::CancellationToken;
 use crate::error::ResourceLimitKind;
 use crate::file_api_error::FileApiError;
 use crate::limits::FileApiLimits;
@@ -126,6 +133,123 @@ impl BlobData {
     /// Returns the number of segments in this blob.
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Appends the segments of `other` to a new blob under `limits`.
+    ///
+    /// This is the sole no-copy composition primitive for bindings: every
+    /// segment of the new blob keeps the shared `Arc` source of `other`,
+    /// so no payload bytes are copied. `media_type` is normalized; size and
+    /// segment-count limits are enforced on the concatenated result.
+    /// Returns `Err` without observable side effects when a limit fails.
+    pub fn concat_shared(
+        &self,
+        other: &Self,
+        media_type: impl AsRef<str>,
+        limits: &FileApiLimits,
+    ) -> Result<Self, FileApiError> {
+        let media_type = normalize_blob_type(media_type.as_ref());
+        let mut segments =
+            Vec::with_capacity(self.segments.len().saturating_add(other.segments.len()));
+        let mut total_size: u64 = 0;
+        for seg in self.segments.iter().chain(other.segments.iter()) {
+            total_size = total_size
+                .checked_add(seg.len)
+                .ok_or(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize))?;
+            segments.push(BlobSegment {
+                source: Arc::clone(&seg.source),
+                offset: seg.offset,
+                len: seg.len,
+            });
+        }
+        if segments.len() > limits.max_segments_after_normalize {
+            return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSegments));
+        }
+        if total_size > limits.max_blob_size {
+            return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize));
+        }
+        Ok(Self {
+            segments,
+            size: total_size,
+            media_type,
+            snapshot: SnapshotState::Memory,
+        })
+    }
+
+    /// Accumulates one more blob part without copying payload bytes.
+    ///
+    /// Zero-copy composition primitive for the JS bindings: re-links the
+    /// shared sources of `other` after the segments of `self`, enforcing
+    /// `limits.max_parts` on the part count, `max_segments_after_normalize`
+    /// on the segment count and `max_blob_size` on the total size.
+    /// `media_type` is normalized. Returning `Err` leaves `self` unchanged,
+    /// so a failing part produces no observable partial blob.
+    pub fn push_shared(
+        &mut self,
+        other: &Self,
+        media_type: impl AsRef<str>,
+        limits: &FileApiLimits,
+        parts: &mut usize,
+    ) -> Result<(), FileApiError> {
+        if *parts >= limits.max_parts {
+            return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobParts));
+        }
+        let combined = self.concat_shared(other, media_type, limits)?;
+        *self = combined;
+        *parts += 1;
+        Ok(())
+    }
+    /// Materializes the blob content without exposing raw segments.
+    ///
+    /// Reads every segment through [`ByteSource::read_range`] in order.
+    /// `cancel` is honoured before each segment read; a cancelled or invalid
+    /// read yields `Err` and no partial result is returned.
+    ///
+    /// Callers must enforce `max_materialize_bytes` themselves: this helper
+    /// performs no limit checks beyond what `read_range` reports.
+    pub fn read_all(&self, cancel: &CancellationToken) -> Result<bytes::Bytes, FileApiError> {
+        use bytes::BytesMut;
+        let mut out = BytesMut::new();
+        for seg in &self.segments {
+            let end = seg
+                .offset
+                .checked_add(seg.len)
+                .ok_or(FileApiError::InvalidRange)?;
+            let chunk = seg.source.read_range(seg.offset..end, cancel)?;
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out.freeze())
+    }
+
+    /// Compares two blobs by source identity, without exposing segments.
+    ///
+    /// Returns `true` when both blobs consist of the same number of segments
+    /// and every pair of segments shares the same `Arc` allocation.
+    /// Offsets and lengths may differ (slices narrow the view into the same
+    /// source). Used by composition tests to prove no payload copy happened.
+    #[must_use]
+    pub fn shares_sources_with(&self, other: &Self) -> bool {
+        if self.segments.len() != other.segments.len() {
+            return false;
+        }
+        self.segments
+            .iter()
+            .zip(other.segments.iter())
+            .all(|(a, b)| Arc::ptr_eq(&a.source, &b.source))
+    }
+
+    /// Returns `true` when the first segment of `self` and `other` share
+    /// the same `Arc` source allocation.
+    ///
+    /// Offsets and lengths may legitimately differ (e.g. a `slice` narrows
+    /// the view into the same source). Used by bindings tests to prove
+    /// zero-copy derivation without exposing raw segments.
+    #[must_use]
+    pub fn first_segment_shares_source_with(&self, other: &Self) -> bool {
+        match (self.segments.first(), other.segments.first()) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a.source, &b.source),
+            _ => false,
+        }
     }
 
     /// Creates a new blob by slicing this blob per File API semantics.
@@ -264,16 +388,7 @@ mod tests {
     }
 
     fn read_blob(blob: &BlobData) -> Vec<u8> {
-        let token = cancel();
-        let mut result = Vec::with_capacity(blob.size as usize);
-        for seg in &blob.segments {
-            result.extend_from_slice(
-                &seg.source
-                    .read_range(seg.offset..seg.offset + seg.len, &token)
-                    .unwrap(),
-            );
-        }
-        result
+        blob.read_all(&cancel()).unwrap().to_vec()
     }
 
     fn make_source(data: &[u8]) -> Arc<dyn ByteSource> {
@@ -663,11 +778,7 @@ mod tests {
         // The sliced blob must share the same Arc allocation as the original
         // source, proving that slice copies no payload data.
         assert_eq!(sliced.segment_count(), 1);
-        assert!(Arc::ptr_eq(&src, &sliced.segments[0].source));
-        assert!(Arc::ptr_eq(
-            &blob.segments[0].source,
-            &sliced.segments[0].source
-        ));
+        assert!(sliced.first_segment_shares_source_with(&blob));
     }
 
     #[test]
@@ -679,6 +790,66 @@ mod tests {
         assert_eq!(sliced.size(), 3);
         assert_eq!(read_blob(&sliced), b"ell");
         assert_eq!(sliced.segment_count(), 1);
+    }
+
+    // ──────────────────────────────────────────────
+    // BlobData::concat_shared (no-copy composition primitive for bindings)
+    // ──────────────────────────────────────────────
+
+    #[test]
+    fn concat_shared_links_and_concatenates_without_copy() {
+        let src1 = make_source(b"hello");
+        let src2 = make_source(b" world");
+        let blob1 = BlobData::from_segments(vec![make_segment(src1, 0, 5)], "", &limits()).unwrap();
+        let blob2 = BlobData::from_segments(vec![make_segment(src2, 0, 6)], "", &limits()).unwrap();
+        let out = blob1.concat_shared(&blob2, "", &limits()).unwrap();
+        assert_eq!(out.size(), 11);
+        assert_eq!(out.segment_count(), 2);
+        assert_eq!(read_blob(&out), b"hello world");
+        assert!(out.shares_sources_with(&blob1.concat_shared(&blob2, "", &limits()).unwrap()));
+        assert!(out.first_segment_shares_source_with(&blob1));
+    }
+
+    #[test]
+    fn concat_shared_enforces_segment_limit() {
+        let mut custom = limits();
+        custom.max_segments_after_normalize = 1;
+        let blob1 =
+            BlobData::from_segments(vec![make_segment(make_source(b"a"), 0, 1)], "", &limits())
+                .unwrap();
+        let blob2 =
+            BlobData::from_segments(vec![make_segment(make_source(b"b"), 0, 1)], "", &limits())
+                .unwrap();
+        assert!(matches!(
+            blob1.concat_shared(&blob2, "", &custom),
+            Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSegments))
+        ));
+    }
+
+    #[test]
+    fn concat_shared_enforces_size_limit() {
+        let mut custom = limits();
+        custom.max_blob_size = 1;
+        let blob1 =
+            BlobData::from_segments(vec![make_segment(make_source(b"a"), 0, 1)], "", &limits())
+                .unwrap();
+        let blob2 =
+            BlobData::from_segments(vec![make_segment(make_source(b"b"), 0, 1)], "", &limits())
+                .unwrap();
+        assert!(matches!(
+            blob1.concat_shared(&blob2, "", &custom),
+            Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize))
+        ));
+    }
+
+    #[test]
+    fn concat_shared_normalizes_media_type() {
+        let blob1 = BlobData::empty("");
+        let blob2 = BlobData::empty("");
+        let out = blob1
+            .concat_shared(&blob2, "TEXT/PLAIN", &limits())
+            .unwrap();
+        assert_eq!(out.media_type(), "text/plain");
     }
 
     // ──────────────────────────────────────────────

@@ -12,11 +12,17 @@ allow = [
     "Apache-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "Zlib",
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates are private (never published to crates.io); the
+# workspace-internal dependency `boa_fapi_core` pins both `path` and
+# `version`, so no wildcard remains. `allow-wildcard-paths` stays enabled
+# as a backstop for path-only dev edges only.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

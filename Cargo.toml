@@ -29,6 +29,8 @@ field_reassign_with_default = "allow"
 bytes = "1"
 thiserror = "2"
 proptest = "1"
+boa_engine = "0.22"
+boa_gc = "0.22"
 
 [profile.dev]
 opt-level = 0

@@ -4,7 +4,17 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Boa File API bindings (placeholder — functionality arrives in M2)"
+description = "Boa File API bindings (Blob, File, FileList)"
 
 [lints]
 workspace = true
+
+[dependencies]
+boa_engine = { workspace = true }
+boa_gc = { workspace = true }
+boa_fapi_core = { path = "../boa_fapi_core", version = "0.1.0" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
