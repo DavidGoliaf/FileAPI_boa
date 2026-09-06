@@ -18,9 +18,10 @@
   `encoding_rs`. Cargo feature `streams-shim` (default on) +
   `FileApiExtensionBuilder::streams_shim(bool)`; off returns typed
   `RegisterError::StreamsShimDisabled` before any mutation.
-- Tests: `crates/boa_fapi/tests/m3_blob_streams.rs` (27 tests, all through
-  `context.run_jobs()`); `streams::tests` (2 JS-realm error proofs);
-  guards (`streams_shim_surface_is_bounded`, `no_filereader_or_dom_surface`,
+- Tests: `crates/boa_fapi/tests/m3_blob_streams.rs` (28 tests, all through
+  `context.run_jobs()`); `streams::tests` (5 proofs: 2 JS-realm error
+  proofs + 3 deterministic-`force_collect` GC proofs); guards
+  (`streams_shim_surface_is_bounded`, `no_filereader_or_dom_surface`,
   module scan covers `streams.rs`).
 - Docs/trace: `M3-STREAM-01..09` in `docs/spec-matrix.md`;
   ADR-0014/0015/0016; README + architecture (bounded shim, `run_jobs()`,
@@ -29,7 +30,9 @@
 ## Base / commit
 
 - Base: M3-A commit `59a8932`; branch `task/m3b`.
-- This handoff covers the single M3-B commit on `task/m3b` (see `git log`).
+- This handoff covers the M3-B stack on `task/m3b` (see `git log`):
+  `fb46cff` (initial M3-B), `13b8582` (M3B-rework R1–R3),
+  `829b26b` (full `validate()` at `register()`; HEAD).
 
 ## Demo commands (work order §7, in order)
 
@@ -49,7 +52,7 @@ $env:CARGO_DENY_DB_PATH='target/cargo-deny-advisories'; cargo deny check
 git diff --check
 ```
 
-All exit 0; recorded in `docs/m3b-validation.md` (coverage 91.07% lines).
+All exit 0; recorded in `docs/m3b-validation.md` (coverage 89.81% lines).
 Final audit trace and findings: `docs/m3b-final-audit.md`.
 
 ## Matrix / ADR
