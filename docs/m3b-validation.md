@@ -14,13 +14,13 @@
 |---|---|---|---|
 | 1 | `cargo fmt --all -- --check` | 0 | PASS |
 | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 | PASS |
-| 3 | `cargo test --workspace --all-features` | 0 | PASS (264 tests: 27 boa_fapi unit, 11 boa_fapi guards, 51 M2 JS integration, 27 M3-B JS integration, 16 M3-A JS integration, 1 boa_fapi doc, 131 core: 58+25+8+8+16+19) |
+| 3 | `cargo test --workspace --all-features` | 0 | PASS (267 tests: 30 boa_fapi unit, 11 boa_fapi guards, 51 M2 JS integration, 28 M3-B JS integration, 16 M3-A JS integration, 1 boa_fapi doc, 130 core: 58+25+8+20+16+19) |
 | 4 | `cargo test --package boa_fapi --test m2_blob_file_filelist` | 0 | PASS (51 tests, all executing JS in a real Boa `Context`) |
 | 5 | `cargo test --package boa_fapi --test m3_promise_blob_reads` | 0 | PASS (16 tests, every read settled via `context.run_jobs()`) |
-| 6 | `cargo test --package boa_fapi --test m3_blob_streams` | 0 | PASS (27 tests, every chunk settled via `context.run_jobs()`) |
+| 6 | `cargo test --package boa_fapi --test m3_blob_streams` | 0 | PASS (28 tests, every chunk settled via `context.run_jobs()`) |
 | 7 | `cargo doc --workspace --no-deps` (RUSTDOCFLAGS='-Dwarnings') | 0 | PASS |
 | 8 | `cargo test --package boa_fapi --doc` | 0 | PASS (1 doc test) |
-| 9 | `cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85` | 0 | PASS (91.07% lines, threshold 85%) |
+| 9 | `cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85` | 0 | PASS (89.86% lines, threshold 85%) |
 | 10 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (all feature combinations, incl. `--no-default-features`) |
 | 11 | `$env:CARGO_DENY_DB_PATH='target/cargo-deny-advisories'; cargo deny fetch db` | 0 | PASS (advisory DB fetched from GitHub) |
 | 12 | `$env:CARGO_DENY_DB_PATH='target/cargo-deny-advisories'; cargo deny check` | 0 | PASS (advisories ok, bans ok, licenses ok, sources ok) |
@@ -35,14 +35,14 @@ blob.rs                           225                12    94.67%          10   
 brand.rs                           45                 2    95.56%           4                 0   100.00%          37                 2    94.59%           0                 0         -
 clock.rs                           25                 8    68.00%           3                 1    66.67%          12                 3    75.00%           0                 0         -
 error.rs                           28                 7    75.00%           4                 1    75.00%          19                 5    73.68%           0                 0         -
-extension.rs                      287                37    87.11%          20                 1    95.00%         208                18    91.35%           0                 0         -
+extension.rs                      292                37    87.33%          20                 1    95.00%         214                18    91.59%           0                 0         -
 file.rs                           157                 8    94.90%          12                 0   100.00%         114                 3    97.37%           0                 0         -
 file_list.rs                      124                7    94.35%           5                 0   100.00%          88                 6    93.18%           0                 0         -
 promise_read.rs                   308                34    88.96%          22                 5    77.27%         209                19    90.91%           0                 0         -
-streams.rs                        898               142    84.19%          45                 8    82.22%         589                71    87.95%           0                 0         -
+streams.rs                       1038               196    81.12%          51                11    78.43%         702               103    85.33%           0                 0         -
 webidl.rs                         632                71    88.77%          41                 4    90.24%         387                33    91.47%           0                 0         -
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                            2729               328    87.98%         166                20    87.95%        1814               162    91.07%           0                 0         -
+TOTAL                            2874               382    86.71%         172                23    86.63%        1933               196    89.86%           0                 0         -
 ```
 
 ## Notes

@@ -62,7 +62,9 @@ Final audit trace and findings: `docs/m3b-final-audit.md`.
 
 ## Coverage
 
-- Workspace: 264 tests green; `boa_fapi` line coverage 91.07%
+- Workspace: 267 tests green (30 boa_fapi unit incl. 5 stream proofs,
+  11 guards, 51 M2 JS integration, 28 M3-B JS integration, 16 M3-A JS
+  integration, 1 doc, 130 core); `boa_fapi` line coverage 89.86%
   (threshold 85%, see `docs/m3b-validation.md`).
 
 ## CI
@@ -73,10 +75,11 @@ claimed here.
 
 ## Findings / fixes
 
-See `docs/m3b-final-audit.md` Step B (7 items): M3-A stale absence test,
-`RefCell` double borrow, dead error-drain helper, invalid-tail decoder
-buffering, chunk-size error mapping, multi-pass reaction polling in tests,
-`cargo hack` dead field/branch.
+See `docs/m3b-final-audit.md` Step B (7 items) plus the `M3B-rework`
+section (R1–R3): GC-safe resolver ownership (resolvers only in traced job
+captures; 3 deterministic-`force_collect` regression tests), no empty text
+chunks (in-request coalescing loop), chunk-size range in
+`FileApiLimits::validate()` + register fail-fast.
 
 ## Deviations
 

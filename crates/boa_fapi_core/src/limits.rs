@@ -80,6 +80,11 @@ impl FileApiLimits {
                 ResourceLimitKind::MaterializeBytes,
             ));
         }
+        if !(16 * 1024..=1024 * 1024).contains(&self.default_chunk_size) {
+            return Err(FileApiError::ResourceLimit(
+                ResourceLimitKind::MaterializeBytes,
+            ));
+        }
         if self.max_data_url_output == 0 {
             return Err(FileApiError::ResourceLimit(
                 ResourceLimitKind::DataUrlOutput,

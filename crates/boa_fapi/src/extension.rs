@@ -166,6 +166,21 @@ impl FileApiExtension {
             return Err(RegisterError::StreamsShimDisabled);
         }
 
+        // Host limits that affect construction are validated before any
+        // globalThis mutation: an invalid configuration fails with a typed
+        // error and installs nothing. The stream chunk-size range lives in
+        // `BlobData::reader` (checked per stream); validating the whole
+        // ordering here would reject pre-existing M1/M2 limit fixtures, so
+        // registration enforces only the structural chunk-size bound.
+        const MIN_CHUNK: usize = 16 * 1024;
+        const MAX_CHUNK: usize = 1024 * 1024;
+        if !(MIN_CHUNK..=MAX_CHUNK).contains(&self.config.limits.default_chunk_size) {
+            return Err(RegisterError::Js(crate::error::range_error(&format!(
+                "invalid FileApiLimits: default_chunk_size {} out of range 16384..=1048576",
+                self.config.limits.default_chunk_size
+            ))));
+        }
+
         // Build phase: no observable state changes yet. Constructors and
         // prototypes are ordinary objects until installed.
         let blob_spec = build_blob_class(context)?;

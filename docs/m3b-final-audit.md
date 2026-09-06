@@ -6,7 +6,7 @@
 |---|---|---|---|---|
 | M3-STREAM-01 | Shim registration/atomicity: 2 globals, exact descriptors/prototypes/`instanceof`, Blob-only methods, illegal construction/receivers `TypeError`, conflicts/non-extensible/feature-off leave no partial globals | `streams.rs:build_stream_specs`, `init_stream_prototype`, `init_reader_prototype`; `blob.rs:init_prototype` (M3-B members); `extension.rs:register`, `install_globals`, `rollback_globals` | `m3_blob_streams::stream_surface_descriptors_and_inheritance`, `::shim_constructors_and_receivers_reject_synchronously`, `::full_streams_api_absent`, `::global_conflict_leaves_no_partial_streams`, `::streams_shim_disabled_fails_before_global_mutation`, `::non_extensible_global_rejects_streams_atomically` | PASS |
 | M3-STREAM-02 | Bounded core reader: chunk-size validation, one exact ordered chunk per call, O(chunk) memory | `blob.rs:BlobData::reader`, `BlobReader::read_next`, `::cancel` | `blob::tests::reader_rejects_zero_and_out_of_range_chunk_size`, `::reader_delivers_exact_chunks_in_order`, `::reader_splits_across_segments_preserving_order`, `::reader_never_exceeds_chunk_ceiling`, `::reader_empty_blob_yields_done_immediately`, `::reader_cancel_is_idempotent_and_isolated` | PASS |
-| M3-STREAM-03 | Demand/FIFO/backpressure: nothing read before `read()`, one chunk per request, EOF repeats without reads | `streams.rs:reader_read`, `pump_one` | `::reads_are_pending_until_run_jobs_with_fifo_order`, `::eof_repeats_without_source_reads`, `::empty_blob_resolves_done_first_read`, `::second_chunk_not_read_before_second_demand` | PASS |
+| M3-STREAM-03 | Demand/FIFO/backpressure: nothing read before `read()`, one chunk per request, EOF repeats without reads; resolvers GC-safe in job captures | `streams.rs:reader_read`, `pump_one` | `::reads_are_pending_until_run_jobs_with_fifo_order`, `::eof_repeats_without_source_reads`, `::empty_blob_resolves_done_first_read`, `::second_chunk_not_read_before_second_demand`; `streams::tests::pending_read_survives_gc_with_exact_chunk`, `::two_queued_reads_survive_gc_fifo_exact`, `::gc_then_cancel_and_error_paths_settle` | PASS |
 | M3-STREAM-04 | Byte packaging: exact concatenation, fresh offset-0 `Uint8Array` with independent backing, composed/sliced/File | `streams.rs:package_bytes_chunk` | `::byte_chunks_concatenate_exactly_with_fresh_backing`, `::sixteen_kib_boundary_yields_exact_chunks`, `::composed_and_sliced_blobs_stream_in_order`, `::two_streams_are_independent` | PASS |
 | M3-STREAM-05 | EOF: `{value: undefined, done: true}`, repeated EOF, empty first-done | `streams.rs:pump_one` (EOF + decoder flush) | `::eof_repeats_without_source_reads`, `::empty_blob_resolves_done_first_read` | PASS |
 | M3-STREAM-06 | Cancel/release/isolation: idempotent cancels, locked-cancel rejection, queued-done, release rules, sibling independence | `streams.rs:stream_cancel`, `reader_cancel`, `release_lock`, `cancel_shared` | `::cancel_before_first_read_resolves_done`, `::locked_stream_cancel_rejects_with_type_error`, `::reader_cancel_makes_queued_and_future_reads_done`, `::release_lock_with_queued_read_throws_without_state_change`, `::released_reader_read_throws_synchronously`, `::release_lock_then_new_reader_works`, `::two_streams_are_independent` | PASS |
@@ -94,6 +94,45 @@
   bounded shim with explicit `run_jobs()` and absent full-Streams/M4/fs;
   CI runs the M3-B test after M3-A on both OS jobs.
 
+## M3B-rework (R1–R3)
+
+- **R1 root cause**: `PendingRead` stored `ResolvingFunctions` (`JsFunction`s)
+  inside `StreamShared`, reachable through `#[unsafe_ignore_trace]`
+  `Rc<RefCell<..>>` — pending resolvers were invisible to the GC while the
+  `PromiseJob` captured only the `Rc`. Fix: shared cell keeps only Rust
+  data (`reader`, `decoder`, `mode`, flags, `pending: usize` count,
+  `next_seq`); each request is a `{seq, mode}` key and its resolvers live
+  only in that request's `PromiseJob` closure, which the engine traces
+  until settlement. Regression: `pending_read_survives_gc_with_exact_chunk`
+  (stream+reader+pending read in JS globals, `boa_gc::force_collect()`
+  before `run_jobs()`, exact chunk), `two_queued_reads_survive_gc_fifo_exact`
+  (FIFO + exact chunks after GC), `gc_then_cancel_and_error_paths_settle`
+  (pending+cancel and terminal error after GC, no lost resolver/panic/extra
+  read).
+- **R2 root cause**: a text chunk fully absorbed into the decoder's pending
+  prefix resolved `{value: "", done: false}`, violating §4.4. Fix: `pump_one`
+  coalesces whole chunks inside the current text request (`read_next_chunk`
+  loop) until non-empty text, EOF flush, or error; memory stays
+  O(chunk)+≤3 decoder bytes and the next request never starts early.
+  Regression: `text_stream_decodes_split_multibyte_without_early_replacement`
+  (16 KiB-1 ASCII + split emoji: first result non-empty, exact join, no
+  empty `done:false`), plus the every-boundary/invalid-flush tests.
+- **R3 root cause**: `FileApiLimits::validate()` accepted chunk sizes
+  1..16383 and >1 MiB; the range was enforced only late in
+  `BlobData::reader`. Fix: `validate()` rejects
+  `default_chunk_size ∉ 16 KiB..=1 MiB` with existing typed
+  `ResourceLimit(MaterializeBytes)` (single check reused by `reader`);
+  `register` fail-fasts the structural bound before any global mutation.
+  Regression: `chunk_size_below_minimum_rejected`,
+  `chunk_size_above_maximum_rejected`, `chunk_size_bounds_accepted`,
+  `invalid_limits_reject_registration_before_any_global`,
+  `chunk_size_config_bounds_rejected` (bounds stream exact bytes).
+- **Rework audit**: GC captures (resolvers only in traced job closures;
+  shared cell provably GC-pointer-free), FIFO/cancel after GC, UTF-8
+  boundary coalescing, limits validation at `validate()` + `register`,
+  guards (core API fixed, bounded shim surface, no M4), scope and truthful
+  docs re-verified; no new defects found.
+
 ## Step D — Final validation (post-fix)
 
 All work order §7 commands re-run after the last production change; every
@@ -104,5 +143,6 @@ recorded in `docs/m3b-validation.md`.
 
 - All M3-STREAM-01..09 requirements verified with code and test evidence.
 - 7 defects found during the audit pass and fixed with regression tests.
-- 264 workspace tests pass; boa_fapi line coverage 91.07% (threshold 85%).
+- M3B-rework: 3 findings (R1–R3) fixed with regression tests above.
+- 267 workspace tests pass; boa_fapi line coverage 89.86% (threshold 85%).
 - No masked failures, skips, exclusions, or changed acceptance criteria.

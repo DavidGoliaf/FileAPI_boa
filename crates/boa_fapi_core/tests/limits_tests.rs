@@ -177,7 +177,53 @@ fn materialize_equals_blob_ok() {
 
 #[test]
 fn chunk_equals_materialize_ok() {
+    // A chunk size equal to a small materialize limit is below the stream
+    // floor, so validation (correctly) rejects it: the M1-era expectation
+    // is superseded by the M3-B chunk-size range. The valid equality case
+    // is a materialize limit inside the chunk range.
+    let mut limits = FileApiLimits::default();
+    limits.max_materialize_bytes = 64 * 1024;
+    limits.max_blob_size = 64 * 1024;
+    limits.max_sync_read_bytes = 32 * 1024;
+    limits.default_chunk_size = 64 * 1024;
+    assert!(limits.validate().is_ok());
     let mut limits = FileApiLimits::default();
     limits.default_chunk_size = limits.max_materialize_bytes as usize;
-    assert!(limits.validate().is_ok());
+    assert!(limits.validate().is_err());
+}
+
+#[test]
+fn chunk_size_below_minimum_rejected() {
+    for bad in [0usize, 1, 16 * 1024 - 1] {
+        let mut limits = FileApiLimits::default();
+        limits.default_chunk_size = bad;
+        assert_eq!(
+            limits.validate(),
+            Err(FileApiError::ResourceLimit(
+                ResourceLimitKind::MaterializeBytes
+            )),
+            "chunk size {bad} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn chunk_size_above_maximum_rejected() {
+    let mut limits = FileApiLimits::default();
+    limits.default_chunk_size = 1024 * 1024 + 1;
+    assert_eq!(
+        limits.validate(),
+        Err(FileApiError::ResourceLimit(
+            ResourceLimitKind::MaterializeBytes
+        ))
+    );
+}
+
+#[test]
+fn chunk_size_bounds_accepted() {
+    for good in [16 * 1024, 64 * 1024, 1024 * 1024] {
+        let mut limits = FileApiLimits::default();
+        limits.default_chunk_size = good;
+        assert!(limits.validate().is_ok(), "chunk size {good} must validate");
+    }
 }

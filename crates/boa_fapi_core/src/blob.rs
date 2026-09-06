@@ -269,10 +269,9 @@ impl BlobData {
 
     /// Opens a bounded incremental reader over this blob.
     ///
-    /// Snapshots `limits.default_chunk_size` (validated to
-    /// `16 KiB..=1 MiB`) as the per-`read_next` chunk ceiling. Reads no
-    /// data. Out-of-range chunk sizes yield a typed `ResourceLimit` error
-    /// with no silent clamp.
+    /// Snapshots the chunk ceiling validated by [`FileApiLimits::validate`]
+    /// (`16 KiB..=1 MiB`). Reads no data. Out-of-range chunk sizes yield a
+    /// typed `ResourceLimit` error with no silent clamp.
     pub fn reader(&self, limits: &FileApiLimits) -> Result<BlobReader, FileApiError> {
         const MIN_CHUNK: usize = 16 * 1024;
         const MAX_CHUNK: usize = 1024 * 1024;

@@ -14,7 +14,6 @@
 //! `run_jobs()` themselves.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -96,8 +95,12 @@ fn shim_constructor_rejects(
 /// Shared mutable stream state behind `Rc<RefCell<..>>`.
 ///
 /// Owned by the stream object and every reader created from it. The cell
-/// holds only Rust state (reader, decoder, queues, flags): no `Context`,
-/// `JsValue`, `JsObject`, callback, or fabricated GC reference.
+/// holds only Rust data: the incremental core reader, the UTF-8 decoder,
+/// the chunk flavor, flags, and a FIFO count of queued requests. It holds
+/// no `Context`, `JsValue`, `JsObject`, `JsFunction`, `ResolvingFunctions`,
+/// or callback: every pending `read()` promise's resolvers travel inside
+/// that request's own Boa `PromiseJob` capture, which the engine keeps
+/// alive (and traces) until the job runs.
 pub(crate) struct StreamShared {
     /// The incremental core reader; `None` once the stream errors.
     reader: Option<BlobReader>,
@@ -111,14 +114,22 @@ pub(crate) struct StreamShared {
     cancelled: bool,
     /// Terminal error class replayed to every later read.
     errored: Option<StreamErrorClass>,
-    /// FIFO queue of pending `read()` requests (resolvers only).
-    pending: VecDeque<PendingRead>,
+    /// FIFO count of queued `read()` jobs (one job per request).
+    pending: usize,
+    /// Next FIFO sequence number for a queued `read()`.
+    next_seq: u64,
 }
 
-/// One queued `read()` request: its promise resolvers.
+/// One queued `read()` request: its sequence number.
+///
+/// The promise resolvers are NOT stored here: `ResolvingFunctions` holds
+/// Boa `JsFunction`s, which must stay traced by the GC. Each request's
+/// resolvers live only in that request's `PromiseJob` closure, so the
+/// engine roots them until settlement. This struct carries the FIFO order
+/// key; the job carries the GC pointers.
 struct PendingRead {
-    /// Resolvers captured by the read job.
-    resolvers: ResolvingFunctions,
+    /// FIFO sequence number assigned at `read()` time.
+    seq: u64,
     /// Chunk flavor active when the request was queued.
     mode: StreamMode,
 }
@@ -145,7 +156,7 @@ impl std::fmt::Debug for StreamShared {
             .field("locked", &self.locked)
             .field("cancelled", &self.cancelled)
             .field("errored", &self.errored)
-            .field("pending", &self.pending.len())
+            .field("pending", &self.pending)
             .finish_non_exhaustive()
     }
 }
@@ -306,7 +317,8 @@ fn create_stream(
         locked: false,
         cancelled: false,
         errored: None,
-        pending: VecDeque::new(),
+        pending: 0,
+        next_seq: 0,
     }));
     let specs = crate::extension::snapshot(context)?;
     #[cfg(feature = "streams-shim")]
@@ -419,19 +431,23 @@ fn stream_cancel(this: &JsValue, _args: &[JsValue], context: &mut Context) -> Js
     Ok(promise.into())
 }
 
-/// Marks the shared state cancelled and drops queued requests.
+/// Marks the shared state cancelled and forgets queued slots.
 ///
-/// Queued requests are settled done by their own owners (`reader_cancel`
-/// resolves them before calling this); stream-level cancel has no queued
-/// requests of its own because every `read()` carries its own job.
+/// Queued `read()` jobs still own their resolvers: each settles done in
+/// its own job when it pumps and observes the cancelled flag. Stream-level
+/// cancel has no requests of its own because every `read()` carries its
+/// own job.
 fn cancel_shared(shared: &Rc<RefCell<StreamShared>>) {
     let mut state = shared.borrow_mut();
     state.cancelled = true;
     state.reader = None;
-    state.pending.clear();
+    state.pending = 0;
 }
 
 /// `ReadableStreamDefaultReader.prototype.read()`: one pending promise, one job.
+///
+/// The resolvers live only in this request's job closure (traced by the
+/// engine until the job runs); the shared cell records just the FIFO slot.
 fn reader_read(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     use boa_engine::object::builtins::JsPromise;
     let (_object, shared, released) = require_reader(this)?;
@@ -439,17 +455,23 @@ fn reader_read(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsRe
         return Err(type_error("the reader has been released"));
     }
     let (promise, resolvers) = JsPromise::new_pending(context);
-    // Queue first: the job pumps exactly this request, preserving FIFO
-    // order and pending-first semantics for cancelled/errored streams.
-    // (`RefCell` is never double-borrowed here: the mode is `Copy`.)
-    let mode = shared.borrow().mode;
-    shared
-        .borrow_mut()
-        .pending
-        .push_back(PendingRead { resolvers, mode });
+    // Reserve the FIFO slot first: jobs pump in enqueue order, preserving
+    // FIFO and pending-first semantics for cancelled/errored streams.
+    let request = {
+        let mut state = shared.borrow_mut();
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.wrapping_add(1);
+        state.pending = state.pending.saturating_add(1);
+        PendingRead {
+            seq,
+            mode: state.mode,
+        }
+    };
     let realm = context.realm().clone();
     let job = PromiseJob::with_realm(
-        move |context: &mut Context| -> JsResult<JsValue> { pump_one(&shared, context) },
+        move |context: &mut Context| -> JsResult<JsValue> {
+            pump_one(&shared, &request, &resolvers, context)
+        },
         realm,
     );
     context.enqueue_job(Job::PromiseJob(job));
@@ -458,16 +480,25 @@ fn reader_read(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsRe
 
 /// Pumps exactly one queued read request: one chunk or terminal state.
 ///
-/// Runs inside a Boa job. Reads at most one `BlobReader` chunk, packages it
-/// as a fresh `Uint8Array`/string, and resolves `{ value, done }`. EOF
-/// resolves done (with decoder flush for text streams). A core failure
-/// errors the stream: the current and every future read reject with a
-/// same-realm plain `Error`, without further source reads.
-fn pump_one(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) -> JsResult<JsValue> {
-    let pending = shared.borrow_mut().pending.pop_front();
-    let Some(request) = pending else {
-        return Ok(JsValue::undefined());
-    };
+/// Runs inside that request's own Boa job, which owns the promise
+/// resolvers (traced by the engine until settlement). Reads at most one
+/// `BlobReader` chunk, packages it as a fresh `Uint8Array`/string, and
+/// resolves `{ value, done }`. EOF resolves done (with decoder flush for
+/// text streams). A core failure errors the stream: the current and every
+/// future read reject with a same-realm plain `Error`, without further
+/// source reads.
+fn pump_one(
+    shared: &Rc<RefCell<StreamShared>>,
+    request: &PendingRead,
+    resolvers: &ResolvingFunctions,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    // FIFO accounting: this job consumes exactly its own slot.
+    {
+        let mut state = shared.borrow_mut();
+        state.pending = state.pending.saturating_sub(1);
+    }
+    let _ = request.seq;
     // Terminal states settle without touching the source.
     let terminal = {
         let state = shared.borrow();
@@ -481,28 +512,25 @@ fn pump_one(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) -> JsResu
     };
     if let Some(is_error) = terminal {
         if is_error {
-            request.resolvers.reject.call(
-                &JsValue::undefined(),
-                &[js_read_error(context)],
-                context,
-            )?;
+            resolvers
+                .reject
+                .call(&JsValue::undefined(), &[js_read_error(context)], context)?;
             return Ok(JsValue::undefined());
         }
         let done = iter_result(JsValue::undefined(), true, context)?;
-        request
-            .resolvers
+        resolvers
             .resolve
             .call(&JsValue::undefined(), &[done], context)?;
         return Ok(JsValue::undefined());
     }
-    // Demand-driven: exactly one `read_next()` per request.
+    // Demand-driven: exactly one `read_next()` for a byte request; text
+    // requests loop below until the decoder yields text, EOF, or error.
     let chunk = {
         let mut state = shared.borrow_mut();
         let Some(reader) = state.reader.as_mut() else {
             drop(state);
             let done = iter_result(JsValue::undefined(), true, context)?;
-            request
-                .resolvers
+            resolvers
                 .resolve
                 .call(&JsValue::undefined(), &[done], context)?;
             return Ok(JsValue::undefined());
@@ -510,16 +538,16 @@ fn pump_one(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) -> JsResu
         match reader.read_next() {
             Ok(chunk) => chunk,
             Err(error) => {
-                let reason = stream_error_reason(&error, context);
+                let reason = js_read_error(context);
                 state.errored = Some(StreamErrorClass::ReadFailed);
                 state.reader = None;
                 // Every other queued read rejects with the same class when
                 // its own job pumps: mark them now, settle them on demand.
-                // (Their jobs each pop one request; terminal state rejects
-                // without source reads.)
+                // (Each job owns its resolvers and observes the terminal
+                // state without source reads.)
                 drop(state);
-                request
-                    .resolvers
+                let _ = error;
+                resolvers
                     .reject
                     .call(&JsValue::undefined(), &[reason], context)?;
                 return Ok(JsValue::undefined());
@@ -537,8 +565,7 @@ fn pump_one(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) -> JsResu
                 if !tail.is_empty() {
                     drop(state);
                     let done = iter_result(JsValue::from(JsString::from(tail)), false, context)?;
-                    request
-                        .resolvers
+                    resolvers
                         .resolve
                         .call(&JsValue::undefined(), &[done], context)?;
                     return Ok(JsValue::undefined());
@@ -546,25 +573,54 @@ fn pump_one(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) -> JsResu
             }
             drop(state);
             let done = iter_result(JsValue::undefined(), true, context)?;
-            request
-                .resolvers
+            resolvers
                 .resolve
                 .call(&JsValue::undefined(), &[done], context)?;
             Ok(JsValue::undefined())
         }
         Some(bytes) => {
-            let value = match request.mode {
-                StreamMode::Bytes => package_bytes_chunk(&bytes, context)?,
-                // Incremental delivery: a chunk fully absorbed into the
-                // decoder's pending prefix resolves as an empty (non-done)
-                // string without extra source reads.
-                StreamMode::Text => {
-                    JsValue::from(JsString::from(shared.borrow_mut().decoder.push(&bytes)))
+            // Text mode must never resolve an empty `done:false` chunk:
+            // keep consuming whole chunks inside THIS request until text,
+            // EOF flush, or error — still no readahead past the request.
+            if request.mode == StreamMode::Text {
+                let mut text = shared.borrow_mut().decoder.push(&bytes);
+                while text.is_empty() {
+                    match read_next_chunk(shared) {
+                        PumpChunk::Bytes(next) => {
+                            text.push_str(&shared.borrow_mut().decoder.push(&next));
+                        }
+                        PumpChunk::Eof => {
+                            let tail = shared.borrow_mut().decoder.flush();
+                            if tail.is_empty() {
+                                let done = iter_result(JsValue::undefined(), true, context)?;
+                                resolvers
+                                    .resolve
+                                    .call(&JsValue::undefined(), &[done], context)?;
+                                return Ok(JsValue::undefined());
+                            }
+                            text.push_str(&tail);
+                            break;
+                        }
+                        PumpChunk::Failed => {
+                            mark_errored(shared);
+                            resolvers.reject.call(
+                                &JsValue::undefined(),
+                                &[js_read_error(context)],
+                                context,
+                            )?;
+                            return Ok(JsValue::undefined());
+                        }
+                    }
                 }
-            };
+                let done = iter_result(JsValue::from(JsString::from(text)), false, context)?;
+                resolvers
+                    .resolve
+                    .call(&JsValue::undefined(), &[done], context)?;
+                return Ok(JsValue::undefined());
+            }
+            let value = package_bytes_chunk(&bytes, context)?;
             let done = iter_result(value, false, context)?;
-            request
-                .resolvers
+            resolvers
                 .resolve
                 .call(&JsValue::undefined(), &[done], context)?;
             Ok(JsValue::undefined())
@@ -572,13 +628,45 @@ fn pump_one(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) -> JsResu
     }
 }
 
-/// Builds the rejection reason for a stream core failure.
+/// Outcome of one demand-driven `BlobReader::read_next()` call.
+enum PumpChunk {
+    /// A byte chunk to package or decode.
+    Bytes(bytes::Bytes),
+    /// End of the logical range (decoder flush decides the settlement).
+    Eof,
+    /// A core failure already recorded as terminal on the shared state.
+    Failed,
+}
+
+/// Reads exactly one chunk from the shared core reader.
 ///
-/// Always a same-realm plain `Error` without body/path/source detail;
-/// never `RangeError`, never `DOMException`.
-fn stream_error_reason(error: &FileApiError, context: &mut Context) -> JsValue {
-    let _ = error;
-    js_read_error(context)
+/// Returns `Eof` when the reader is gone or exhausted. On core failure
+/// marks the stream errored (terminal replay, no further reads) and
+/// returns `Failed`. Never reads ahead.
+fn read_next_chunk(shared: &Rc<RefCell<StreamShared>>) -> PumpChunk {
+    let mut state = shared.borrow_mut();
+    let Some(reader) = state.reader.as_mut() else {
+        return PumpChunk::Eof;
+    };
+    match reader.read_next() {
+        Ok(Some(bytes)) => PumpChunk::Bytes(bytes),
+        Ok(None) => PumpChunk::Eof,
+        Err(_) => {
+            state.errored = Some(StreamErrorClass::ReadFailed);
+            state.reader = None;
+            PumpChunk::Failed
+        }
+    }
+}
+
+/// Marks the stream terminally errored without needing a `Context`.
+///
+/// Used when a follow-up chunk read inside a text request fails: the
+/// caller (which owns the job's `Context`) builds the same-realm `Error`.
+fn mark_errored(shared: &Rc<RefCell<StreamShared>>) {
+    let mut state = shared.borrow_mut();
+    state.errored = Some(StreamErrorClass::ReadFailed);
+    state.reader = None;
 }
 
 /// Packages one chunk as a fresh offset-0 `Uint8Array` over a fresh buffer.
@@ -607,16 +695,10 @@ fn reader_cancel(this: &JsValue, _args: &[JsValue], context: &mut Context) -> Js
     let realm = context.realm().clone();
     let job = PromiseJob::with_realm(
         move |context: &mut Context| -> JsResult<JsValue> {
-            // Resolve queued reads done first, then mark cancelled so
-            // future reads observe the terminal state.
-            let queued: Vec<PendingRead> = shared.borrow_mut().pending.drain(..).collect();
-            for request in queued {
-                let done = iter_result(JsValue::undefined(), true, context)?;
-                request
-                    .resolvers
-                    .resolve
-                    .call(&JsValue::undefined(), &[done], context)?;
-            }
+            // `reader.cancel()` settles already-queued reads done inside
+            // their own jobs (each owns its resolvers); the cancel promise
+            // itself resolves after marking the terminal state.
+            shared.borrow_mut().pending = 0;
             cancel_shared(&shared);
             resolvers
                 .resolve
@@ -641,7 +723,7 @@ fn release_lock(this: &JsValue, _args: &[JsValue], _context: &mut Context) -> Js
     }
     {
         let state = shared.borrow();
-        if !state.pending.is_empty() {
+        if state.pending != 0 {
             return Err(type_error(
                 "cannot release the lock with queued read requests",
             ));
@@ -873,6 +955,101 @@ mod tests {
             .expect("verdict string")
             .to_std_string_escaped()
     }
+
+    /// Runs `boa_gc::force_collect()` — the supported deterministic GC path
+    /// — with live stream/reader/promise roots reachable from JS globals.
+    fn force_gc() {
+        boa_gc::force_collect();
+    }
+
+    /// Builds a stream + reader + pending `read()` fully reachable from JS
+    /// globals, runs the deterministic GC, then drives jobs and returns the
+    /// JS-observable verdict. Proves pending resolvers survive collection:
+    /// they live in the job capture (traced by the engine), never in the
+    /// untraced shared cell.
+    fn gc_probe_verdict(context: &mut Context, setup_js: &str) -> String {
+        context
+            .eval(Source::from_bytes(setup_js))
+            .expect("setup probe");
+        force_gc();
+        context.run_jobs().expect("run_jobs");
+        force_gc();
+        context
+            .eval(Source::from_bytes("globalThis.verdict"))
+            .expect("read verdict")
+            .as_string()
+            .expect("verdict string")
+            .to_std_string_escaped()
+    }
+
+    #[test]
+    fn pending_read_survives_gc_with_exact_chunk() {
+        let context = &mut Context::default();
+        crate::extension::FileApiExtension::builder()
+            .build()
+            .register(context)
+            .expect("register");
+        let verdict = gc_probe_verdict(
+            context,
+            "globalThis.verdict = 'pending'; \
+             globalThis.stream = new Blob(['gc-exact']).stream(); \
+             globalThis.reader = globalThis.stream.getReader(); \
+             globalThis.reader.read().then( \
+                 r => { globalThis.verdict = 'chunk:' + r.value.length + ':' + r.done; }, \
+                 e => { globalThis.verdict = 'rejected:' + e.name; } \
+             );",
+        );
+        assert_eq!(verdict, "chunk:8:false");
+    }
+
+    #[test]
+    fn two_queued_reads_survive_gc_fifo_exact() {
+        let context = &mut Context::default();
+        crate::extension::FileApiExtension::builder()
+            .build()
+            .register(context)
+            .expect("register");
+        let verdict = gc_probe_verdict(
+            context,
+            "globalThis.verdict = 'pending'; \
+             globalThis.reader = new Blob(['ab']).stream().getReader(); \
+             globalThis.reader.read().then(r => { globalThis.verdict = 'first:' + r.value.length; }); \
+             globalThis.reader.read().then(r => { globalThis.verdict += '|second-done:' + r.done; });",
+        );
+        assert_eq!(verdict, "first:2|second-done:true");
+    }
+
+    #[test]
+    fn gc_then_cancel_and_error_paths_settle() {
+        // Pending read + cancel after GC settles done.
+        let context = &mut Context::default();
+        crate::extension::FileApiExtension::builder()
+            .build()
+            .register(context)
+            .expect("register");
+        let verdict = gc_probe_verdict(
+            context,
+            "globalThis.verdict = 'pending'; \
+             globalThis.reader = new Blob(['cancel-me']).stream().getReader(); \
+             globalThis.reader.read().then(r => { globalThis.verdict = 'read-done:' + r.done; }); \
+             globalThis.reader.cancel().then(() => { globalThis.verdict += '|cancelled'; });",
+        );
+        // The read was queued before cancel, so it settles with its chunk
+        // (`done:false`); the cancel promise still resolves. Both survive GC.
+        assert_eq!(verdict, "read-done:false|cancelled");
+        // Terminal core error after GC rejects plain-Error.
+        let context = &mut Context::default();
+        crate::extension::FileApiExtension::builder()
+            .build()
+            .register(context)
+            .expect("register");
+        let (size_before, segments_before) = enqueue_failing_probe(context);
+        force_gc();
+        context.run_jobs().expect("run_jobs");
+        assert_eq!(js_verdict(context), "error:Error:blob read failed");
+        let _ = (size_before, segments_before);
+    }
+
     #[test]
     fn errored_stream_rejects_with_plain_error_not_range_error() {
         let context = &mut Context::default();

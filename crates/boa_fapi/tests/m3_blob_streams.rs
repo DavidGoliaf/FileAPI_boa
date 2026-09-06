@@ -3,7 +3,9 @@
 //! Every test uses a fresh real `boa_engine::Context`, registers the
 //! extension, executes JavaScript, and drives settlement explicitly with
 //! `context.run_jobs()`. Demand, FIFO order, EOF, cancellation, and error
-//! paths are proven through JS-observable state only.
+//! paths are proven through JS-observable state only. Garbage-collection
+//! safety of pending reads is proven by the deterministic `boa_gc` path in
+//! `streams::tests` (resolvers live in job captures, never in shared state).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -682,13 +684,34 @@ fn stream_error_path_rejects_with_plain_error_not_range_error() {
 }
 
 #[test]
-fn chunk_size_config_bounds_rejected() {
-    for bad in [0usize, 16 * 1024 - 1, 1024 * 1024 + 1] {
-        let mut context = setup_with_chunk(bad);
-        assert_eval_type_error(&mut context, "new Blob(['x']).stream()");
-        let mut context = setup_with_chunk(bad);
-        assert_eval_type_error(&mut context, "new Blob(['x']).textStream()");
+fn invalid_limits_reject_registration_before_any_global() {
+    for bad_chunk in [0usize, 16 * 1024 - 1, 1024 * 1024 + 1] {
+        let mut context = Context::default();
+        let limits = boa_fapi_core::limits::FileApiLimits {
+            default_chunk_size: bad_chunk,
+            ..boa_fapi_core::limits::FileApiLimits::default()
+        };
+        let extension = FileApiExtension::builder().limits(limits).build();
+        match extension.register(&mut context) {
+            Err(boa_fapi::RegisterError::Js(_)) => {}
+            Err(other) => panic!("expected Js limits error, got {other:?}"),
+            Ok(_) => panic!("expected Js limits error, got Ok"),
+        }
+        assert_eval(
+            &mut context,
+            "typeof Blob === 'undefined' && typeof File === 'undefined' \
+             && typeof ReadableStream === 'undefined' \
+             && typeof ReadableStreamDefaultReader === 'undefined'",
+        );
     }
+}
+
+#[test]
+fn chunk_size_config_bounds_rejected() {
+    // Registration itself fails fast on out-of-range chunk sizes (proven by
+    // `invalid_limits_reject_registration_before_any_global`); `stream()`
+    // on a valid registration always succeeds, and the bounds below stream
+    // exact bytes.
     for good in [16 * 1024, 64 * 1024, 1024 * 1024] {
         let mut context = setup_with_chunk(good);
         assert_async_body(
