@@ -41,21 +41,26 @@ fn core_cargo_toml_no_forbidden_dependencies() {
 fn public_api_no_path_types() {
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let entries = walk_src_files(&src_dir);
+    let forbidden = [
+        "PathBuf",
+        "std::path::Path",
+        "std::fs::",
+        "FileDesc",
+        "RawFd",
+        "RawHandle",
+        "JsValue",
+        "JsString",
+        "JsObject",
+    ];
     for (path, content) in &entries {
-        // Skip test modules
-        if content.contains("#[cfg(test)]") && path.ends_with("lib.rs") {
-            continue;
+        for pat in &forbidden {
+            assert!(
+                !content.contains(pat),
+                "source {} must not use {}",
+                path,
+                pat
+            );
         }
-        assert!(
-            !content.contains("PathBuf"),
-            "public API in {} must not use PathBuf",
-            path
-        );
-        assert!(
-            !content.contains("std::fs::"),
-            "public API in {} must not use std::fs",
-            path
-        );
     }
 }
 
@@ -162,11 +167,18 @@ fn strip_test_modules(source: &str) -> String {
 // ──────────────────────────────────────────────
 
 use boa_fapi_core::blob::{BlobData, BlobSegment};
+use boa_fapi_core::cancellation::CancellationToken;
 use boa_fapi_core::limits::FileApiLimits;
 use boa_fapi_core::source::ByteSource;
 use boa_fapi_core::source::memory::MemorySource;
 use bytes::Bytes;
 use std::sync::Arc;
+
+fn read_blob(blob: &BlobData) -> Vec<u8> {
+    let cancel = CancellationToken::new();
+    blob.materialize(u64::MAX, &cancel)
+        .expect("materialize failed")
+}
 
 fn reference_slice(data: &[u8], start: Option<i64>, end: Option<i64>) -> Vec<u8> {
     let len = data.len() as i64;
@@ -200,7 +212,7 @@ proptest! {
 
         let sliced = blob.slice(Some(start), Some(end), None, &limits).unwrap();
         let expected = reference_slice(&data, Some(start), Some(end));
-        let actual = sliced.read_all().unwrap();
+        let actual = read_blob(&sliced);
 
         prop_assert_eq!(actual, expected);
     }

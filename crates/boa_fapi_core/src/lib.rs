@@ -17,7 +17,9 @@
 //! - [`source`] — Byte source abstraction and memory implementation.
 
 #![deny(unsafe_code)]
-#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
 
 pub mod blob;
 pub mod cancellation;

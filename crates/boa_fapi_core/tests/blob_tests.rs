@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use boa_fapi_core::blob::{BlobData, BlobSegment};
+use boa_fapi_core::cancellation::CancellationToken;
 use boa_fapi_core::error::ResourceLimitKind;
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_fapi_core::limits::FileApiLimits;
@@ -13,6 +14,15 @@ use bytes::Bytes;
 
 fn limits() -> FileApiLimits {
     FileApiLimits::default()
+}
+
+fn cancel() -> CancellationToken {
+    CancellationToken::new()
+}
+
+fn read_blob(blob: &BlobData) -> Vec<u8> {
+    blob.materialize(u64::MAX, &cancel())
+        .expect("materialize failed")
 }
 
 fn make_source(data: &[u8]) -> Arc<dyn ByteSource> {
@@ -76,7 +86,7 @@ fn from_segments_with_offset() {
     let seg = make_segment(src, 6, 5);
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     assert_eq!(blob.size(), 5);
-    let content = blob.read_all().unwrap();
+    let content = read_blob(&blob);
     assert_eq!(&content, b"world");
 }
 
@@ -88,6 +98,45 @@ fn from_segments_zero_length_filtered() {
     let blob = BlobData::from_segments(vec![seg_empty, seg_full], "text/plain", &limits()).unwrap();
     assert_eq!(blob.segment_count(), 1);
     assert_eq!(blob.size(), 5);
+}
+
+#[test]
+fn from_segments_zero_length_invalid_offset_rejected() {
+    let src = make_source(b"hello");
+    // Zero-length segment with offset > source.len() must be rejected
+    let seg_bad = BlobSegment {
+        source: src,
+        offset: 100,
+        len: 0,
+    };
+    let result = BlobData::from_segments(vec![seg_bad], "text/plain", &limits());
+    assert!(matches!(result, Err(FileApiError::InvalidRange)));
+}
+
+#[test]
+fn materialize_respects_limit() {
+    let src = make_source(b"hello world");
+    let seg = make_segment(src, 0, 11);
+    let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+    let cancel = CancellationToken::new();
+    // 11 bytes > 10 byte limit
+    let result = blob.materialize(10, &cancel);
+    assert!(matches!(
+        result,
+        Err(FileApiError::ResourceLimit(
+            ResourceLimitKind::MaterializeBytes
+        ))
+    ));
+}
+
+#[test]
+fn materialize_within_limit() {
+    let src = make_source(b"hello");
+    let seg = make_segment(src, 0, 5);
+    let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+    let cancel = CancellationToken::new();
+    let result = blob.materialize(5, &cancel).unwrap();
+    assert_eq!(&result, b"hello");
 }
 
 #[test]
@@ -180,8 +229,8 @@ fn blob_data_immutable_repeated_reads() {
     let seg = make_segment(src, 0, 11);
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
 
-    let first = blob.read_all().unwrap();
-    let second = blob.read_all().unwrap();
+    let first = read_blob(&blob);
+    let second = read_blob(&blob);
     assert_eq!(first, second);
     assert_eq!(first, b"hello world");
 }
@@ -209,7 +258,7 @@ fn slice_none_none() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(None, None, None, &limits()).unwrap();
     assert_eq!(sliced.size(), 11);
-    assert_eq!(sliced.read_all().unwrap(), b"hello world");
+    assert_eq!(read_blob(&sliced), b"hello world");
 }
 
 #[test]
@@ -219,7 +268,7 @@ fn slice_start_0_end_size() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(0), Some(11), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 11);
-    assert_eq!(sliced.read_all().unwrap(), b"hello world");
+    assert_eq!(read_blob(&sliced), b"hello world");
 }
 
 #[test]
@@ -229,7 +278,7 @@ fn slice_positive_start_end() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(6), Some(11), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 5);
-    assert_eq!(sliced.read_all().unwrap(), b"world");
+    assert_eq!(read_blob(&sliced), b"world");
 }
 
 #[test]
@@ -239,7 +288,7 @@ fn slice_positive_beyond_size() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(3), Some(100), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 2);
-    assert_eq!(sliced.read_all().unwrap(), b"lo");
+    assert_eq!(read_blob(&sliced), b"lo");
 }
 
 #[test]
@@ -249,7 +298,7 @@ fn slice_negative_end_minus_1() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(0), Some(-1), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 10);
-    assert_eq!(sliced.read_all().unwrap(), b"hello worl");
+    assert_eq!(read_blob(&sliced), b"hello worl");
 }
 
 #[test]
@@ -259,7 +308,7 @@ fn slice_negative_start_minus_size() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(-11), None, None, &limits()).unwrap();
     assert_eq!(sliced.size(), 11);
-    assert_eq!(sliced.read_all().unwrap(), b"hello world");
+    assert_eq!(read_blob(&sliced), b"hello world");
 }
 
 #[test]
@@ -269,7 +318,7 @@ fn slice_negative_less_than_minus_size() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(-100), None, None, &limits()).unwrap();
     assert_eq!(sliced.size(), 5);
-    assert_eq!(sliced.read_all().unwrap(), b"hello");
+    assert_eq!(read_blob(&sliced), b"hello");
 }
 
 #[test]
@@ -278,9 +327,8 @@ fn slice_i64_min() {
     let seg = make_segment(src, 0, 5);
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(i64::MIN), None, None, &limits()).unwrap();
-    // i64::MIN is negative, abs() > u64::MAX for most sizes, so saturates to 0
     assert_eq!(sliced.size(), 5);
-    assert_eq!(sliced.read_all().unwrap(), b"hello");
+    assert_eq!(read_blob(&sliced), b"hello");
 }
 
 #[test]
@@ -320,7 +368,7 @@ fn slice_crosses_two_segments() {
     // Slice from position 3 to 8: "lo" + "wo"
     let sliced = blob.slice(Some(3), Some(8), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 5);
-    assert_eq!(sliced.read_all().unwrap(), b"lowor");
+    assert_eq!(read_blob(&sliced), b"lowor");
 }
 
 #[test]
@@ -335,7 +383,7 @@ fn slice_crosses_all_segments() {
 
     let sliced = blob.slice(Some(0), Some(9), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 9);
-    assert_eq!(sliced.read_all().unwrap(), b"aaabbbccc");
+    assert_eq!(read_blob(&sliced), b"aaabbbccc");
 }
 
 #[test]
@@ -375,7 +423,7 @@ fn slice_does_not_modify_original() {
     let seg = make_segment(src, 0, 11);
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let _sliced = blob.slice(Some(0), Some(5), None, &limits()).unwrap();
-    assert_eq!(blob.read_all().unwrap(), b"hello world");
+    assert_eq!(read_blob(&blob), b"hello world");
 }
 
 #[test]
@@ -386,8 +434,8 @@ fn slice_preserves_arc_pointers() {
     let sliced = blob.slice(Some(3), Some(8), None, &limits()).unwrap();
 
     // Verify that the sliced blob shares the same Arc pointer
-    let original_ptr = Arc::as_ptr(&blob.segments()[0].source);
-    let sliced_ptr = Arc::as_ptr(&sliced.segments()[0].source);
+    let original_ptr = blob.segment_source_ptr(0);
+    let sliced_ptr = sliced.segment_source_ptr(0);
     assert!(std::ptr::eq(original_ptr, sliced_ptr));
 }
 
@@ -398,6 +446,6 @@ fn slice_single_segment_fast_path() {
     let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
     let sliced = blob.slice(Some(1), Some(4), None, &limits()).unwrap();
     assert_eq!(sliced.size(), 3);
-    assert_eq!(sliced.read_all().unwrap(), b"ell");
+    assert_eq!(read_blob(&sliced), b"ell");
     assert_eq!(sliced.segment_count(), 1);
 }

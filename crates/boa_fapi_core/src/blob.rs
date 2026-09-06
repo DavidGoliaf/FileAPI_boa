@@ -65,6 +65,22 @@ impl BlobData {
     ) -> Result<Self, FileApiError> {
         let media_type = normalize_blob_type(media_type.as_ref());
 
+        // Validate every segment before filtering, so that zero-length segments
+        // with invalid offsets are still rejected.
+        for seg in &segments {
+            let source_len = seg.source.len();
+            if seg.offset > source_len {
+                return Err(FileApiError::InvalidRange);
+            }
+            let seg_end = seg
+                .offset
+                .checked_add(seg.len)
+                .ok_or(FileApiError::InvalidRange)?;
+            if seg_end > source_len {
+                return Err(FileApiError::InvalidRange);
+            }
+        }
+
         // Filter out zero-length segments to normalize, but preserve semantics.
         let segments: Vec<BlobSegment> = segments.into_iter().filter(|s| s.len > 0).collect();
 
@@ -74,19 +90,6 @@ impl BlobData {
 
         let mut total_size: u64 = 0;
         for seg in &segments {
-            // Validate offset <= source.len()
-            let source_len = seg.source.len();
-            if seg.offset > source_len {
-                return Err(FileApiError::InvalidRange);
-            }
-            // Validate offset + len <= source.len() with checked arithmetic
-            let seg_end = seg
-                .offset
-                .checked_add(seg.len)
-                .ok_or(FileApiError::InvalidRange)?;
-            if seg_end > source_len {
-                return Err(FileApiError::InvalidRange);
-            }
             // Accumulate total size with overflow check
             total_size = total_size
                 .checked_add(seg.len)
@@ -125,11 +128,40 @@ impl BlobData {
         self.segments.len()
     }
 
-    /// Returns a reference to the segments.
-    ///
-    /// Primarily intended for testing slice internals and verifying `Arc` pointer sharing.
-    pub fn segments(&self) -> &[BlobSegment] {
+    #[allow(dead_code)]
+    pub(crate) fn segments(&self) -> &[BlobSegment] {
         &self.segments
+    }
+
+    /// Returns the `Arc` pointer for the source of the segment at `index`.
+    ///
+    /// This is a testing accessor — it does not expose mutable internals.
+    pub fn segment_source_ptr(&self, index: usize) -> *const () {
+        Arc::as_ptr(&self.segments[index].source) as *const ()
+    }
+
+    /// Reads the entire blob content, up to `max_bytes`.
+    ///
+    /// Returns `Err(FileApiError::ResourceLimit(MaterializeBytes))` if the blob
+    /// size exceeds `max_bytes`. This prevents unbounded allocation.
+    pub fn materialize(
+        &self,
+        max_bytes: u64,
+        cancel: &crate::cancellation::CancellationToken,
+    ) -> Result<Vec<u8>, FileApiError> {
+        if self.size > max_bytes {
+            return Err(FileApiError::ResourceLimit(
+                ResourceLimitKind::MaterializeBytes,
+            ));
+        }
+        let mut result = Vec::with_capacity(self.size as usize);
+        for seg in &self.segments {
+            let bytes = seg
+                .source
+                .read_range(seg.offset..seg.offset + seg.len, cancel)?;
+            result.extend_from_slice(&bytes);
+        }
+        Ok(result)
     }
 
     /// Creates a new blob by slicing this blob per File API semantics.
@@ -241,21 +273,5 @@ impl BlobData {
             media_type: new_media_type,
             snapshot: SnapshotState::Memory,
         })
-    }
-
-    /// Reads the entire blob content by materializing all segments.
-    ///
-    /// This is primarily for testing. The production API does not expose
-    /// a single-shot materialization method.
-    pub fn read_all(&self) -> Result<Vec<u8>, FileApiError> {
-        let cancel = crate::cancellation::CancellationToken::new();
-        let mut result = Vec::with_capacity(self.size as usize);
-        for seg in &self.segments {
-            let bytes = seg
-                .source
-                .read_range(seg.offset..seg.offset + seg.len, &cancel)?;
-            result.extend_from_slice(&bytes);
-        }
-        Ok(result)
     }
 }
