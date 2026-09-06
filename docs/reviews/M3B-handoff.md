@@ -30,9 +30,15 @@
 ## Base / commit
 
 - Base: M3-A commit `59a8932`; branch `task/m3b`.
-- This handoff covers the M3-B stack on `task/m3b` (see `git log`):
-  `fb46cff` (initial M3-B), `13b8582` (M3B-rework R1–R3),
-  `829b26b` (implementation commit), `040211d` (final handoff-fix / HEAD).
+- Implementation baseline (code freeze): `fb46cff` (initial M3-B),
+  `13b8582` (M3B-rework R1–R3), `829b26b` (final implementation commit:
+  full `validate()` at `register()`). Validation/audit/coverage results in
+  this handoff describe this baseline.
+- Documentation-only handoff fixes after the baseline (`040211d`,
+  `8648a11`, and any later doc-only commits) change this handoff text
+  only — no production code, tests, or validation results. The current
+  HEAD is resolved via `git log`; it is not part of the implementation
+  baseline.
 
 ## Demo commands (work order §7, in order)
 
