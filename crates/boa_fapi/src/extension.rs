@@ -31,6 +31,8 @@ pub(crate) struct ExtensionConfig {
     pub(crate) clock: Arc<dyn Clock>,
     /// M1 resource limits for blob construction and slicing.
     pub(crate) limits: FileApiLimits,
+    /// Whether the M3-B streams shim is registered.
+    pub(crate) streams_shim: bool,
 }
 
 /// The registered classes and configuration of a context.
@@ -42,6 +44,9 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) file: StandardConstructor,
     /// FileList prototype (no public constructor exists).
     pub(crate) file_list_proto: JsObject,
+    /// Streams shim constructors/prototypes (present when enabled).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) streams: Option<crate::streams::StreamSpecs>,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
 }
@@ -84,6 +89,7 @@ pub(crate) fn snapshot(context: &Context) -> JsResult<RegisteredSpecs> {
 pub struct FileApiExtensionBuilder {
     clock: Option<Arc<dyn Clock>>,
     limits: Option<FileApiLimits>,
+    streams_shim: Option<bool>,
 }
 
 impl FileApiExtensionBuilder {
@@ -103,6 +109,16 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Enables or disables the M3-B streams shim registration.
+    ///
+    /// Defaults to `true`. When `false` (or the `streams-shim` Cargo
+    /// feature is off), `register` fails before touching `globalThis`
+    /// because no host stream adapter is implemented in this milestone.
+    pub fn streams_shim(&mut self, enabled: bool) -> &mut Self {
+        self.streams_shim = Some(enabled);
+        self
+    }
+
     /// Creates the extension.
     #[must_use]
     pub fn build(&self) -> FileApiExtension {
@@ -110,6 +126,7 @@ impl FileApiExtensionBuilder {
             config: ExtensionConfig {
                 clock: self.clock.clone().unwrap_or_else(|| Arc::new(SystemClock)),
                 limits: self.limits.clone().unwrap_or_default(),
+                streams_shim: self.streams_shim.unwrap_or(true),
             },
         }
     }
@@ -139,11 +156,23 @@ impl FileApiExtension {
             return Err(RegisterError::AlreadyRegistered);
         }
 
+        // Streams shim availability is checked before any globalThis
+        // mutation: without the shim there is no host stream adapter.
+        // The flag and the feature must both agree: the flag opts out at
+        // runtime, the feature opts out at compile time. The combined
+        // condition keeps both live in every feature configuration.
+        let shim_available = self.config.streams_shim && cfg!(feature = "streams-shim");
+        if !shim_available {
+            return Err(RegisterError::StreamsShimDisabled);
+        }
+
         // Build phase: no observable state changes yet. Constructors and
         // prototypes are ordinary objects until installed.
         let blob_spec = build_blob_class(context)?;
         let file_spec = build_file_class(context, blob_spec.prototype())?;
         let file_list_proto = build_file_list_prototype(context)?;
+        #[cfg(feature = "streams-shim")]
+        let stream_specs = crate::streams::build_stream_specs(context)?;
         // Preflight: extensibility and every own global name.
         let global = context.global_object();
         if !global.is_extensible(context).map_err(RegisterError::Js)? {
@@ -152,7 +181,15 @@ impl FileApiExtension {
         let keys = global
             .own_property_keys(context)
             .map_err(RegisterError::Js)?;
-        for name in ["Blob", "File", "FileList"] {
+        for name in [
+            "Blob",
+            "File",
+            "FileList",
+            #[cfg(feature = "streams-shim")]
+            "ReadableStream",
+            #[cfg(feature = "streams-shim")]
+            "ReadableStreamDefaultReader",
+        ] {
             let key = PropertyKey::from(js_string!(name));
             if keys.contains(&key) {
                 return Err(RegisterError::NameConflict(name.to_owned()));
@@ -160,7 +197,13 @@ impl FileApiExtension {
         }
 
         // Install phase with rollback.
-        if let Err(error) = install_globals(context, &blob_spec, &file_spec) {
+        if let Err(error) = install_globals(
+            context,
+            &blob_spec,
+            &file_spec,
+            #[cfg(feature = "streams-shim")]
+            &stream_specs,
+        ) {
             rollback_globals(context)?;
             return Err(RegisterError::Js(error));
         }
@@ -169,6 +212,8 @@ impl FileApiExtension {
             blob: blob_spec,
             file: file_spec,
             file_list_proto,
+            #[cfg(feature = "streams-shim")]
+            streams: Some(stream_specs),
             config: self.config.clone(),
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
@@ -226,17 +271,41 @@ struct OrdinaryPrototype;
 
 /// Installs `Blob` and `File` on the global object (Web IDL attributes:
 /// writable, non-enumerable, configurable). `FileList` installs nothing.
+/// The streams shim installs `ReadableStream` and
+/// `ReadableStreamDefaultReader` the same way.
 fn install_globals(
     context: &mut Context,
     blob_spec: &StandardConstructor,
     file_spec: &StandardConstructor,
+    #[cfg(feature = "streams-shim")] stream_specs: &crate::streams::StreamSpecs,
 ) -> JsResult<()> {
     let global = context.global_object();
-    for (name, spec) in [("Blob", blob_spec), ("File", file_spec)] {
+    for (name, constructor) in [
+        ("Blob", blob_spec.constructor()),
+        ("File", file_spec.constructor()),
+    ] {
         global.define_property_or_throw(
             js_string!(name),
             PropertyDescriptor::builder()
-                .value(spec.constructor())
+                .value(constructor)
+                .writable(true)
+                .enumerable(false)
+                .configurable(true),
+            context,
+        )?;
+    }
+    #[cfg(feature = "streams-shim")]
+    for (name, constructor) in [
+        ("ReadableStream", stream_specs.stream.constructor()),
+        (
+            "ReadableStreamDefaultReader",
+            stream_specs.reader.constructor(),
+        ),
+    ] {
+        global.define_property_or_throw(
+            js_string!(name),
+            PropertyDescriptor::builder()
+                .value(constructor)
                 .writable(true)
                 .enumerable(false)
                 .configurable(true),
@@ -249,7 +318,14 @@ fn install_globals(
 /// Removes partially installed globals after a failed install.
 fn rollback_globals(context: &mut Context) -> Result<(), RegisterError> {
     let global = context.global_object();
-    for name in ["Blob", "File"] {
+    for name in [
+        "Blob",
+        "File",
+        #[cfg(feature = "streams-shim")]
+        "ReadableStream",
+        #[cfg(feature = "streams-shim")]
+        "ReadableStreamDefaultReader",
+    ] {
         // The property was just defined as configurable, so deletion succeeds
         // on ordinary globals. A hostile exotic global may still refuse; the
         // reported error then reflects the rollback failure.

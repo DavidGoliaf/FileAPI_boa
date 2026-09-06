@@ -189,6 +189,7 @@ fn internal_binding_modules_expose_no_public_items() {
         "file.rs",
         "file_list.rs",
         "promise_read.rs",
+        "streams.rs",
         "webidl.rs",
     ] {
         let content = read(&src.join(module));
@@ -219,8 +220,60 @@ fn lib_rs_denies_unsafe_and_limits_re_exports() {
 }
 
 #[test]
-fn no_stream_filereader_or_dom_surface() {
-    // M3-A must not register streams, readers, events, or DOM shims.
+fn streams_shim_surface_is_bounded() {
+    // M3-B registers exactly the ordered surface: two globals, five
+    // stream/reader methods, one accessor, two tags. No pipe/tee/iterator,
+    // BYOB, controller, strategy, transform/writable, decoder, reader,
+    // event, or DOM API may appear in the shim module.
+    let streams = read(&workspace_root().join("crates/boa_fapi/src/streams.rs"));
+    for required in [
+        "\"ReadableStream\"",
+        "\"ReadableStreamDefaultReader\"",
+        "\"getReader\"",
+        "\"cancel\"",
+        "\"locked\"",
+        "\"read\"",
+        "\"releaseLock\"",
+    ] {
+        assert!(
+            streams.contains(required),
+            "streams.rs must contain {required}"
+        );
+    }
+    for forbidden in [
+        "pipeTo",
+        "pipeThrough",
+        "tee",
+        "AsyncIterator",
+        "BYOB",
+        "Controller",
+        "Strategy",
+        "TransformStream",
+        "WritableStream",
+        "TextDecoder",
+        "FileReader",
+        "EventTarget",
+        "DOMException",
+        "ReadableStreamBYOBReader",
+    ] {
+        let mut hits = 0;
+        for line in streams.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "streams.rs must not contain {forbidden}");
+    }
+}
+
+#[test]
+fn no_filereader_or_dom_surface() {
+    // Neither M3-A nor M3-B introduces readers, events, or DOM shims.
+    // (The M3-B streams shim is covered by the bounded-surface guard above.)
     let src = workspace_root().join("crates/boa_fapi/src");
     let mut all = String::new();
     for entry in walk_rs(&src) {
@@ -228,18 +281,16 @@ fn no_stream_filereader_or_dom_surface() {
         all.push('\n');
     }
     for forbidden in [
-        "\"stream\"",
-        "\"textStream\"",
         "\"FileReader\"",
         "\"FileReaderSync\"",
         "\"EventTarget\"",
         "\"DOMException\"",
-        "ReadableStream",
         "FileReader",
         "DOMException",
     ] {
-        // `js_read_error` documents the absence of DOMException; that
-        // comment is the only allowed mention.
+        // `js_read_error` documents the absence of DOMException and the
+        // streams module names its error mapping; comments are the only
+        // allowed mentions.
         let mut hits = 0;
         for line in all.lines() {
             let trimmed = line.trim();
@@ -250,18 +301,12 @@ fn no_stream_filereader_or_dom_surface() {
                 hits += 1;
             }
         }
-        assert_eq!(hits, 0, "M3-A must not introduce {forbidden}");
+        assert_eq!(hits, 0, "must not introduce {forbidden}");
     }
-    // No M3-B/M4 global is registered by the extension either.
     let extension = read(&src.join("extension.rs"));
     assert!(
-        !extension.contains("stream"),
-        "extension must not mention stream"
-    );
-    let blob = read(&src.join("blob.rs"));
-    assert!(
-        !blob.contains("textStream"),
-        "blob.rs must not mention textStream"
+        extension.contains("stream"),
+        "extension must register the streams shim"
     );
 }
 

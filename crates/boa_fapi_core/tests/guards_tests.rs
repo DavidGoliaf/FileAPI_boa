@@ -66,7 +66,8 @@ fn public_api_no_path_types() {
 
 // ──────────────────────────────────────────────
 // Public BlobData API guard: exactly the fixed M1 contract + M2
-// no-copy composition primitives, no test probes or content reads
+// no-copy composition primitives + M3 bounded read + M3-B reader,
+// no test probes or content reads
 // ──────────────────────────────────────────────
 
 #[test]
@@ -87,13 +88,28 @@ fn blob_data_public_api_is_fixed() {
         "pub fn concat_shared(",
         "pub fn push_shared(",
         "pub fn materialize(",
+        "pub fn reader(",
         "pub fn slice(",
     ];
     let mut actual = Vec::new();
+    let mut in_blobdata_impl = false;
+    let mut brace_depth = 0i32;
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("pub fn ") {
-            actual.push(trimmed.to_owned());
+        // Only the `impl BlobData` block counts; `impl BlobReader` and the
+        // test module have their own guards.
+        if trimmed.starts_with("impl BlobData") {
+            in_blobdata_impl = true;
+        }
+        if in_blobdata_impl {
+            brace_depth += line.chars().filter(|&c| c == '{').count() as i32;
+            brace_depth -= line.chars().filter(|&c| c == '}').count() as i32;
+            if trimmed.starts_with("pub fn ") {
+                actual.push(trimmed.to_owned());
+            }
+            if brace_depth <= 0 && line.contains('}') && !actual.is_empty() {
+                break;
+            }
         }
     }
     assert_eq!(
@@ -107,19 +123,60 @@ fn blob_data_public_api_is_fixed() {
             "unexpected BlobData public method: {line} (expected {expected})"
         );
     }
-    // Exactly one bounded byte-read primitive (M3) beyond segments/probes.
+    // Exactly one bounded byte-read primitive (M3) plus the bounded
+    // incremental reader (M3-B); no segments/probes/positions/sources.
     for forbidden in [
         "pub fn segments(",
         "pub fn read_all(",
         "pub fn shares_sources_with(",
         "pub fn first_segment_shares_source_with(",
         "pub fn segment_source_ptr(",
+        "pub fn position(",
+        "pub fn source(",
     ] {
         assert!(
             !content.contains(forbidden),
             "blob.rs must not expose {forbidden}"
         );
     }
+}
+
+#[test]
+fn blob_reader_public_api_is_fixed() {
+    let blob_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blob.rs");
+    let content = match std::fs::read_to_string(&blob_rs) {
+        Ok(s) => s,
+        Err(e) => panic!("could not read blob.rs: {e}"),
+    };
+    // `BlobReader` exposes exactly `read_next` and `cancel`.
+    let mut actual = Vec::new();
+    let mut in_reader_impl = false;
+    let mut brace_depth = 0i32;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("impl BlobReader") {
+            in_reader_impl = true;
+        }
+        if in_reader_impl {
+            brace_depth += line.chars().filter(|&c| c == '{').count() as i32;
+            brace_depth -= line.chars().filter(|&c| c == '}').count() as i32;
+            if trimmed.starts_with("pub fn ") {
+                actual.push(trimmed.to_owned());
+            }
+            if brace_depth <= 0 && line.contains('}') && !actual.is_empty() {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        actual,
+        vec![
+            "pub fn read_next(&mut self) -> Result<Option<bytes::Bytes>, FileApiError> {"
+                .to_owned(),
+            "pub fn cancel(&mut self) {".to_owned(),
+        ],
+        "BlobReader public API changed: {actual:?}"
+    );
 }
 
 fn walk_src_files(dir: &std::path::Path) -> Vec<(String, String)> {

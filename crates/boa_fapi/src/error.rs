@@ -19,6 +19,13 @@ pub enum RegisterError {
     /// A required global name is already an own property of the global object.
     #[error("global name `{0}` is already defined")]
     NameConflict(String),
+    /// The streams shim is disabled but a host stream adapter is required.
+    ///
+    /// Returned before any `globalThis` mutation when the `streams-shim`
+    /// Cargo feature is off or `streams_shim(false)` was configured: this
+    /// milestone implements no host stream adapter.
+    #[error("the streams shim is disabled and no host stream adapter is available")]
+    StreamsShimDisabled,
     /// A Boa engine error occurred while building or installing the classes.
     #[error(transparent)]
     Js(#[from] JsError),

@@ -194,3 +194,55 @@ message (`js_read_error`); packaging-ошибка движка reject-ится �
 
 Последствия: тип rejection предсказуем и проверен JS-тестами на границе
 `size == limit` / `size == limit + 1`.
+
+## ADR-0014 (M3-B): bounded `BlobReader` вместо materialization для потоков
+
+Контекст: стриминг обязан выдавать данные по demand без чтения всего Blob;
+`materialize()` для этого непригоден (память O(size), нарушение
+backpressure), переписывать его запрещено.
+
+Решение: `BlobData::reader(limits)` snapshot-ит `default_chunk_size`
+(валидация `16 KiB..=1 MiB`, без silent clamp) и возвращает `BlobReader`
+с приватным курсором. `read_next()` выдаёт максимум один chunk
+`min(chunk, remaining)` за O(chunk) памяти, пересекая сегменты с checked
+arithmetic и exact-length проверками источника; short/long/cancel/source
+ошибки делают reader terminal с replay того же класса без новых чтений.
+`cancel()` идемпотентен и изолирован. Guard фиксирует 11 методов
+`BlobData` + 2 метода `BlobReader`; позиции/сегменты/источники не публичны.
+
+Последствия: bindings читают строго по demand; whole-Blob materialization
+в stream-пути отсутствует по построению.
+
+## ADR-0015 (M3-B): capability-checked shim вместо WHATWG Streams
+
+Контекст: Boa 0.22 не содержит `ReadableStream`; полный WHATWG Streams вне
+scope M3-B, но `stream()`/`textStream()` обязаны возвращать настоящие
+брендированные объекты с demand-семантикой.
+
+Решение: `streams.rs` + Cargo feature `streams-shim` (default on) +
+`FileApiExtensionBuilder::streams_shim(bool)` (default true). Регистрируются
+только 2 globals, 5 методов, 1 accessor, 2 toStringTag; конструкторы
+неконструируемы (`TypeError`). Бренд — native data с shared
+`Rc<RefCell<StreamShared>>` (только Rust-состояние); jobs захватывают
+shared cell + resolvers и ставят ровно одну job на `read()`. Отключение
+(feature off или `streams_shim(false)`) возвращает typed
+`RegisterError::StreamsShimDisabled` до мутации `globalThis`; конфликты
+глобалов и нерасширяемость — fail-fast с atomic rollback, как M2.
+
+Последствия: отсутствие host-адаптера честно сигнализируется вместо
+заглушек; M2 preflight/rollback атомарно охватывают новые globals.
+
+## ADR-0016 (M3-B): incremental UTF-8 decoder без `encoding_rs`
+
+Контекст: `textStream()` обязан не выдавать U+FFFD раньше EOF при split
+multibyte-последовательности; разрешённая зависимость `encoding_rs`
+не понадобилась.
+
+Решение: собственный `Utf8Decoder` (~60 строк): `push()` отделяет
+валидный префикс через `incomplete_tail_len` (только строгие
+продолжения лидеров, max 3 байта буфера), `flush()` на EOF превращает
+остаток в U+FFFD побайтово — итог равен `from_utf8_lossy` на всём входе
+без его материализации. Новых dependencies нет.
+
+Последствия: split на любой байтовой границе доказан JS-тестами;
+зависимость не добавлена, ADR о ней не нужен.

@@ -3,11 +3,13 @@
 //! The segmentation is an internal representation detail. The public API
 //! exposes only the fixed M1 contract (`empty`, `from_segments`, `size`,
 //! `media_type`, `snapshot`, `segment_count`, `slice`), the M2 no-copy
-//! composition primitives (`concat_shared`, `push_shared`) and the single
-//! M3 bounded byte-read primitive (`materialize`). No segment accessor,
-//! unbounded read, source-identity or other test probe is public:
-//! [`BlobSegment`] fields are public solely so that `from_segments` can
-//! accept caller-owned segments as *input*.
+//! composition primitives (`concat_shared`, `push_shared`), the single
+//! M3 bounded byte-read primitive (`materialize`), and the M3-B bounded
+//! incremental reader (`BlobData::reader` plus `BlobReader`). No segment
+//! accessor, unbounded read, position/source/identity probe, or content
+//! accumulation accessor is public: [`BlobSegment`] fields are public
+//! solely so that `from_segments` can accept caller-owned segments as
+//! *input*.
 
 use std::sync::Arc;
 
@@ -265,6 +267,32 @@ impl BlobData {
         Ok(bytes::Bytes::from(out))
     }
 
+    /// Opens a bounded incremental reader over this blob.
+    ///
+    /// Snapshots `limits.default_chunk_size` (validated to
+    /// `16 KiB..=1 MiB`) as the per-`read_next` chunk ceiling. Reads no
+    /// data. Out-of-range chunk sizes yield a typed `ResourceLimit` error
+    /// with no silent clamp.
+    pub fn reader(&self, limits: &FileApiLimits) -> Result<BlobReader, FileApiError> {
+        const MIN_CHUNK: usize = 16 * 1024;
+        const MAX_CHUNK: usize = 1024 * 1024;
+        let chunk_size = limits.default_chunk_size;
+        if !(MIN_CHUNK..=MAX_CHUNK).contains(&chunk_size) {
+            return Err(FileApiError::ResourceLimit(
+                ResourceLimitKind::MaterializeBytes,
+            ));
+        }
+        Ok(BlobReader {
+            segments: self.segments.clone(),
+            seg_index: 0,
+            seg_offset: 0,
+            remaining: self.size,
+            chunk_size,
+            cancelled: false,
+            errored: None,
+        })
+    }
+
     /// Creates a new blob by slicing this blob per File API semantics.
     ///
     /// `start` and `end` follow the File API integer conversion rules:
@@ -374,6 +402,156 @@ impl BlobData {
             media_type: new_media_type,
             snapshot: SnapshotState::Memory,
         })
+    }
+}
+
+/// Bounded incremental reader over a [`BlobData`]'s logical byte range.
+///
+/// Created by [`BlobData::reader`]; yields at most one chunk per
+/// [`BlobReader::read_next`] call, in source order, without ever calling
+/// `materialize` or reading ahead. Temporary memory is O(chunk size).
+/// Cancellation and terminal errors are sticky: after either, `read_next`
+/// returns `Ok(None)` or the same error class without further source reads.
+#[derive(Debug)]
+pub struct BlobReader {
+    /// Shared segment list snapshot; positions stay private.
+    segments: Vec<BlobSegment>,
+    /// Index of the segment containing the read cursor.
+    seg_index: usize,
+    /// Offset of the read cursor within that segment.
+    seg_offset: u64,
+    /// Logical bytes not yet delivered.
+    remaining: u64,
+    /// Per-call chunk ceiling snapshotted from limits at `reader()` time.
+    chunk_size: usize,
+    /// Sticky cancellation flag set by [`BlobReader::cancel`].
+    cancelled: bool,
+    /// Sticky terminal error class; further calls replay it without reads.
+    errored: Option<BlobReaderErrorClass>,
+}
+
+/// Terminal error class replayed by an errored [`BlobReader`].
+///
+/// The class (not the message) is sticky: every call after the first
+/// failure returns the same class without touching the source again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobReaderErrorClass {
+    /// A resource limit was exceeded.
+    ResourceLimit(ResourceLimitKind),
+    /// The read was cancelled.
+    Cancelled,
+    /// A range or source-output check failed.
+    InvalidRange,
+}
+
+impl From<BlobReaderErrorClass> for FileApiError {
+    fn from(class: BlobReaderErrorClass) -> Self {
+        match class {
+            BlobReaderErrorClass::ResourceLimit(kind) => FileApiError::ResourceLimit(kind),
+            BlobReaderErrorClass::Cancelled => FileApiError::Cancelled,
+            BlobReaderErrorClass::InvalidRange => FileApiError::InvalidRange,
+        }
+    }
+}
+
+impl From<&FileApiError> for BlobReaderErrorClass {
+    fn from(error: &FileApiError) -> Self {
+        match error {
+            FileApiError::ResourceLimit(kind) => BlobReaderErrorClass::ResourceLimit(*kind),
+            FileApiError::Cancelled => BlobReaderErrorClass::Cancelled,
+            _ => BlobReaderErrorClass::InvalidRange,
+        }
+    }
+}
+
+impl BlobReader {
+    /// Reads at most one chunk: `min(chunk_size, remaining)` logical bytes.
+    ///
+    /// After cancellation or EOF returns idempotent `Ok(None)` without a
+    /// source read. On any source/cancel/range failure records the terminal
+    /// error class and returns `Err` with no partial chunk.
+    pub fn read_next(&mut self) -> Result<Option<bytes::Bytes>, FileApiError> {
+        if self.cancelled {
+            return Ok(None);
+        }
+        if let Some(class) = self.errored {
+            return Err(FileApiError::from(class));
+        }
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let chunk_len = (self.chunk_size as u64).min(self.remaining);
+        let capacity = usize::try_from(chunk_len)
+            .map_err(|_| FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes))?;
+        let mut out: Vec<u8> = Vec::new();
+        out.try_reserve_exact(capacity)
+            .map_err(|_| FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes))?;
+        let mut need = chunk_len;
+        while need > 0 {
+            let Some(seg) = self.segments.get(self.seg_index) else {
+                self.errored = Some(BlobReaderErrorClass::InvalidRange);
+                return Err(FileApiError::InvalidRange);
+            };
+            let seg_remaining = seg.len.saturating_sub(self.seg_offset);
+            if seg_remaining == 0 {
+                self.seg_index = self.seg_index.saturating_add(1);
+                self.seg_offset = 0;
+                continue;
+            }
+            let take = need.min(seg_remaining);
+            let source_offset = seg
+                .offset
+                .checked_add(self.seg_offset)
+                .ok_or(FileApiError::InvalidRange)?;
+            let source_end = source_offset
+                .checked_add(take)
+                .ok_or(FileApiError::InvalidRange)?;
+            let expected_len = usize::try_from(take)
+                .map_err(|_| FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes))?;
+            let chunk = seg.source.read_range(
+                source_offset..source_end,
+                &crate::cancellation::CancellationToken::new(),
+            );
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.errored = Some(BlobReaderErrorClass::from(&error));
+                    return Err(error);
+                }
+            };
+            if chunk.len() != expected_len {
+                self.errored = Some(BlobReaderErrorClass::InvalidRange);
+                return Err(FileApiError::InvalidRange);
+            }
+            let next_len =
+                out.len()
+                    .checked_add(expected_len)
+                    .ok_or(FileApiError::ResourceLimit(
+                        ResourceLimitKind::MaterializeBytes,
+                    ))?;
+            if next_len > capacity {
+                self.errored = Some(BlobReaderErrorClass::InvalidRange);
+                return Err(FileApiError::InvalidRange);
+            }
+            out.extend_from_slice(&chunk);
+            self.seg_offset = self.seg_offset.saturating_add(take);
+            need = need.saturating_sub(take);
+            self.remaining = self.remaining.saturating_sub(take);
+        }
+        if out.len() != capacity {
+            self.errored = Some(BlobReaderErrorClass::InvalidRange);
+            return Err(FileApiError::InvalidRange);
+        }
+        Ok(Some(bytes::Bytes::from(out)))
+    }
+
+    /// Cancels the reader idempotently.
+    ///
+    /// Affects only this reader: the blob, its sources, the limits, and
+    /// every other reader are untouched. After cancel, `read_next` returns
+    /// `Ok(None)` without further source reads.
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
     }
 }
 
@@ -1125,6 +1303,177 @@ mod tests {
         let offset = u64::MAX;
         let len = 1u64;
         assert!(offset.checked_add(len).is_none());
+    }
+
+    // ──────────────────────────────────────────────
+    // BlobReader
+    // ──────────────────────────────────────────────
+
+    fn small_limits(chunk_size: usize) -> FileApiLimits {
+        FileApiLimits {
+            default_chunk_size: chunk_size,
+            ..limits()
+        }
+    }
+
+    fn reader_blob(data: &[u8], chunk_size: usize) -> (BlobData, FileApiLimits) {
+        let blob = BlobData::from_segments(
+            vec![make_segment(make_source(data), 0, data.len() as u64)],
+            "",
+            &limits(),
+        )
+        .unwrap();
+        (blob, small_limits(chunk_size))
+    }
+
+    fn drain(reader: &mut BlobReader) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(chunk) = reader.read_next().unwrap() {
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
+
+    #[test]
+    fn reader_rejects_zero_and_out_of_range_chunk_size() {
+        let blob = BlobData::empty("");
+        for bad in [0usize, 16 * 1024 - 1, 1024 * 1024 + 1] {
+            assert!(matches!(
+                blob.reader(&small_limits(bad)),
+                Err(FileApiError::ResourceLimit(
+                    ResourceLimitKind::MaterializeBytes
+                ))
+            ));
+        }
+        for good in [16 * 1024, 64 * 1024, 1024 * 1024] {
+            assert!(blob.reader(&small_limits(good)).is_ok());
+        }
+    }
+
+    #[test]
+    fn reader_empty_blob_yields_done_immediately() {
+        let blob = BlobData::empty("");
+        let mut reader = blob.reader(&limits()).unwrap();
+        assert!(reader.read_next().unwrap().is_none());
+        assert!(reader.read_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_delivers_exact_chunks_in_order() {
+        let data: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
+        let (blob, limits) = reader_blob(&data, 16 * 1024);
+        let mut reader = blob.reader(&limits).unwrap();
+        let first = reader.read_next().unwrap().expect("one chunk");
+        assert_eq!(&first[..], &data[..]);
+        assert!(reader.read_next().unwrap().is_none());
+        assert!(reader.read_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_splits_across_segments_preserving_order() {
+        let src1 = make_source(b"hello");
+        let src2 = make_source(b" world!!!");
+        let blob = BlobData::from_segments(
+            vec![make_segment(src1, 0, 5), make_segment(src2, 0, 9)],
+            "",
+            &limits(),
+        )
+        .unwrap();
+        let chunk_limits = small_limits(16 * 1024);
+        let mut reader = blob.reader(&chunk_limits).unwrap();
+        assert_eq!(&drain(&mut reader)[..], b"hello world!!!");
+    }
+
+    #[test]
+    fn reader_never_exceeds_chunk_ceiling() {
+        let data = vec![7u8; 40 * 1024];
+        let (blob, limits) = reader_blob(&data, 16 * 1024);
+        let mut reader = blob.reader(&limits).unwrap();
+        let first = reader.read_next().unwrap().expect("chunk 1");
+        assert_eq!(first.len(), 16 * 1024);
+        let second = reader.read_next().unwrap().expect("chunk 2");
+        assert_eq!(second.len(), 16 * 1024);
+        let third = reader.read_next().unwrap().expect("chunk 3");
+        assert_eq!(third.len(), 8 * 1024);
+        assert!(reader.read_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_cancel_is_idempotent_and_isolated() {
+        let (blob, limits) = reader_blob(b"hello world", 16 * 1024);
+        let mut a = blob.reader(&limits).unwrap();
+        let mut b = blob.reader(&limits).unwrap();
+        a.cancel();
+        a.cancel();
+        assert!(a.read_next().unwrap().is_none());
+        assert!(a.read_next().unwrap().is_none());
+        assert_eq!(&drain(&mut b)[..], b"hello world");
+        assert_eq!(blob.size(), 11);
+    }
+
+    #[test]
+    fn reader_terminal_error_replays_without_new_reads() {
+        struct CountingShort {
+            inner: MemorySource,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ByteSource for CountingShort {
+            fn len(&self) -> u64 {
+                self.inner.len()
+            }
+            fn snapshot(&self) -> crate::snapshot::SnapshotState {
+                self.inner.snapshot()
+            }
+            fn read_range(
+                &self,
+                _range: std::ops::Range<u64>,
+                _cancel: &CancellationToken,
+            ) -> Result<Bytes, FileApiError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::copy_from_slice(b"shor"))
+            }
+        }
+        let source: Arc<dyn ByteSource> = Arc::new(CountingShort {
+            inner: MemorySource::new(Bytes::copy_from_slice(b"hello")),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let blob =
+            BlobData::from_segments(vec![make_segment(source, 0, 5)], "", &limits()).unwrap();
+        let mut reader = blob.reader(&small_limits(16 * 1024)).unwrap();
+        assert!(matches!(
+            reader.read_next(),
+            Err(FileApiError::InvalidRange)
+        ));
+        assert!(matches!(
+            reader.read_next(),
+            Err(FileApiError::InvalidRange)
+        ));
+    }
+
+    #[test]
+    fn reader_propagates_source_error_as_same_class() {
+        struct Failing;
+        impl ByteSource for Failing {
+            fn len(&self) -> u64 {
+                4
+            }
+            fn snapshot(&self) -> crate::snapshot::SnapshotState {
+                crate::snapshot::SnapshotState::Memory
+            }
+            fn read_range(
+                &self,
+                _range: std::ops::Range<u64>,
+                _cancel: &CancellationToken,
+            ) -> Result<Bytes, FileApiError> {
+                Err(FileApiError::Cancelled)
+            }
+        }
+        let blob =
+            BlobData::from_segments(vec![make_segment(Arc::new(Failing), 0, 4)], "", &limits())
+                .unwrap();
+        let mut reader = blob.reader(&small_limits(16 * 1024)).unwrap();
+        assert!(matches!(reader.read_next(), Err(FileApiError::Cancelled)));
+        assert!(matches!(reader.read_next(), Err(FileApiError::Cancelled)));
     }
 
     // ──────────────────────────────────────────────

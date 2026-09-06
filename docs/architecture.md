@@ -47,11 +47,9 @@ Native data owns `Arc<BlobData>` plus immutable Rust strings/numbers only;
 it contains no `JsObject`/`JsValue`/`Context` and is GC-safe through the
 `boa_gc` derive with `#[unsafe_ignore_trace]` on non-GC fields.
 
-Not implemented (rest of M3, M4+): promise-returning reads beyond the three
-methods, streams, FileReader, DOM events, blob URLs, structured clone.
+Not implemented (M4+): FileReader, DOM events, blob URLs, structured clone.
 
 ### Layer 2b: `boa_fapi` promise reads (M3-A)
-
 `promise_read.rs` owns the single conversion/packaging/scheduling path for
 `Blob.prototype.text()`, `arrayBuffer()`, and `bytes()`:
 
@@ -64,6 +62,22 @@ methods, streams, FileReader, DOM events, blob URLs, structured clone.
 - `MaterializeBytes` rejects as `RangeError`; other read failures reject as
   plain `Error` (no `DOMException` before M4); the embedder runs
   `context.run_jobs()` explicitly — the job never calls it itself.
+
+### Layer 2c: `boa_fapi` streams shim (M3-B)
+`streams.rs` owns the branded `ReadableStream` shim:
+
+- `Blob.prototype.stream()`/`textStream()` (Blob-brand only, inherited by
+  `File`) create fresh unlocked streams backed by a bounded `BlobReader`;
+  nothing is read until `reader.read()`;
+- each `read()` creates one pending promise and enqueues exactly one
+  `PromiseJob` that pumps at most one `read_next()` chunk: fresh
+  `Uint8Array` or incremental UTF-8 string, `{value, done}` settlement,
+  EOF with decoder flush, sticky terminal error/cancel states;
+- `ReadableStream`/`ReadableStreamDefaultReader` constructors reject direct
+  `new`; `getReader` locks, `releaseLock` unlocks only with no queued read,
+  stream/reader `cancel()` resolve `undefined` idempotently through jobs;
+- full WHATWG Streams, FileReader, events, and DOMException stay absent by
+  construction (bounded-surface guard).
 
 ### Layer 3: Host adapters (future M5+)
 

@@ -462,22 +462,22 @@ fn materialize_limit_boundary() {
 }
 
 // ──────────────────────────────────────────────
-// 9. No accidental M4 / M3-B surface
+// 9. No accidental M4 surface (M3-B streams are expected to exist)
 // ──────────────────────────────────────────────
 
 #[test]
-fn no_stream_filereader_or_dom_globals_appear() {
+fn no_filereader_or_dom_globals_appear() {
     let mut context = setup();
     assert_eval(
         &mut context,
         r"
-        typeof Blob.prototype.stream === 'undefined'
-        && typeof Blob.prototype.textStream === 'undefined'
+        typeof Blob.prototype.stream === 'function'
+        && typeof Blob.prototype.textStream === 'function'
         && typeof globalThis.FileReader === 'undefined'
         && typeof globalThis.FileReaderSync === 'undefined'
         && typeof globalThis.EventTarget === 'undefined'
         && typeof globalThis.DOMException === 'undefined'
-        && typeof globalThis.ReadableStream === 'undefined'
+        && typeof globalThis.ReadableStream === 'function'
         ",
     );
 }
