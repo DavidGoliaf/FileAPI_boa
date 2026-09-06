@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/boa_fapi_core",
+    "crates/boa_fapi",
+    "crates/boa_fapi_fs",
+    "crates/boa_fapi_wpt",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91.0"
+license = "MIT"
+repository = "https://github.com/nickel-org/boa-fapi"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+todo = "deny"
+unimplemented = "deny"
+field_reassign_with_default = "allow"
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+proptest = "1"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true

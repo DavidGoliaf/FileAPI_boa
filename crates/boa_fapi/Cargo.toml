@@ -1,0 +1,10 @@
+[package]
+name = "boa_fapi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Boa File API bindings (placeholder — functionality arrives in M2)"
+
+[lints]
+workspace = true
