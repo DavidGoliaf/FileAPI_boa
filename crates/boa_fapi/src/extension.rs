@@ -166,19 +166,18 @@ impl FileApiExtension {
             return Err(RegisterError::StreamsShimDisabled);
         }
 
-        // Host limits that affect construction are validated before any
-        // globalThis mutation: an invalid configuration fails with a typed
-        // error and installs nothing. The stream chunk-size range lives in
-        // `BlobData::reader` (checked per stream); validating the whole
-        // ordering here would reject pre-existing M1/M2 limit fixtures, so
-        // registration enforces only the structural chunk-size bound.
-        const MIN_CHUNK: usize = 16 * 1024;
-        const MAX_CHUNK: usize = 1024 * 1024;
-        if !(MIN_CHUNK..=MAX_CHUNK).contains(&self.config.limits.default_chunk_size) {
-            return Err(RegisterError::Js(crate::error::range_error(&format!(
-                "invalid FileApiLimits: default_chunk_size {} out of range 16384..=1048576",
-                self.config.limits.default_chunk_size
-            ))));
+        // Host limits are validated before any globalThis mutation: an
+        // invalid configuration fails with a typed error and installs
+        // nothing. This is the full `FileApiLimits::validate()` contract,
+        // including the M3-B stream chunk-size range.
+        if let Err(error) = self.config.limits.validate() {
+            let message = format!("invalid FileApiLimits: {error}");
+            return Err(match error {
+                boa_fapi_core::file_api_error::FileApiError::ResourceLimit(_) => {
+                    RegisterError::Js(crate::error::range_error(&message))
+                }
+                _ => RegisterError::Js(crate::error::type_error(&message)),
+            });
         }
 
         // Build phase: no observable state changes yet. Constructors and

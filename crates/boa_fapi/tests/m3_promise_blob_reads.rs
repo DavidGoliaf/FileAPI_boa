@@ -38,10 +38,21 @@ fn setup() -> Context {
 }
 
 /// Creates a clean context with `max_materialize_bytes` overridden.
+///
+/// Narrow per-operation fixture: the materialize/sync ceilings shrink
+/// together while the blob ceiling keeps its default, so the whole-config
+/// `validate()` (sync <= materialize <= blob, chunk <= materialize) still
+/// passes and the materialize limit is enforced per read by `materialize()`.
+/// (Requires max_materialize_bytes >= 64 KiB so the default chunk fits.)
 fn setup_with_materialize_limit(max_materialize_bytes: u64) -> Context {
     let mut context = Context::default();
+    assert!(
+        max_materialize_bytes >= 64 * 1024,
+        "fixture materialize ceiling must fit the default chunk size"
+    );
     let limits = boa_fapi_core::limits::FileApiLimits {
         max_materialize_bytes,
+        max_sync_read_bytes: max_materialize_bytes.min(32 * 1024 * 1024),
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
     FileApiExtension::builder()
@@ -397,21 +408,26 @@ fn bytes_results_are_independent() {
 
 #[test]
 fn over_materialize_limit_rejects_with_range_error() {
-    let mut context = setup_with_materialize_limit(4);
+    // A 70 KiB ceiling (above the 64 KiB chunk floor) with a 70 KiB+1 blob:
+    // the limit is enforced per read by `materialize()`.
+    let mut context = setup_with_materialize_limit(70 * 1024);
+    let big = "new Uint8Array(70 * 1024 + 1)";
     assert_eval(
         &mut context,
-        r"
-        (() => {
+        &format!(
+            r"
+        (() => {{
             globalThis.outcome = 'pending';
-            globalThis.p = new Blob(['hello']).text();
+            globalThis.p = new Blob([{big}]).text();
             globalThis.p.then(
-                () => { globalThis.outcome = 'fulfilled'; },
-                error => { globalThis.outcome = error instanceof RangeError ? 'range' : 'other:' + error.name; }
+                () => {{ globalThis.outcome = 'fulfilled'; }},
+                error => {{ globalThis.outcome = error instanceof RangeError ? 'range' : 'other:' + error.name; }}
             );
             // Still pending: the rejection happens in the job.
             return globalThis.outcome === 'pending' && (globalThis.p instanceof Promise);
-        })()
-        ",
+        }})()
+        "
+        ),
     );
     context.run_jobs().expect("run_jobs failed");
     assert_eval(&mut context, "globalThis.outcome === 'range'");
@@ -424,38 +440,45 @@ fn over_materialize_limit_rejects_with_range_error() {
 
 #[test]
 fn materialize_limit_boundary() {
-    let mut context = setup_with_materialize_limit(5);
-    // size == limit succeeds for every method.
+    // 64 KiB ceiling: `size == limit` succeeds, `size == limit + 1` rejects.
+    let mut context = setup_with_materialize_limit(64 * 1024);
+    let exact = "new Uint8Array(64 * 1024)";
+    let over = "new Uint8Array(64 * 1024 + 1)";
+    // size == limit succeeds for every method (byte-exact check via lengths).
     assert_async_body(
         &mut context,
-        r"
+        &format!(
+            r"
 
-            var t = await new Blob(['hello']).text();
-            var ab = await new Blob(['hello']).arrayBuffer();
-            var u8 = await new Blob(['hello']).bytes();
-            return t === 'hello' && ab.byteLength === 5 && u8.length === 5;
+            var t = await new Blob([{exact}]).arrayBuffer();
+            var ab = await new Blob([{exact}]).arrayBuffer();
+            var u8 = await new Blob([{exact}]).bytes();
+            return t.byteLength === 64 * 1024 && ab.byteLength === 64 * 1024 && u8.length === 64 * 1024;
 
-        ",
+        "
+        ),
     );
     // size == limit + 1 rejects for every method.
     assert_eval(
         &mut context,
-        r"
-        (() => {
+        &format!(
+            r"
+        (() => {{
             globalThis.rejections = 0;
             for (var read of [
-                new Blob(['hello!']).text(),
-                new Blob(['hello!']).arrayBuffer(),
-                new Blob(['hello!']).bytes(),
-            ]) {
+                new Blob([{over}]).text(),
+                new Blob([{over}]).arrayBuffer(),
+                new Blob([{over}]).bytes(),
+            ]) {{
                 read.then(
-                    () => {},
-                    error => { if (error instanceof RangeError) globalThis.rejections++; }
+                    () => {{}},
+                    error => {{ if (error instanceof RangeError) globalThis.rejections++; }}
                 );
-            }
+            }}
             return true;
-        })()
-        ",
+        }})()
+        "
+        ),
     );
     context.run_jobs().expect("run_jobs failed");
     assert_eval(&mut context, "globalThis.rejections === 3");

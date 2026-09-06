@@ -117,16 +117,19 @@
   Regression: `text_stream_decodes_split_multibyte_without_early_replacement`
   (16 KiB-1 ASCII + split emoji: first result non-empty, exact join, no
   empty `done:false`), plus the every-boundary/invalid-flush tests.
-- **R3 root cause**: `FileApiLimits::validate()` accepted chunk sizes
-  1..16383 and >1 MiB; the range was enforced only late in
-  `BlobData::reader`. Fix: `validate()` rejects
-  `default_chunk_size ∉ 16 KiB..=1 MiB` with existing typed
-  `ResourceLimit(MaterializeBytes)` (single check reused by `reader`);
-  `register` fail-fasts the structural bound before any global mutation.
-  Regression: `chunk_size_below_minimum_rejected`,
-  `chunk_size_above_maximum_rejected`, `chunk_size_bounds_accepted`,
-  `invalid_limits_reject_registration_before_any_global`,
-  `chunk_size_config_bounds_rejected` (bounds stream exact bytes).
+- **R3 follow-up: full `validate()` at registration, no carve-out** — the
+  first rework draft enforced only the chunk-size bound in `register()`
+  and documented the rest as a deliberate exception. Per review this
+  contradicts the rework order (full validation, or `QUESTIONS.md` on
+  conflict). Fix: `register()` calls the full
+  `FileApiLimits::validate()` before any `globalThis` mutation (typed
+  `RangeError`/`TypeError`, nothing installed). The M2/M3-A fixtures were
+  migrated — not weakened — to fully valid configurations:
+  M2 tightens blob+materialize+sync together (64 KiB scale, same limit
+  intent); M3-A tightens materialize+sync together with a 64–70 KiB scale
+  and byte-exact boundary bodies. The ordering-violation path is now
+  covered by `invalid_limits_reject_registration_before_any_global`
+  (chunk bounds + sync>materialize, both fail fast with no globals).
 - **Rework audit**: GC captures (resolvers only in traced job closures;
   shared cell provably GC-pointer-free), FIFO/cancel after GC, UTF-8
   boundary coalescing, limits validation at `validate()` + `register`,
@@ -143,6 +146,8 @@ recorded in `docs/m3b-validation.md`.
 
 - All M3-STREAM-01..09 requirements verified with code and test evidence.
 - 7 defects found during the audit pass and fixed with regression tests.
-- M3B-rework: 3 findings (R1–R3) fixed with regression tests above.
-- 267 workspace tests pass; boa_fapi line coverage 89.86% (threshold 85%).
+- M3B-rework: 3 findings (R1–R3) fixed with regression tests above,
+  plus the R3 follow-up (full `validate()` at `register()` with migrated,
+  still fully-valid M2/M3-A fixtures).
+- 267 workspace tests pass; boa_fapi line coverage 89.81% (threshold 85%).
 - No masked failures, skips, exclusions, or changed acceptance criteria.

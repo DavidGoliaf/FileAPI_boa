@@ -685,6 +685,7 @@ fn stream_error_path_rejects_with_plain_error_not_range_error() {
 
 #[test]
 fn invalid_limits_reject_registration_before_any_global() {
+    // Out-of-range chunk sizes fail fast with a typed limits error.
     for bad_chunk in [0usize, 16 * 1024 - 1, 1024 * 1024 + 1] {
         let mut context = Context::default();
         let limits = boa_fapi_core::limits::FileApiLimits {
@@ -704,6 +705,26 @@ fn invalid_limits_reject_registration_before_any_global() {
              && typeof ReadableStreamDefaultReader === 'undefined'",
         );
     }
+    // So does a broken ordering: sync above materialize is rejected before
+    // any global is installed.
+    let mut context = Context::default();
+    let limits = boa_fapi_core::limits::FileApiLimits {
+        max_sync_read_bytes: 64 * 1024 * 1024,
+        max_materialize_bytes: 32 * 1024,
+        ..boa_fapi_core::limits::FileApiLimits::default()
+    };
+    let extension = FileApiExtension::builder().limits(limits).build();
+    match extension.register(&mut context) {
+        Err(boa_fapi::RegisterError::Js(_)) => {}
+        Err(other) => panic!("expected Js limits error, got {other:?}"),
+        Ok(_) => panic!("expected Js limits error, got Ok"),
+    }
+    assert_eval(
+        &mut context,
+        "typeof Blob === 'undefined' && typeof File === 'undefined' \
+         && typeof ReadableStream === 'undefined' \
+         && typeof ReadableStreamDefaultReader === 'undefined'",
+    );
 }
 
 #[test]
