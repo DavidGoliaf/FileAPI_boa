@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DENY_DB_PATH: target/cargo-deny-advisories
+
+jobs:
+  m2-validation:
+    name: M2 validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91.0 with components
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install cargo-deny, cargo-llvm-cov, cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-llvm-cov,cargo-hack
+
+      # Work order M2 §8, in order.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test (workspace)
+        run: cargo test --workspace --all-features
+
+      - name: cargo test (M2 JS integration)
+        run: cargo test --package boa_fapi --test m2_blob_file_filelist
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+      - name: cargo test --doc
+        run: cargo test --package boa_fapi --doc
+
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85
+
+      - name: cargo hack (feature powerset)
+        run: cargo hack check --feature-powerset --depth 2
+
+      - name: cargo deny fetch db
+        run: cargo deny fetch db
+
+      - name: cargo deny check
+        run: cargo deny check
+
+      - name: git diff --check
+        run: git diff --check
