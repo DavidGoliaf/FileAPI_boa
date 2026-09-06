@@ -32,7 +32,7 @@
 - Base: M3-A commit `59a8932`; branch `task/m3b`.
 - This handoff covers the M3-B stack on `task/m3b` (see `git log`):
   `fb46cff` (initial M3-B), `13b8582` (M3B-rework R1–R3),
-  `829b26b` (full `validate()` at `register()`; HEAD).
+  `829b26b` (implementation commit), `040211d` (final handoff-fix / HEAD).
 
 ## Demo commands (work order §7, in order)
 
