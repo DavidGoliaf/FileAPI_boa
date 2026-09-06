@@ -196,3 +196,150 @@ fn package_bytes(mode: ReadMode, bytes: &bytes::Bytes, context: &mut Context) ->
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    //! Child-module proof that a non-limit `FileApiError` rejects with a
+    //! plain `Error` (never `RangeError`) through the real
+    //! `read_promise` → `PromiseJob` → `Context::run_jobs()` path.
+    //!
+    //! The blob carries a controlled `ByteSource` that is structurally
+    //! valid (`len()` covers the segment) but fails reads with
+    //! `FileApiError::Cancelled`. The source type exists only in this
+    //! test module: no production hook, no public arbitrary-source API.
+
+    use super::*;
+    use boa_engine::builtins::promise::PromiseState;
+    use boa_engine::object::builtins::JsPromise;
+    use boa_fapi_core::snapshot::SnapshotState;
+    use boa_fapi_core::source::ByteSource;
+    use boa_fapi_core::source::memory::MemorySource;
+
+    /// A source that passes `from_segments` validation but fails every read
+    /// with the non-limit error under test.
+    struct FailingSource {
+        len: u64,
+    }
+
+    impl ByteSource for FailingSource {
+        fn len(&self) -> u64 {
+            self.len
+        }
+        fn snapshot(&self) -> SnapshotState {
+            SnapshotState::Memory
+        }
+        fn read_range(
+            &self,
+            _range: std::ops::Range<u64>,
+            _cancel: &CancellationToken,
+        ) -> Result<bytes::Bytes, FileApiError> {
+            Err(FileApiError::Cancelled)
+        }
+    }
+
+    /// Drives one `read_promise` job and returns the settled promise state.
+    fn settled_state(data: Arc<BlobData>, mode: ReadMode) -> PromiseState {
+        let context = &mut Context::default();
+        let promise_value =
+            read_promise(data, &FileApiLimits::default(), mode, context).expect("enqueue read");
+        // Pending before the queue runs: nothing settles on the JS stack.
+        let before =
+            JsPromise::from_object(promise_value.as_object().expect("promise object").clone())
+                .expect("promise")
+                .state();
+        assert!(matches!(before, PromiseState::Pending));
+        context.run_jobs().expect("run_jobs");
+        let promise =
+            JsPromise::from_object(promise_value.as_object().expect("promise object").clone())
+                .expect("promise");
+        promise.state()
+    }
+
+    fn failing_blob() -> Arc<BlobData> {
+        let source: Arc<dyn ByteSource> = Arc::new(FailingSource { len: 3 });
+        Arc::new(
+            BlobData::from_segments(
+                vec![boa_fapi_core::blob::BlobSegment {
+                    source,
+                    offset: 0,
+                    len: 3,
+                }],
+                "",
+                &FileApiLimits::default(),
+            )
+            .expect("valid segments"),
+        )
+    }
+
+    #[test]
+    fn non_limit_error_rejects_with_plain_error_not_range_error() {
+        let data = failing_blob();
+        let size_before = data.size();
+        let state = settled_state(Arc::clone(&data), ReadMode::Text);
+        let PromiseState::Rejected(reason) = state else {
+            panic!("expected rejection, got {state:?}");
+        };
+        // Plain `Error`: rejected with the M3 message, and its `name` is
+        // `Error` — never `RangeError`. Checked from Rust without
+        // JS-visible helpers.
+        let context = &mut Context::default();
+        let reason_object = reason.as_object().expect("error object").clone();
+        let name = reason_object
+            .get(boa_engine::js_string!("name"), context)
+            .expect("name")
+            .as_string()
+            .expect("name string")
+            .to_std_string_escaped();
+        assert_eq!(name, "Error", "must reject with plain Error, got {name}");
+        assert_eq!(
+            reason_object
+                .get(boa_engine::js_string!("message"), context)
+                .expect("message")
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("blob read failed".to_owned())
+        );
+        // The blob is unchanged by the failed read.
+        assert_eq!(data.size(), size_before);
+        assert_eq!(data.segment_count(), 1);
+    }
+
+    #[test]
+    fn non_limit_rejection_mapping_is_distinct_from_limit_mapping() {
+        // Same job path with an over-limit blob rejects as `RangeError`,
+        // proving the two mappings are distinct.
+        let big = BlobData::from_segments(
+            vec![boa_fapi_core::blob::BlobSegment {
+                source: Arc::new(MemorySource::new(bytes::Bytes::copy_from_slice(b"hello"))),
+                offset: 0,
+                len: 5,
+            }],
+            "",
+            &FileApiLimits::default(),
+        )
+        .expect("valid blob");
+        let mut tight = FileApiLimits::default();
+        tight.max_materialize_bytes = 4;
+        let context = &mut Context::default();
+        let promise_value =
+            read_promise(Arc::new(big), &tight, ReadMode::Text, context).expect("enqueue read");
+        context.run_jobs().expect("run_jobs");
+        let state =
+            JsPromise::from_object(promise_value.as_object().expect("promise object").clone())
+                .expect("promise")
+                .state();
+        let PromiseState::Rejected(reason) = state else {
+            panic!("expected limit rejection, got {state:?}");
+        };
+        let name = reason
+            .as_object()
+            .expect("error object")
+            .get(boa_engine::js_string!("name"), context)
+            .expect("name")
+            .as_string()
+            .expect("name string")
+            .to_std_string_escaped();
+        assert_eq!(name, "RangeError");
+    }
+}

@@ -212,9 +212,13 @@ impl BlobData {
     /// fallibly, so allocation failure yields
     /// `ResourceLimit(MaterializeBytes)` instead of a panic. Checks
     /// `cancel` before the first and before every segment read, reads
-    /// exactly `offset..offset+len` with checked arithmetic, and returns
-    /// `Err` with no partial bytes on any failure. Does not mutate the
-    /// blob, its sources, or the limits. An empty blob yields empty `Bytes`.
+    /// exactly `offset..offset+len` with checked arithmetic, and requires
+    /// every source to return exactly the requested bytes: a short or long
+    /// response yields `InvalidRange` with no partial bytes. The output
+    /// length is release-enforced against the preflighted capacity, so an
+    /// oversized response can never grow past `max_materialize_bytes`.
+    /// Does not mutate the blob, its sources, or the limits. An empty blob
+    /// yields empty `Bytes`.
     pub fn materialize(
         &self,
         limits: &FileApiLimits,
@@ -234,14 +238,30 @@ impl BlobData {
             if cancel.is_cancelled() {
                 return Err(FileApiError::Cancelled);
             }
+            let expected_len = usize::try_from(seg.len)
+                .map_err(|_| FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes))?;
             let end = seg
                 .offset
                 .checked_add(seg.len)
                 .ok_or(FileApiError::InvalidRange)?;
             let chunk = seg.source.read_range(seg.offset..end, cancel)?;
+            if chunk.len() != expected_len {
+                return Err(FileApiError::InvalidRange);
+            }
+            let next_len =
+                out.len()
+                    .checked_add(expected_len)
+                    .ok_or(FileApiError::ResourceLimit(
+                        ResourceLimitKind::MaterializeBytes,
+                    ))?;
+            if next_len > capacity {
+                return Err(FileApiError::InvalidRange);
+            }
             out.extend_from_slice(&chunk);
         }
-        debug_assert_eq!(u64::try_from(out.len()).ok(), Some(self.size));
+        if out.len() != capacity {
+            return Err(FileApiError::InvalidRange);
+        }
         Ok(bytes::Bytes::from(out))
     }
 
@@ -1001,6 +1021,71 @@ mod tests {
         assert!(matches!(
             blob.materialize(&limits(), &token),
             Err(FileApiError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn materialize_rejects_short_source_response() {
+        struct ShortSource;
+        impl ByteSource for ShortSource {
+            fn len(&self) -> u64 {
+                5
+            }
+            fn snapshot(&self) -> crate::snapshot::SnapshotState {
+                crate::snapshot::SnapshotState::Memory
+            }
+            fn read_range(
+                &self,
+                _range: std::ops::Range<u64>,
+                _cancel: &CancellationToken,
+            ) -> Result<Bytes, FileApiError> {
+                // Declared length 5, but returns one byte short.
+                Ok(Bytes::copy_from_slice(b"hell"))
+            }
+        }
+        let blob = BlobData::from_segments(
+            vec![make_segment(Arc::new(ShortSource), 0, 5)],
+            "",
+            &limits(),
+        )
+        .unwrap();
+        assert!(matches!(
+            blob.materialize(&limits(), &cancel()),
+            Err(FileApiError::InvalidRange)
+        ));
+    }
+
+    #[test]
+    fn materialize_rejects_long_source_response() {
+        struct LongSource;
+        impl ByteSource for LongSource {
+            fn len(&self) -> u64 {
+                5
+            }
+            fn snapshot(&self) -> crate::snapshot::SnapshotState {
+                crate::snapshot::SnapshotState::Memory
+            }
+            fn read_range(
+                &self,
+                _range: std::ops::Range<u64>,
+                _cancel: &CancellationToken,
+            ) -> Result<Bytes, FileApiError> {
+                // Declared length 5, but returns one byte too many.
+                Ok(Bytes::copy_from_slice(b"hello!"))
+            }
+        }
+        let mut tight = limits();
+        tight.max_materialize_bytes = 5;
+        let blob = BlobData::from_segments(
+            vec![make_segment(Arc::new(LongSource), 0, 5)],
+            "",
+            &limits(),
+        )
+        .unwrap();
+        // Mismatch is rejected before any output growth past the limit.
+        assert!(matches!(
+            blob.materialize(&tight, &cancel()),
+            Err(FileApiError::InvalidRange)
         ));
     }
 

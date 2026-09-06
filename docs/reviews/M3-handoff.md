@@ -46,13 +46,18 @@ $env:CARGO_DENY_DB_PATH='target/cargo-deny-advisories'; cargo deny check
 git diff --check
 ```
 
-All exit 0; recorded in `docs/m3-validation.md` (coverage 91.40% lines).
+All exit 0; recorded in `docs/m3-validation.md` (coverage 92.29% lines).
 Final audit trace and findings: `docs/m3-final-audit.md`.
+
+## CI
+
+`CI: awaiting customer verification` — the customer checks green Windows
+and Ubuntu runs for the final commit before acceptance; no run URL/ID is
+claimed here.
 
 ## Matrix / ADR
 
-- Matrix: `M3-READ-01..08` with `file:symbol`, normal/error/boundary tests.
-- ADR-0011: why `materialize` is the sole bounded byte operation.
+- Matrix: `M3-READ-01..08` with `file:symbol`, normal/error/boundary tests.- ADR-0011: why `materialize` is the sole bounded byte operation.
 - ADR-0012: why the Boa job queue is the only settlement mechanism.
 - ADR-0013: why limit → `RangeError`, other failures → `Error`.
 - No new dependencies, so no dependency ADR.
@@ -66,9 +71,12 @@ Final audit trace and findings: `docs/m3-final-audit.md`.
 
 ## Findings / fixes
 
-See `docs/m3-final-audit.md` Step B (5 items): `slice` enumerability,
+See `docs/m3-final-audit.md` Step B (7 items): `slice` enumerability,
 `JsPromise::new` vs `new_pending`, async-IIFE assertion helper,
-`BytesMut::try_reserve_exact`, guard allow-list for `materialize`.
+`BytesMut::try_reserve_exact`, guard allow-list for `materialize`, plus the
+two rework findings — strict source-output checks in `materialize`
+(short/long regression tests) and the real non-limit `Error` rejection
+proof replacing the misleading integration test.
 
 ## Deviations
 

@@ -396,36 +396,6 @@ fn bytes_results_are_independent() {
 // ──────────────────────────────────────────────
 
 #[test]
-fn non_limit_core_error_rejects_with_plain_error() {
-    // A cancelled materialization surfaces as a plain `Error` (not a
-    // `RangeError`): the mapping is unit-covered through the same
-    // rejection path by forcing the limit path first, then asserting the
-    // non-limit branch rejects without RangeError identity. The empty-bits
-    // File read proves the success branch stays intact.
-    let mut context = setup_with_materialize_limit(0);
-    assert_eval(
-        &mut context,
-        r"
-        (() => {
-            globalThis.outcome = 'pending';
-            new Blob().text().then(
-                () => { globalThis.outcome = 'fulfilled'; },
-                error => {
-                    globalThis.outcome = (error instanceof RangeError)
-                        ? 'range'
-                        : (error instanceof Error ? 'error' : 'other');
-                }
-            );
-            return globalThis.outcome === 'pending';
-        })()
-        ",
-    );
-    context.run_jobs().expect("run_jobs failed");
-    // Empty blob (size 0) fits even a zero limit, so it fulfills.
-    assert_eval(&mut context, "globalThis.outcome === 'fulfilled'");
-}
-
-#[test]
 fn over_materialize_limit_rejects_with_range_error() {
     let mut context = setup_with_materialize_limit(4);
     assert_eval(
