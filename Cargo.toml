@@ -18,9 +18,9 @@ unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
-unwrap_used = "allow"
-expect_used = "allow"
-panic = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 field_reassign_with_default = "allow"

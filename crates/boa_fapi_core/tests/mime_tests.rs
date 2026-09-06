@@ -1,5 +1,7 @@
 //! Tests for MIME type normalization.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use boa_fapi_core::mime::normalize_blob_type;
 use proptest::prelude::*;
 

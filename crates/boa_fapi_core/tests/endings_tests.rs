@@ -1,5 +1,7 @@
 //! Tests for line ending conversion.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use boa_fapi_core::endings::{NativeLineEnding, convert_line_endings_to_native};
 use proptest::prelude::*;
 

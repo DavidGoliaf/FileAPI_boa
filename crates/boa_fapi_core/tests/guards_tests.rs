@@ -1,6 +1,6 @@
 //! Dependency and quality guards for boa_fapi_core.
 
-use proptest::prelude::*;
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 // ──────────────────────────────────────────────
 // Dependency guard: verify Cargo.toml content
@@ -135,18 +135,18 @@ fn production_source_no_unwrap_expect_panic() {
     }
 }
 
+/// Removes `#[cfg(test)]` module bodies from source text.
+///
+/// Once a `#[cfg(test)]` attribute is seen, every following line is stripped
+/// until the braces opened inside the test module are balanced again. Inner
+/// `#[test]` attributes do not reset the depth, so helper functions between
+/// test functions (which may use `unwrap`/`expect`) stay excluded.
 fn strip_test_modules(source: &str) -> String {
     let mut result = String::new();
     let mut in_test_module = false;
     let mut brace_depth = 0i32;
 
     for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#[test]") {
-            in_test_module = true;
-            brace_depth = 0;
-            continue;
-        }
         if in_test_module {
             brace_depth += line.chars().filter(|&c| c == '{').count() as i32;
             brace_depth -= line.chars().filter(|&c| c == '}').count() as i32;
@@ -154,6 +154,11 @@ fn strip_test_modules(source: &str) -> String {
                 in_test_module = false;
             }
             continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#![cfg(test)]") {
+            in_test_module = true;
+            brace_depth = 0;
         }
         result.push_str(line);
         result.push('\n');
@@ -163,57 +168,76 @@ fn strip_test_modules(source: &str) -> String {
 }
 
 // ──────────────────────────────────────────────
-// Property test: BlobData slice matches reference
+// Guard self-tests: the scanner must be simple and correct
 // ──────────────────────────────────────────────
 
-use boa_fapi_core::blob::{BlobData, BlobSegment};
-use boa_fapi_core::cancellation::CancellationToken;
-use boa_fapi_core::limits::FileApiLimits;
-use boa_fapi_core::source::ByteSource;
-use boa_fapi_core::source::memory::MemorySource;
-use bytes::Bytes;
-use std::sync::Arc;
-
-fn read_blob(blob: &BlobData) -> Vec<u8> {
-    let cancel = CancellationToken::new();
-    blob.materialize(u64::MAX, &cancel)
-        .expect("materialize failed")
+#[test]
+fn strip_test_modules_keeps_non_test_code() {
+    let source = "fn a() {\n    let _ = 1;\n}\n\nfn b() {\n    let _ = 2;\n}\n";
+    assert_eq!(strip_test_modules(source), source);
 }
 
-fn reference_slice(data: &[u8], start: Option<i64>, end: Option<i64>) -> Vec<u8> {
-    let len = data.len() as i64;
-    let rel_start = match start {
-        None => 0,
-        Some(s) if s < 0 => (len + s).max(0) as u64,
-        Some(s) => (s as u64).min(data.len() as u64),
-    };
-    let rel_end = match end {
-        None => data.len() as u64,
-        Some(e) if e < 0 => (len + e).max(0) as u64,
-        Some(e) => (e as u64).min(data.len() as u64),
-    };
-    if rel_start >= rel_end {
-        return Vec::new();
-    }
-    data[rel_start as usize..rel_end as usize].to_vec()
+#[test]
+fn strip_test_modules_removes_cfg_test_module_with_helpers() {
+    let source = "fn a() {\n    let _ = 1;\n}\n\
+                  #[cfg(test)]\n\
+                  #[allow(clippy::unwrap_used)]\n\
+                  mod tests {\n\
+                  \x20   fn helper() {\n\
+                  \x20       something.unwrap();\n\
+                  \x20   }\n\
+                  \x20   #[test]\n\
+                  \x20   fn t() {\n\
+                  \x20       helper();\n\
+                  \x20   }\n\
+                  }\n\
+                  fn b() {\n    let _ = 2;\n}\n";
+    let stripped = strip_test_modules(source);
+    assert!(
+        stripped.contains("fn a()"),
+        "non-test code must survive: {stripped}"
+    );
+    assert!(
+        stripped.contains("fn b()"),
+        "trailing non-test code must survive: {stripped}"
+    );
+    assert!(
+        !stripped.contains("unwrap("),
+        "test module must be stripped: {stripped}"
+    );
+    assert!(
+        !stripped.contains("mod tests"),
+        "test module must be stripped: {stripped}"
+    );
 }
 
-proptest! {
-    #[test]
-    fn slice_matches_reference(
-        data in proptest::collection::vec(any::<u8>(), 0..256),
-        start in any::<i64>(),
-        end in any::<i64>(),
-    ) {
-        let limits = FileApiLimits::default();
-        let src: Arc<dyn ByteSource> = Arc::new(MemorySource::new(Bytes::from(data.clone())));
-        let seg = BlobSegment { source: src, offset: 0, len: data.len() as u64 };
-        let blob = BlobData::from_segments(vec![seg], "", &limits).unwrap();
-
-        let sliced = blob.slice(Some(start), Some(end), None, &limits).unwrap();
-        let expected = reference_slice(&data, Some(start), Some(end));
-        let actual = read_blob(&sliced);
-
-        prop_assert_eq!(actual, expected);
-    }
+#[test]
+fn strip_test_modules_ignores_inner_test_attribute_without_reset() {
+    // An inner `#[test]` must not reset the brace depth of the enclosing
+    // cfg(test) module, otherwise code after a nested test would be treated
+    // as production code.
+    let source = "#[cfg(test)]\n\
+                  mod tests {\n\
+                  \x20   #[test]\n\
+                  \x20   fn t() {\n\
+                  \x20       let _ = x.unwrap();\n\
+                  \x20   }\n\
+                  \x20   fn helper() {\n\
+                  \x20       let _ = y.expect(\"no\");\n\
+                  \x20   }\n\
+                  }\n\
+                  fn keep() {\n    let _ = 1;\n}\n";
+    let stripped = strip_test_modules(source);
+    assert!(
+        stripped.contains("fn keep()"),
+        "trailing code must survive: {stripped}"
+    );
+    assert!(
+        !stripped.contains("unwrap("),
+        "test code must be stripped: {stripped}"
+    );
+    assert!(
+        !stripped.contains("expect("),
+        "test code must be stripped: {stripped}"
+    );
 }

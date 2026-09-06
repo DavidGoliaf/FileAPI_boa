@@ -12,7 +12,7 @@
 | M1-CORE-06 | segment validation and checked arithmetic | `src/blob.rs:from_segments()` — validates ALL segments before filtering zero-length; checked_add for totals | `blob_tests::from_segments_*` (12 tests including `from_segments_zero_length_invalid_offset_rejected`) | PASS | |
 | M1-CORE-07 | File API slice semantics | `src/blob.rs:slice()` | `blob_tests::slice_*` (19 tests) + `guards_tests::slice_matches_reference` | PASS | |
 | M1-CORE-08 | limits validation | `src/limits.rs:validate()` | `limits_tests::*` (17 tests) | PASS | |
-| M1-CORE-09 | safe Rust/no panics in public paths | `src/lib.rs` — `#![deny(unsafe_code)]`, `#![deny(clippy::unwrap_used/expect_used/panic)]`; workspace lints deny todo/unimplemented | `guards_tests::production_source_no_unwrap_expect_panic`, `guards_tests::public_api_no_path_types` | PASS | |
+| M1-CORE-09 | safe Rust/no panics in public paths | `src/lib.rs` — `#![deny(unsafe_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]`; root `Cargo.toml` `[workspace.lints.clippy]` denies `unwrap_used`/`expect_used`/`panic`/`todo`/`unimplemented` for all members | `guards_tests::production_source_no_unwrap_expect_panic`, `guards_tests::public_api_no_path_types`, `guards_tests::strip_test_modules_*` | PASS | |
 
 ## Step B — Defect Search
 
@@ -21,8 +21,8 @@
 
 ### Public API audit
 - No `Path`, `PathBuf`, file descriptors, `JsValue`, or mutable payload access. ✅
-- `read_all()` removed; replaced by `materialize(max_bytes, &cancel)` which enforces `max_materialize_bytes`. ✅
-- `segments()` is `pub(crate)` only; `segment_source_ptr()` provides test-only Arc pointer access. ✅
+- Public `BlobData` API is exactly the M1 contract: `empty`, `from_segments`, `size`, `media_type`, `snapshot`, `segment_count`, `slice`. No `read_all`, no `materialize`, no `segment_source_ptr`, no segments accessor. ✅
+- Tests that need internals read the private fields from the `#[cfg(test)]` module beside `src/blob.rs` (child-module privacy); integration suites use only the contract API. ✅
 
 ### Arithmetic audit
 - `from_segments()`: validates ALL segments (including zero-length) before filtering. ✅
@@ -35,7 +35,7 @@
 
 ### Lint configuration
 - Issue found: workspace lints set `unwrap_used = "allow"` which contradicts the task requirement.
-- Fix: workspace lints set to `allow` (needed for integration tests); `boa_fapi_core/src/lib.rs` has `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` for production code. ✅
+- Fix: root `Cargo.toml` `[workspace.lints.clippy]` sets `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"` (plus `todo`/`unimplemented` already denied); all members inherit via `[lints] workspace = true`. Test crates carry a documented test-only allowlist (`#![allow(...)]` at the top of each `tests/*.rs`), which is the allowlist for tests required by work order §6.7. ✅
 
 ### Guard test completeness
 - Issue found: guard test only checked `PathBuf` and `std::fs::`, missing `Path`, file descriptors, `JsValue`.
@@ -58,10 +58,24 @@
 ## Step C — Issues Found and Fixed
 
 1. **`from_segments()` validation order** — Zero-length segments with invalid offsets were filtered before validation. Fix: validate all segments first, then filter.
-2. **`read_all()` OOM risk** — Public method allocated up to 2 GiB without limit. Fix: removed; replaced by `materialize(max_bytes, &cancel)` with limit enforcement.
-3. **Lint configuration** — Workspace lints allowed `unwrap`/`expect`/`panic`. Fix: `#![deny]` in core `lib.rs`; workspace `allow` only for integration test compatibility.
+2. **`read_all()` OOM risk** — Public method allocated up to 2 GiB without limit. Fix: removed; M1 contract defines no content-read public API (a limited read arrives with its contract in a later milestone).
+3. **Lint configuration** — Workspace lints allowed `unwrap`/`expect`/`panic`. Fix: strict `[workspace.lints.clippy]` deny set in root `Cargo.toml`; test-only allowlist in `tests/*.rs` per §6.7.
 4. **Guard test incomplete** — Only checked `PathBuf`/`std::fs::`. Fix: expanded to check `Path`, file descriptors, `JsValue`, `JsString`, `JsObject`.
 5. **cargo deny read-only DB** — Default advisory DB path may be read-only. Fix: `db-path` in `deny.toml` points to `target/cargo-deny-advisories`.
+
+## Rework — Review Blockers (2026-09-06)
+
+| # | Blocker | Fix |
+|---|---|---|
+| 1 | Public `segment_source_ptr(index)` panicked on out-of-range `self.segments[index]` | Method removed from the API. Pointer sharing is proven in tests via `Arc::ptr_eq` on the segments (work order §6.6), from the `#[cfg(test)]` module beside `src/blob.rs`. |
+| 2 | Public `materialize(max_bytes, ..)` ignored `FileApiLimits::max_materialize_bytes` (caller could pass `u64::MAX`); API absent from the M1 contract | Method removed from the API. `BlobData` public API is now exactly the M1 contract; `max_materialize_bytes` remains enforced by `FileApiLimits::validate()` (M1-CORE-08). Tests read blob content via child-module access to private fields, bounded by `blob.size()`. |
+| 3 | `#[allow(dead_code)]` in production code (`blob.rs:131`) | Removed together with the unused `segments()` accessor; no `allow` attributes remain in production code (`crates/boa_fapi_core/src/`). |
+| 4 | Root `[workspace.lints.clippy]` still allowed `unwrap`/`expect`/`panic` | Root `Cargo.toml` now denies `unwrap_used`, `expect_used`, `panic` workspace-wide; `cargo clippy --workspace --all-targets --all-features -- -D warnings` enforces it. Test-only allowlist documented in each `tests/*.rs` header. |
+| 5 | `memory_source_result_shares_allocation` checked only length/bytes, not shared allocation | Strengthened with exact pointer equality via `Bytes::as_ptr()`: a full-range read must return a `Bytes` over the very same allocation. |
+
+### Rework validation
+
+All commands of work order §8 re-run from the root on 2026-09-06, exit code 0: fmt check, clippy `-D warnings`, 120 tests (37 `blob::tests` unit tests incl. the property test, 19 source, 25 endings, 16 mime, 17 limits, 6 guards incl. 3 scanner self-tests), rustdoc `-Dwarnings`, doc-tests, `cargo llvm-cov` 97.84% lines (threshold 85%), `cargo hack check --feature-powerset --depth 2`, `cargo deny fetch db` + `cargo deny check` (both exit 0 in an available network; an earlier reviewer run of these two steps hit external GitHub advisory DB unavailability — network condition, not a code defect), `git diff --check`. Details in `docs/m1-validation.md`.
 
 ## Step D — Final Validation (Post-Fix)
 
@@ -80,6 +94,6 @@
 ## Audit Conclusion
 
 - All M1-CORE-01…09 requirements verified with specific code and test evidence.
-- 5 defects found and fixed during audit; no remaining open issues.
-- 119 tests passing; 95.22% line coverage (threshold: 85%).
+- 5 defects found and fixed during audit; 5 review blockers found and fixed during rework (see above); no remaining open issues.
+- 120 tests passing after rework; 97.84% line coverage (threshold: 85%).
 - No masked failures, skips, or changed acceptance criteria.

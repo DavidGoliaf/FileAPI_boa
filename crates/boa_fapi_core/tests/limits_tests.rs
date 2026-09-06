@@ -1,5 +1,7 @@
 //! Tests for FileApiLimits validation.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use boa_fapi_core::error::ResourceLimitKind;
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_fapi_core::limits::FileApiLimits;

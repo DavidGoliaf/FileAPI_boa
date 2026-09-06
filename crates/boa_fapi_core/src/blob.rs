@@ -128,42 +128,6 @@ impl BlobData {
         self.segments.len()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn segments(&self) -> &[BlobSegment] {
-        &self.segments
-    }
-
-    /// Returns the `Arc` pointer for the source of the segment at `index`.
-    ///
-    /// This is a testing accessor — it does not expose mutable internals.
-    pub fn segment_source_ptr(&self, index: usize) -> *const () {
-        Arc::as_ptr(&self.segments[index].source) as *const ()
-    }
-
-    /// Reads the entire blob content, up to `max_bytes`.
-    ///
-    /// Returns `Err(FileApiError::ResourceLimit(MaterializeBytes))` if the blob
-    /// size exceeds `max_bytes`. This prevents unbounded allocation.
-    pub fn materialize(
-        &self,
-        max_bytes: u64,
-        cancel: &crate::cancellation::CancellationToken,
-    ) -> Result<Vec<u8>, FileApiError> {
-        if self.size > max_bytes {
-            return Err(FileApiError::ResourceLimit(
-                ResourceLimitKind::MaterializeBytes,
-            ));
-        }
-        let mut result = Vec::with_capacity(self.size as usize);
-        for seg in &self.segments {
-            let bytes = seg
-                .source
-                .read_range(seg.offset..seg.offset + seg.len, cancel)?;
-            result.extend_from_slice(&bytes);
-        }
-        Ok(result)
-    }
-
     /// Creates a new blob by slicing this blob per File API semantics.
     ///
     /// `start` and `end` follow the File API integer conversion rules:
@@ -273,5 +237,489 @@ impl BlobData {
             media_type: new_media_type,
             snapshot: SnapshotState::Memory,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! Unit tests for `BlobData`.
+    //!
+    //! These tests verify content by reading the blob's segments directly
+    //! through child-module access to the private fields, which keeps the
+    //! public API free of test-only accessors.
+
+    use super::*;
+    use crate::cancellation::CancellationToken;
+    use crate::source::memory::MemorySource;
+    use bytes::Bytes;
+    use proptest::prelude::*;
+
+    fn limits() -> FileApiLimits {
+        FileApiLimits::default()
+    }
+
+    fn cancel() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    fn read_blob(blob: &BlobData) -> Vec<u8> {
+        let token = cancel();
+        let mut result = Vec::with_capacity(blob.size as usize);
+        for seg in &blob.segments {
+            result.extend_from_slice(
+                &seg.source
+                    .read_range(seg.offset..seg.offset + seg.len, &token)
+                    .unwrap(),
+            );
+        }
+        result
+    }
+
+    fn make_source(data: &[u8]) -> Arc<dyn ByteSource> {
+        Arc::new(MemorySource::new(Bytes::copy_from_slice(data)))
+    }
+
+    fn make_segment(source: Arc<dyn ByteSource>, offset: u64, len: u64) -> BlobSegment {
+        BlobSegment {
+            source,
+            offset,
+            len,
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // BlobData::empty
+    // ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_blob() {
+        let blob = BlobData::empty("text/plain");
+        assert_eq!(blob.size(), 0);
+        assert_eq!(blob.media_type(), "text/plain");
+        assert_eq!(blob.segment_count(), 0);
+        assert_eq!(blob.snapshot(), &SnapshotState::Memory);
+    }
+
+    #[test]
+    fn empty_blob_normalizes_type() {
+        let blob = BlobData::empty("TEXT/PLAIN");
+        assert_eq!(blob.media_type(), "text/plain");
+    }
+
+    // ──────────────────────────────────────────────
+    // BlobData::from_segments
+    // ──────────────────────────────────────────────
+
+    #[test]
+    fn from_single_source() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        assert_eq!(blob.size(), 11);
+        assert_eq!(blob.segment_count(), 1);
+    }
+
+    #[test]
+    fn from_multiple_sources() {
+        let src1 = make_source(b"hello");
+        let src2 = make_source(b" world");
+        let seg1 = make_segment(src1, 0, 5);
+        let seg2 = make_segment(src2, 0, 6);
+        let blob = BlobData::from_segments(vec![seg1, seg2], "text/plain", &limits()).unwrap();
+        assert_eq!(blob.size(), 11);
+        assert_eq!(blob.segment_count(), 2);
+    }
+
+    #[test]
+    fn from_segments_with_offset() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 6, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        assert_eq!(blob.size(), 5);
+        let content = read_blob(&blob);
+        assert_eq!(&content, b"world");
+    }
+
+    #[test]
+    fn from_segments_zero_length_filtered() {
+        let src = make_source(b"hello");
+        let seg_empty = make_segment(src.clone(), 0, 0);
+        let seg_full = make_segment(src, 0, 5);
+        let blob =
+            BlobData::from_segments(vec![seg_empty, seg_full], "text/plain", &limits()).unwrap();
+        assert_eq!(blob.segment_count(), 1);
+        assert_eq!(blob.size(), 5);
+    }
+
+    #[test]
+    fn from_segments_zero_length_invalid_offset_rejected() {
+        let src = make_source(b"hello");
+        // Zero-length segment with offset greater than source length is rejected
+        let seg_bad = BlobSegment {
+            source: src,
+            offset: 100,
+            len: 0,
+        };
+        let result = BlobData::from_segments(vec![seg_bad], "text/plain", &limits());
+        assert!(matches!(result, Err(FileApiError::InvalidRange)));
+    }
+
+    #[test]
+    fn from_segments_invalid_offset() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 10, 5); // offset greater than source length
+        let result = BlobData::from_segments(vec![seg], "text/plain", &limits());
+        assert!(matches!(result, Err(FileApiError::InvalidRange)));
+    }
+
+    #[test]
+    fn from_segments_invalid_end() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 2, 10); // offset + len beyond source length
+        let result = BlobData::from_segments(vec![seg], "text/plain", &limits());
+        assert!(matches!(result, Err(FileApiError::InvalidRange)));
+    }
+
+    #[test]
+    fn from_segments_offset_overflow() {
+        let src = make_source(b"hello");
+        let seg = BlobSegment {
+            source: src,
+            offset: u64::MAX,
+            len: 1,
+        };
+        let result = BlobData::from_segments(vec![seg], "text/plain", &limits());
+        assert!(matches!(result, Err(FileApiError::InvalidRange)));
+    }
+
+    #[test]
+    fn from_segments_size_exactly_at_limit() {
+        let mut custom = limits();
+        custom.max_blob_size = 11;
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        assert!(BlobData::from_segments(vec![seg], "text/plain", &custom).is_ok());
+    }
+
+    #[test]
+    fn from_segments_size_one_over_limit() {
+        let mut custom = limits();
+        custom.max_blob_size = 10;
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        assert!(matches!(
+            BlobData::from_segments(vec![seg], "text/plain", &custom),
+            Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize))
+        ));
+    }
+
+    #[test]
+    fn from_segments_count_exactly_at_limit() {
+        let mut custom = limits();
+        custom.max_segments_after_normalize = 2;
+        let src = make_source(b"abc");
+        let seg1 = make_segment(src.clone(), 0, 1);
+        let seg2 = make_segment(src, 1, 1);
+        assert!(BlobData::from_segments(vec![seg1, seg2], "text/plain", &custom).is_ok());
+    }
+
+    #[test]
+    fn from_segments_count_one_over_limit() {
+        let mut custom = limits();
+        custom.max_segments_after_normalize = 1;
+        let src = make_source(b"abc");
+        let seg1 = make_segment(src.clone(), 0, 1);
+        let seg2 = make_segment(src, 1, 1);
+        assert!(matches!(
+            BlobData::from_segments(vec![seg1, seg2], "text/plain", &custom),
+            Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSegments))
+        ));
+    }
+
+    #[test]
+    fn from_segments_normalizes_mime_type() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "TEXT/PLAIN", &limits()).unwrap();
+        assert_eq!(blob.media_type(), "text/plain");
+    }
+
+    // ──────────────────────────────────────────────
+    // Immutability tests
+    // ──────────────────────────────────────────────
+
+    #[test]
+    fn blob_data_immutable_repeated_reads() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+
+        let first = read_blob(&blob);
+        let second = read_blob(&blob);
+        assert_eq!(first, second);
+        assert_eq!(first, b"hello world");
+    }
+
+    #[test]
+    fn memory_source_immutable_after_new() {
+        let data = Bytes::from(vec![1, 2, 3, 4, 5]);
+        let source = MemorySource::new(data);
+        let token = cancel();
+
+        let r1 = source.read_range(0..5, &token).unwrap();
+        let r2 = source.read_range(0..5, &token).unwrap();
+        assert_eq!(&r1[..], &[1, 2, 3, 4, 5]);
+        assert_eq!(&r2[..], &[1, 2, 3, 4, 5]);
+    }
+
+    // ──────────────────────────────────────────────
+    // BlobData::slice tests
+    // ──────────────────────────────────────────────
+
+    #[test]
+    fn slice_none_none() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(None, None, None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 11);
+        assert_eq!(read_blob(&sliced), b"hello world");
+    }
+
+    #[test]
+    fn slice_start_0_end_size() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(0), Some(11), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 11);
+        assert_eq!(read_blob(&sliced), b"hello world");
+    }
+
+    #[test]
+    fn slice_positive_start_end() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(6), Some(11), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 5);
+        assert_eq!(read_blob(&sliced), b"world");
+    }
+
+    #[test]
+    fn slice_positive_beyond_size() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(3), Some(100), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 2);
+        assert_eq!(read_blob(&sliced), b"lo");
+    }
+
+    #[test]
+    fn slice_negative_end_minus_1() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(0), Some(-1), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 10);
+        assert_eq!(read_blob(&sliced), b"hello worl");
+    }
+
+    #[test]
+    fn slice_negative_start_minus_size() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(-11), None, None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 11);
+        assert_eq!(read_blob(&sliced), b"hello world");
+    }
+
+    #[test]
+    fn slice_negative_less_than_minus_size() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(-100), None, None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 5);
+        assert_eq!(read_blob(&sliced), b"hello");
+    }
+
+    #[test]
+    fn slice_i64_min() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(i64::MIN), None, None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 5);
+        assert_eq!(read_blob(&sliced), b"hello");
+    }
+
+    #[test]
+    fn slice_i64_max() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(i64::MAX), None, None, &limits()).unwrap();
+        // i64::MAX is beyond the size, so it is clamped to an empty span
+        assert_eq!(sliced.size(), 0);
+    }
+
+    #[test]
+    fn slice_end_less_than_start() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(5), Some(2), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 0);
+    }
+
+    #[test]
+    fn slice_empty_blob() {
+        let blob = BlobData::empty("text/plain");
+        let sliced = blob.slice(Some(0), Some(0), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 0);
+    }
+
+    #[test]
+    fn slice_crosses_two_segments() {
+        let src1 = make_source(b"hello");
+        let src2 = make_source(b"world");
+        let seg1 = make_segment(src1, 0, 5);
+        let seg2 = make_segment(src2, 0, 5);
+        let blob = BlobData::from_segments(vec![seg1, seg2], "text/plain", &limits()).unwrap();
+
+        // Slice from position 3 to 8: "lo" plus "wo"
+        let sliced = blob.slice(Some(3), Some(8), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 5);
+        assert_eq!(read_blob(&sliced), b"lowor");
+    }
+
+    #[test]
+    fn slice_crosses_all_segments() {
+        let src1 = make_source(b"aaa");
+        let src2 = make_source(b"bbb");
+        let src3 = make_source(b"ccc");
+        let seg1 = make_segment(src1, 0, 3);
+        let seg2 = make_segment(src2, 0, 3);
+        let seg3 = make_segment(src3, 0, 3);
+        let blob =
+            BlobData::from_segments(vec![seg1, seg2, seg3], "text/plain", &limits()).unwrap();
+
+        let sliced = blob.slice(Some(0), Some(9), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 9);
+        assert_eq!(read_blob(&sliced), b"aaabbbccc");
+    }
+
+    #[test]
+    fn slice_override_type_normal() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob
+            .slice(None, None, Some("application/octet-stream"), &limits())
+            .unwrap();
+        assert_eq!(sliced.media_type(), "application/octet-stream");
+    }
+
+    #[test]
+    fn slice_override_type_invalid_unicode() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob
+            .slice(None, None, Some("text/\nplain"), &limits())
+            .unwrap();
+        assert_eq!(sliced.media_type(), "");
+    }
+
+    #[test]
+    fn slice_override_type_none_is_empty() {
+        let src = make_source(b"hello");
+        let seg = make_segment(src, 0, 5);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(None, None, None, &limits()).unwrap();
+        assert_eq!(sliced.media_type(), "");
+    }
+
+    #[test]
+    fn slice_does_not_modify_original() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let _sliced = blob.slice(Some(0), Some(5), None, &limits()).unwrap();
+        assert_eq!(read_blob(&blob), b"hello world");
+    }
+
+    #[test]
+    fn slice_preserves_arc_pointers() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(Arc::clone(&src), 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(3), Some(8), None, &limits()).unwrap();
+
+        // The sliced blob must share the same Arc allocation as the original
+        // source, proving that slice copies no payload data.
+        assert_eq!(sliced.segment_count(), 1);
+        assert!(Arc::ptr_eq(&src, &sliced.segments[0].source));
+        assert!(Arc::ptr_eq(
+            &blob.segments[0].source,
+            &sliced.segments[0].source
+        ));
+    }
+
+    #[test]
+    fn slice_single_segment_fast_path() {
+        let src = make_source(b"hello world");
+        let seg = make_segment(src, 0, 11);
+        let blob = BlobData::from_segments(vec![seg], "text/plain", &limits()).unwrap();
+        let sliced = blob.slice(Some(1), Some(4), None, &limits()).unwrap();
+        assert_eq!(sliced.size(), 3);
+        assert_eq!(read_blob(&sliced), b"ell");
+        assert_eq!(sliced.segment_count(), 1);
+    }
+
+    // ──────────────────────────────────────────────
+    // Property test: BlobData slice matches reference
+    // ──────────────────────────────────────────────
+
+    fn reference_slice(data: &[u8], start: Option<i64>, end: Option<i64>) -> Vec<u8> {
+        let len = data.len() as i64;
+        let rel_start = match start {
+            None => 0,
+            Some(s) if s < 0 => (len + s).max(0) as u64,
+            Some(s) => (s as u64).min(data.len() as u64),
+        };
+        let rel_end = match end {
+            None => data.len() as u64,
+            Some(e) if e < 0 => (len + e).max(0) as u64,
+            Some(e) => (e as u64).min(data.len() as u64),
+        };
+        if rel_start >= rel_end {
+            return Vec::new();
+        }
+        data[rel_start as usize..rel_end as usize].to_vec()
+    }
+
+    proptest! {
+        #[test]
+        fn slice_matches_reference(
+            data in proptest::collection::vec(any::<u8>(), 0..256),
+            start in any::<i64>(),
+            end in any::<i64>(),
+        ) {
+            let custom = FileApiLimits::default();
+            let src: Arc<dyn ByteSource> = Arc::new(MemorySource::new(Bytes::from(data.clone())));
+            let seg = BlobSegment { source: src, offset: 0, len: data.len() as u64 };
+            let blob = BlobData::from_segments(vec![seg], "", &custom).unwrap();
+
+            let sliced = blob.slice(Some(start), Some(end), None, &custom).unwrap();
+            let expected = reference_slice(&data, Some(start), Some(end));
+            let actual = read_blob(&sliced);
+
+            prop_assert_eq!(actual, expected);
+        }
     }
 }

@@ -1,5 +1,7 @@
 //! Tests for CancellationToken and MemorySource.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use boa_fapi_core::cancellation::CancellationToken;
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_fapi_core::snapshot::SnapshotState;
@@ -173,8 +175,14 @@ fn memory_source_result_shares_allocation() {
     let source = MemorySource::new(data.clone());
     let cancel = CancellationToken::new();
     let result = source.read_range(0..1024, &cancel).unwrap();
-    // The result should share the same underlying allocation (no copy).
-    // We verify by checking that the result points to the same data.
+    // The result must share the same underlying allocation (no copy).
+    // `Bytes::as_ptr()` proves this exactly: a full-range read returns a
+    // `Bytes` whose pointer and length identify the very same allocation.
     assert_eq!(result.len(), 1024);
+    assert_eq!(
+        result.as_ptr(),
+        data.as_ptr(),
+        "read_range must return a view over the source allocation, not a copy"
+    );
     assert_eq!(&result[..], &data[..]);
 }
