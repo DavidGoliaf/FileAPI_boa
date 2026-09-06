@@ -200,18 +200,21 @@ fn package_bytes(mode: ReadMode, bytes: &bytes::Bytes, context: &mut Context) ->
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    //! Child-module proof that a non-limit `FileApiError` rejects with a
-    //! plain `Error` (never `RangeError`) through the real
+    //! Child-module proof of the rejection-type mapping through the real
     //! `read_promise` → `PromiseJob` → `Context::run_jobs()` path.
     //!
     //! The blob carries a controlled `ByteSource` that is structurally
     //! valid (`len()` covers the segment) but fails reads with
     //! `FileApiError::Cancelled`. The source type exists only in this
     //! test module: no production hook, no public arbitrary-source API.
+    //!
+    //! Prototype identity (`instanceof`) cannot be proven from Rust alone —
+    //! `name` is writable — so each test attaches a JavaScript rejection
+    //! handler in the same `Context` before jobs run and reads back its
+    //! observable verdict after `run_jobs()`.
 
     use super::*;
-    use boa_engine::builtins::promise::PromiseState;
-    use boa_engine::object::builtins::JsPromise;
+    use boa_engine::{Source, js_string};
     use boa_fapi_core::snapshot::SnapshotState;
     use boa_fapi_core::source::ByteSource;
     use boa_fapi_core::source::memory::MemorySource;
@@ -238,24 +241,6 @@ mod tests {
         }
     }
 
-    /// Drives one `read_promise` job and returns the settled promise state.
-    fn settled_state(data: Arc<BlobData>, mode: ReadMode) -> PromiseState {
-        let context = &mut Context::default();
-        let promise_value =
-            read_promise(data, &FileApiLimits::default(), mode, context).expect("enqueue read");
-        // Pending before the queue runs: nothing settles on the JS stack.
-        let before =
-            JsPromise::from_object(promise_value.as_object().expect("promise object").clone())
-                .expect("promise")
-                .state();
-        assert!(matches!(before, PromiseState::Pending));
-        context.run_jobs().expect("run_jobs");
-        let promise =
-            JsPromise::from_object(promise_value.as_object().expect("promise object").clone())
-                .expect("promise");
-        promise.state()
-    }
-
     fn failing_blob() -> Arc<BlobData> {
         let source: Arc<dyn ByteSource> = Arc::new(FailingSource { len: 3 });
         Arc::new(
@@ -272,43 +257,75 @@ mod tests {
         )
     }
 
+    /// Enqueues a `read_promise` job and exposes its promise to JS as
+    /// `globalThis.probe`, with a rejection handler recording the
+    /// realm-local verdict into `globalThis.verdict`.
+    ///
+    /// Returns the input metadata for the unchanged-blob assertion.
+    fn enqueue_probe(
+        context: &mut Context,
+        data: &Arc<BlobData>,
+        limits: &FileApiLimits,
+    ) -> (u64, usize) {
+        let promise =
+            read_promise(Arc::clone(data), limits, ReadMode::Text, context).expect("enqueue read");
+        context
+            .register_global_property(
+                js_string!("probe"),
+                promise,
+                boa_engine::property::Attribute::all(),
+            )
+            .expect("register probe");
+        context
+            .eval(Source::from_bytes(
+                "globalThis.verdict = 'pending'; \
+                 globalThis.probe.then( \
+                     () => { globalThis.verdict = 'fulfilled'; }, \
+                     error => { \
+                         globalThis.verdict = \
+                             (error instanceof RangeError) ? 'range' \
+                             : (error instanceof Error) \
+                                 ? 'error:' + error.name + ':' + error.message \
+                                 : 'other'; \
+                     } \
+                 );",
+            ))
+            .expect("attach handler");
+        (data.size(), data.segment_count())
+    }
+
+    /// Reads back the JS handler verdict after jobs have run.
+    fn js_verdict(context: &mut Context) -> String {
+        context
+            .eval(Source::from_bytes("globalThis.verdict"))
+            .expect("read verdict")
+            .as_string()
+            .expect("verdict string")
+            .to_std_string_escaped()
+    }
+
     #[test]
     fn non_limit_error_rejects_with_plain_error_not_range_error() {
         let data = failing_blob();
-        let size_before = data.size();
-        let state = settled_state(Arc::clone(&data), ReadMode::Text);
-        let PromiseState::Rejected(reason) = state else {
-            panic!("expected rejection, got {state:?}");
-        };
-        // Plain `Error`: rejected with the M3 message, and its `name` is
-        // `Error` — never `RangeError`. Checked from Rust without
-        // JS-visible helpers.
         let context = &mut Context::default();
-        let reason_object = reason.as_object().expect("error object").clone();
-        let name = reason_object
-            .get(boa_engine::js_string!("name"), context)
-            .expect("name")
-            .as_string()
-            .expect("name string")
-            .to_std_string_escaped();
-        assert_eq!(name, "Error", "must reject with plain Error, got {name}");
-        assert_eq!(
-            reason_object
-                .get(boa_engine::js_string!("message"), context)
-                .expect("message")
-                .as_string()
-                .map(|s| s.to_std_string_escaped()),
-            Some("blob read failed".to_owned())
-        );
-        // The blob is unchanged by the failed read.
+        let (size_before, segments_before) =
+            enqueue_probe(context, &data, &FileApiLimits::default());
+        // Pending before the queue runs: the handler has not observed the
+        // rejection yet.
+        assert_eq!(js_verdict(context), "pending");
+        context.run_jobs().expect("run_jobs");
+        // Prototype identity proven in the originating realm: a plain
+        // `Error` with the M3 message, never a `RangeError`.
+        assert_eq!(js_verdict(context), "error:Error:blob read failed");
+        // No fulfilled text value and unchanged input metadata.
         assert_eq!(data.size(), size_before);
-        assert_eq!(data.segment_count(), 1);
+        assert_eq!(data.segment_count(), segments_before);
     }
 
     #[test]
     fn non_limit_rejection_mapping_is_distinct_from_limit_mapping() {
         // Same job path with an over-limit blob rejects as `RangeError`,
-        // proving the two mappings are distinct.
+        // proving the two mappings are distinct in the same JS-realm style.
         let big = BlobData::from_segments(
             vec![boa_fapi_core::blob::BlobSegment {
                 source: Arc::new(MemorySource::new(bytes::Bytes::copy_from_slice(b"hello"))),
@@ -321,25 +338,32 @@ mod tests {
         .expect("valid blob");
         let mut tight = FileApiLimits::default();
         tight.max_materialize_bytes = 4;
+        let data = Arc::new(big);
         let context = &mut Context::default();
-        let promise_value =
-            read_promise(Arc::new(big), &tight, ReadMode::Text, context).expect("enqueue read");
+        let (size_before, segments_before) = enqueue_probe(context, &data, &tight);
+        assert_eq!(js_verdict(context), "pending");
         context.run_jobs().expect("run_jobs");
-        let state =
-            JsPromise::from_object(promise_value.as_object().expect("promise object").clone())
-                .expect("promise")
-                .state();
-        let PromiseState::Rejected(reason) = state else {
-            panic!("expected limit rejection, got {state:?}");
-        };
-        let name = reason
-            .as_object()
-            .expect("error object")
-            .get(boa_engine::js_string!("name"), context)
-            .expect("name")
-            .as_string()
-            .expect("name string")
-            .to_std_string_escaped();
-        assert_eq!(name, "RangeError");
+        assert_eq!(
+            js_verdict(context),
+            "range",
+            "limit mapping must reject with RangeError"
+        );
+        assert_eq!(data.size(), size_before);
+        assert_eq!(data.segment_count(), segments_before);
+    }
+
+    #[test]
+    fn js_realm_verdict_helper_distinguishes_range_error() {
+        // Self-check: the verdict helper distinguishes a plain `Error`
+        // from a `RangeError` in the same realm (guards against a vacuous
+        // `instanceof` assertion above).
+        let context = &mut Context::default();
+        let value = context
+            .eval(Source::from_bytes(
+                "var e = new RangeError('x'); \
+                 (e instanceof RangeError) && (e instanceof Error);",
+            ))
+            .expect("eval");
+        assert_eq!(value.as_boolean(), Some(true));
     }
 }

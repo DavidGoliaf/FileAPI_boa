@@ -5,21 +5,25 @@
 - Core: bounded `BlobData::materialize(limits, cancel)` in
   `crates/boa_fapi_core/src/blob.rs` — limit check before allocation,
   fallible `usize` conversion + `try_reserve_exact`, cancellation before
-  every segment read, checked `offset..offset+len`, no partial bytes.
-  7 unit tests; guard `blob_data_public_api_is_fixed` now allows exactly
-  10 methods.
+  every segment read, checked `offset..offset+len`, exact source-output
+  length match with `checked_add`/capacity bound and release-enforced
+  final length, no partial bytes. 9 unit tests (incl. short/long source
+  response rejections); guard `blob_data_public_api_is_fixed` now allows
+  exactly 10 methods.
 - Bindings: new isolated `crates/boa_fapi/src/promise_read.rs`
   (`ReadMode`, `ReadRequest`, `read_promise`, `text`, `arrayBuffer`,
-  `bytes`, `settle_read`, `reject_with`, `package_bytes`) plus
+  `bytes`, `settle_read`, `reject_with`, `package_bytes`,
+  `#[cfg(test)] tests` with JS-realm `instanceof` verdicts) plus
   `js_read_error` in `error.rs`. Pending `JsPromise::new_pending` +
   `PromiseJob` with realm via `Context::enqueue_job`; settlement only in
   the job. `blob.rs::init_prototype` registers the three methods
   (writable, non-enumerable, configurable, length 0); `File` inherits via
   `Blob.prototype`. `slice` corrected to non-enumerable per Web IDL.
-- Tests: `crates/boa_fapi/tests/m3_promise_blob_reads.rs` (17 tests, every
-  read settled via `context.run_jobs()`); guards extended
-  (`promise_read.rs` in the no-public-items scan,
-  `no_stream_filereader_or_dom_surface`).
+- Tests: `crates/boa_fapi/tests/m3_promise_blob_reads.rs` (16 tests, every
+  read settled via `context.run_jobs()`); `promise_read::tests` (3 tests:
+  JS-realm plain-`Error` proof, distinct `RangeError` mapping, verdict
+  self-check); guards extended (`promise_read.rs` in the no-public-items
+  scan, `no_stream_filereader_or_dom_surface`).
 - Docs/trace: `M3-READ-01..08` in `docs/spec-matrix.md`; ADR-0011/0012/0013;
   README + architecture (memory-only reads, explicit `run_jobs()`); CI runs
   the M3-A test after the M2 test on both OS jobs.
@@ -46,7 +50,7 @@ $env:CARGO_DENY_DB_PATH='target/cargo-deny-advisories'; cargo deny check
 git diff --check
 ```
 
-All exit 0; recorded in `docs/m3-validation.md` (coverage 92.29% lines).
+All exit 0; recorded in `docs/m3-validation.md` (coverage 92.42% lines).
 Final audit trace and findings: `docs/m3-final-audit.md`.
 
 ## CI
@@ -62,21 +66,25 @@ claimed here.
 - ADR-0013: why limit → `RangeError`, other failures → `Error`.
 - No new dependencies, so no dependency ADR.
 
-## Coverage / CI
+## Coverage
 
-- Workspace: 232 tests green; `boa_fapi` line coverage 91.40% (threshold 85%).
-- CI: `m3a-validation` job on `windows-latest` + `ubuntu-latest` runs §7 in
-  order, including the new M3-A test step. CI links/run IDs: see the Actions
-  run for this commit on `task/m3`.
+- Workspace: 235 tests green (25 boa_fapi unit incl. 3 JS-realm rejection
+  proofs, 10 guards, 51 M2 JS integration, 16 M3-A JS integration, 1 doc,
+  132 core: 50+25+7+17+16+19); `boa_fapi` line coverage 92.42%
+  (threshold 85%, see `docs/m3-validation.md`).
+- CI workflow runs §7 in order on `windows-latest` + `ubuntu-latest`,
+  including the M3-A test step. No CI run ID/URL is claimed here.
 
 ## Findings / fixes
 
-See `docs/m3-final-audit.md` Step B (7 items): `slice` enumerability,
+See `docs/m3-final-audit.md` Step B (8 items): `slice` enumerability,
 `JsPromise::new` vs `new_pending`, async-IIFE assertion helper,
-`BytesMut::try_reserve_exact`, guard allow-list for `materialize`, plus the
-two rework findings — strict source-output checks in `materialize`
+`BytesMut::try_reserve_exact`, guard allow-list for `materialize`, the two
+rework findings — strict source-output checks in `materialize`
 (short/long regression tests) and the real non-limit `Error` rejection
-proof replacing the misleading integration test.
+proof replacing the misleading integration test — plus the rework-2
+finding: JS-realm `instanceof` proof for both mappings (Rust `name`
+checks alone do not prove prototype identity).
 
 ## Deviations
 

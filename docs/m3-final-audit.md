@@ -9,7 +9,7 @@
 | M3-READ-03 | `text()` UTF-8 replacement decode (invalid/truncated → U+FFFD) | `promise_read.rs:package_bytes` (`String::from_utf8_lossy`) | `::text_decodes_ascii_and_multibyte`, `::text_replaces_invalid_utf8`, `::text_reads_composed_and_sliced_blobs` | PASS |
 | M3-READ-04 | `arrayBuffer()` exact bytes in a fresh independent `ArrayBuffer` | `promise_read.rs:package_bytes` (`JsArrayBuffer::new` + copy) | `::array_buffer_returns_exact_bytes_in_fresh_buffer`, `::array_buffer_results_are_independent` | PASS |
 | M3-READ-05 | `bytes()` fresh offset-0 `Uint8Array` over an independent buffer | `promise_read.rs:package_bytes` (`JsUint8Array::from_iter`) | `::bytes_returns_uint8array_with_offset_zero`, `::bytes_results_are_independent` | PASS |
-| M3-READ-06 | Materialization limit → pending `Promise` rejected as `RangeError`; `size == limit` ok, `limit + 1` rejects; blob stays usable; non-limit core error → plain `Error` | `blob.rs:BlobData::materialize`; `promise_read.rs:reject_with` | `::over_materialize_limit_rejects_with_range_error`, `::materialize_limit_boundary`; `promise_read::tests::non_limit_error_rejects_with_plain_error_not_range_error`, `::non_limit_rejection_mapping_is_distinct_from_limit_mapping`; core `blob::tests::materialize_*` (9 unit tests) | PASS |
+| M3-READ-06 | Materialization limit → pending `Promise` rejected as `RangeError` (`instanceof` proven in the originating JS realm); `size == limit` ok, `limit + 1` rejects; blob stays usable; non-limit core error → plain `Error` (`instanceof Error`, not `RangeError`, same-realm JS handler) | `blob.rs:BlobData::materialize`; `promise_read.rs:reject_with` | `::over_materialize_limit_rejects_with_range_error`, `::materialize_limit_boundary`; `promise_read::tests::non_limit_error_rejects_with_plain_error_not_range_error`, `::non_limit_rejection_mapping_is_distinct_from_limit_mapping`, `::js_realm_verdict_helper_distinguishes_range_error`; core `blob::tests::materialize_*` (9 unit tests) | PASS |
 | M3-READ-07 | `File` reads use exactly the Blob-brand path | `promise_read.rs` via `brand::require_blob` (accepts `FileNative`) | `::file_inherits_read_methods_without_own_copies`, `::text_decodes_ascii_and_multibyte` (File case) | PASS |
 | M3-READ-08 | Bounded core materialize: order, empty, exact/over limit, short/long source responses, cancel paths, checked offsets | `blob.rs:BlobData::materialize` | `blob::tests::materialize_multi_segment_order`, `::materialize_empty_blob`, `::materialize_exactly_at_limit`, `::materialize_one_over_limit_rejected_before_allocation`, `::materialize_rejects_short_source_response`, `::materialize_rejects_long_source_response`, `::materialize_cancelled_before_first_read`, `::materialize_cancelled_between_segments`, `::materialize_checked_offset_failure` | PASS |
 
@@ -53,6 +53,21 @@
    both through `read_promise` → `PromiseJob` → `run_jobs()` with a
    failing controlled source (`Cancelled`) and limit/`Error` name/message
    assertions.
+8. **Rework-2 P2-A: `name` does not prove `instanceof`** — the Rust-side
+   `name == "Error"` read used a different `Context`, and `name` is
+   writable, so prototype identity in the originating realm was unproven.
+   Fix: same-`Context` JS rejection handler attached before jobs run;
+   verdict string proves `instanceof Error`, `!(instanceof RangeError)`,
+   `name === "Error"`, `message === "blob read failed"` for the plain
+   mapping and `instanceof RangeError` for the limit mapping, with
+   pending-before/`verdict`-after `run_jobs()` checks. Regression tests:
+   rewritten `non_limit_error_rejects_with_plain_error_not_range_error`,
+   `non_limit_rejection_mapping_is_distinct_from_limit_mapping`, plus the
+   `js_realm_verdict_helper_distinguishes_range_error` self-check.
+9. **Rework-2 P2-B: handoff contradicted final results** — stale `232`
+   tests / `91.40%` / "see the Actions run" wording vs `234` / `92.29%`
+   in validation/audit. Fix: handoff rewritten to the factual final counts
+   with exactly `CI: awaiting customer verification` and no run-ID claims.
 
 ## Step C — Independent audit notes
 
@@ -107,7 +122,7 @@ recorded in `docs/m3-validation.md`.
 ## Audit conclusion
 
 - All M3-READ-01..08 requirements verified with code and test evidence.
-- 7 defects found during the audit pass and fixed with regression tests
-  (5 initial + 2 rework findings).
-- 234 workspace tests pass; boa_fapi line coverage 92.29% (threshold 85%).
+- 9 defects found during the audit pass and fixed with regression tests
+  (5 initial + 2 rework + 2 rework-2 findings).
+- 235 workspace tests pass; boa_fapi line coverage 92.42% (threshold 85%).
 - No masked failures, skips, exclusions, or changed acceptance criteria.
