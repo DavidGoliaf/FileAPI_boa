@@ -26,6 +26,13 @@ pub enum RegisterError {
     /// milestone implements no host stream adapter.
     #[error("the streams shim is disabled and no host stream adapter is available")]
     StreamsShimDisabled,
+    /// The DOM shim is disabled but `FileReader` requires it.
+    ///
+    /// Returned before any `globalThis` mutation when the `dom-shim`
+    /// Cargo feature is off or `dom_shim(false)` was configured: this
+    /// milestone implements no host DOM adapter.
+    #[error("the DOM shim is disabled and no host DOM adapter is available")]
+    DomShimDisabled,
     /// A Boa engine error occurred while building or installing the classes.
     #[error(transparent)]
     Js(#[from] JsError),
@@ -43,10 +50,11 @@ pub(crate) fn range_error(message: &str) -> JsError {
         .into()
 }
 
-/// Builds a plain JS `Error` for a failed promise read.
+/// Builds a plain JS `Error` for an unmapped failure fallback.
 ///
-/// Carries no path, source, or body detail, per the M3 rejection contract.
-/// (No `DOMException` exists before M4.)
+/// Carries no path, source, or body detail. Used only when the DOM shim is
+/// unexpectedly absent (registration always installs it, so this path is
+/// unreachable in practice) or when an engine error cannot be wrapped.
 pub(crate) fn js_read_error(context: &mut Context) -> boa_engine::JsValue {
     JsNativeError::error()
         .with_message("blob read failed")

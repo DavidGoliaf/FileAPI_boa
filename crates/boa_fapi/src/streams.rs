@@ -31,7 +31,7 @@ use boa_fapi_core::limits::FileApiLimits;
 use boa_gc::{Finalize, Trace};
 
 use crate::brand;
-use crate::error::{js_read_error, type_error};
+use crate::error::type_error;
 
 /// The chunk flavor produced by a stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,6 +397,27 @@ fn locked_getter(this: &JsValue, _args: &[JsValue], _context: &mut Context) -> J
     Ok(JsValue::from(shared.borrow().locked))
 }
 
+/// Builds the rejection reason for a stream failure, in the same realm:
+/// the M4-A mapped `DOMException` when the `dom-shim` feature is on, a
+/// plain `Error` otherwise (or when the DOM shim is unexpectedly absent —
+/// registration always installs it).
+fn stream_error_reason(context: &mut Context, error: &FileApiError) -> JsValue {
+    #[cfg(feature = "dom-shim")]
+    {
+        let (name, message) = crate::dom::map_core_error(error);
+        crate::extension::snapshot(context)
+            .ok()
+            .and_then(|specs| specs.dom_specs())
+            .map(|dom| JsValue::from(crate::dom::construct_exception(&dom, name, message)))
+            .unwrap_or_else(|| crate::error::js_read_error(context))
+    }
+    #[cfg(not(feature = "dom-shim"))]
+    {
+        let _ = error;
+        crate::error::js_read_error(context)
+    }
+}
+
 /// `ReadableStream.prototype.cancel(reason?)`: idempotent unlock-cancel.
 ///
 /// Only valid on an unlocked stream; a locked stream rejects with
@@ -413,7 +434,7 @@ fn stream_cancel(this: &JsValue, _args: &[JsValue], context: &mut Context) -> Js
             if locked {
                 let reason = type_error("cannot cancel a locked stream")
                     .into_opaque(context)
-                    .map_or_else(|_| js_read_error(context), JsValue::from);
+                    .map_or_else(|_| crate::error::js_read_error(context), JsValue::from);
                 resolvers
                     .reject
                     .call(&JsValue::undefined(), &[reason], context)?;
@@ -485,8 +506,8 @@ fn reader_read(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsRe
 /// `BlobReader` chunk, packages it as a fresh `Uint8Array`/string, and
 /// resolves `{ value, done }`. EOF resolves done (with decoder flush for
 /// text streams). A core failure errors the stream: the current and every
-/// future read reject with a same-realm plain `Error`, without further
-/// source reads.
+/// future read reject with the M4-A mapped same-realm `DOMException`,
+/// without further source reads.
 fn pump_one(
     shared: &Rc<RefCell<StreamShared>>,
     request: &PendingRead,
@@ -512,9 +533,10 @@ fn pump_one(
     };
     if let Some(is_error) = terminal {
         if is_error {
+            let reason = stream_error_reason(context, &FileApiError::Internal);
             resolvers
                 .reject
-                .call(&JsValue::undefined(), &[js_read_error(context)], context)?;
+                .call(&JsValue::undefined(), &[reason], context)?;
             return Ok(JsValue::undefined());
         }
         let done = iter_result(JsValue::undefined(), true, context)?;
@@ -538,7 +560,7 @@ fn pump_one(
         match reader.read_next() {
             Ok(chunk) => chunk,
             Err(error) => {
-                let reason = js_read_error(context);
+                let reason = stream_error_reason(context, &error);
                 state.errored = Some(StreamErrorClass::ReadFailed);
                 state.reader = None;
                 // Every other queued read rejects with the same class when
@@ -546,7 +568,6 @@ fn pump_one(
                 // (Each job owns its resolvers and observes the terminal
                 // state without source reads.)
                 drop(state);
-                let _ = error;
                 resolvers
                     .reject
                     .call(&JsValue::undefined(), &[reason], context)?;
@@ -603,11 +624,10 @@ fn pump_one(
                         }
                         PumpChunk::Failed => {
                             mark_errored(shared);
-                            resolvers.reject.call(
-                                &JsValue::undefined(),
-                                &[js_read_error(context)],
-                                context,
-                            )?;
+                            let reason = stream_error_reason(context, &FileApiError::Internal);
+                            resolvers
+                                .reject
+                                .call(&JsValue::undefined(), &[reason], context)?;
                             return Ok(JsValue::undefined());
                         }
                     }
@@ -860,7 +880,8 @@ mod tests {
     //! fails reads with `FileApiError::Cancelled`. It exists only in this
     //! test module: no production hook, no public arbitrary-source API.
     //! Prototype identity is proven in the same `Context` by a JavaScript
-    //! rejection handler: `instanceof Error`, never `instanceof RangeError`.
+    //! rejection handler: the M4-A mapped `DOMException` (`AbortError`),
+    //! inheriting from `Error`, never a plain `Error` or `RangeError`.
 
     use super::*;
     use boa_engine::{Source, js_string};
@@ -936,10 +957,12 @@ mod tests {
                      () => { globalThis.verdict = 'fulfilled'; }, \
                      error => { \
                          globalThis.verdict = \
-                             (error instanceof RangeError) ? 'range' \
-                             : (error instanceof Error) \
-                                 ? 'error:' + error.name + ':' + error.message \
-                                 : 'other'; \
+                             (error instanceof DOMException) \
+                                 ? 'dom:' + error.name + ':' + (error instanceof Error) \
+                                 : (error instanceof RangeError) ? 'range' \
+                                 : (error instanceof Error) \
+                                     ? 'error:' + error.name + ':' + error.message \
+                                     : 'other'; \
                      } \
                  );",
             ))
@@ -1037,7 +1060,7 @@ mod tests {
         // The read was queued before cancel, so it settles with its chunk
         // (`done:false`); the cancel promise still resolves. Both survive GC.
         assert_eq!(verdict, "read-done:false|cancelled");
-        // Terminal core error after GC rejects plain-Error.
+        // Terminal core error after GC rejects the mapped `DOMException`.
         let context = &mut Context::default();
         crate::extension::FileApiExtension::builder()
             .build()
@@ -1046,12 +1069,12 @@ mod tests {
         let (size_before, segments_before) = enqueue_failing_probe(context);
         force_gc();
         context.run_jobs().expect("run_jobs");
-        assert_eq!(js_verdict(context), "error:Error:blob read failed");
+        assert_eq!(js_verdict(context), "dom:AbortError:true");
         let _ = (size_before, segments_before);
     }
 
     #[test]
-    fn errored_stream_rejects_with_plain_error_not_range_error() {
+    fn errored_stream_rejects_with_mapped_dom_exception() {
         let context = &mut Context::default();
         // Streams need registered prototypes for `create_stream`.
         crate::extension::FileApiExtension::builder()
@@ -1061,9 +1084,9 @@ mod tests {
         let (size_before, segments_before) = enqueue_failing_probe(context);
         assert_eq!(js_verdict(context), "pending");
         context.run_jobs().expect("run_jobs");
-        assert_eq!(js_verdict(context), "error:Error:blob read failed");
+        assert_eq!(js_verdict(context), "dom:AbortError:true");
         // A second read on the errored stream replays the terminal error
-        // class without new source reads: same plain-`Error` verdict.
+        // class without new source reads: same mapped verdict.
         context
             .eval(Source::from_bytes(
                 "globalThis.probe2 = globalThis.probe.constructor === Promise \
@@ -1082,7 +1105,7 @@ mod tests {
             .expect("register");
         let (size_before, segments_before) = enqueue_failing_probe(context);
         context.run_jobs().expect("run_jobs");
-        assert_eq!(js_verdict(context), "error:Error:blob read failed");
+        assert_eq!(js_verdict(context), "dom:AbortError:true");
         // Queue a second read on the same errored stream: it must reject
         // with the same class and never touch the source again.
         context
@@ -1092,7 +1115,8 @@ mod tests {
                      () => { globalThis.verdict2 = 'fulfilled'; }, \
                      error => { \
                          globalThis.verdict2 = \
-                             (error instanceof RangeError) ? 'range' \
+                             (error instanceof DOMException) ? 'dom' \
+                             : (error instanceof RangeError) ? 'range' \
                              : (error instanceof Error) ? 'error' : 'other'; \
                      } \
                  );",
@@ -1105,7 +1129,7 @@ mod tests {
             .as_string()
             .expect("verdict string")
             .to_std_string_escaped();
-        assert_eq!(second, "error");
+        assert_eq!(second, "dom");
         let _ = (size_before, segments_before);
     }
 }

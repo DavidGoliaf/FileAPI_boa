@@ -190,6 +190,8 @@ fn internal_binding_modules_expose_no_public_items() {
         "file_list.rs",
         "promise_read.rs",
         "streams.rs",
+        "dom.rs",
+        "filereader.rs",
         "webidl.rs",
     ] {
         let content = read(&src.join(module));
@@ -224,7 +226,8 @@ fn streams_shim_surface_is_bounded() {
     // M3-B registers exactly the ordered surface: two globals, five
     // stream/reader methods, one accessor, two tags. No pipe/tee/iterator,
     // BYOB, controller, strategy, transform/writable, decoder, reader,
-    // event, or DOM API may appear in the shim module.
+    // event, or DOM API may appear in the shim module. (FileReader and the
+    // DOM shim live in `dom.rs`/`filereader.rs`, not here.)
     let streams = read(&workspace_root().join("crates/boa_fapi/src/streams.rs"));
     for required in [
         "\"ReadableStream\"",
@@ -251,11 +254,24 @@ fn streams_shim_surface_is_bounded() {
         "TransformStream",
         "WritableStream",
         "TextDecoder",
-        "FileReader",
-        "EventTarget",
-        "DOMException",
         "ReadableStreamBYOBReader",
     ] {
+        let mut hits = 0;
+        for line in streams.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "streams.rs must not contain {forbidden}");
+    }
+    // The M4-A DOM mapping is referenced by streams errors through the
+    // qualified `crate::dom::` path only; no literal FileReader/Event/DOM
+    // surface may appear here.
+    for forbidden in ["\"FileReader\"", "\"EventTarget\"", "\"DOMException\""] {
         let mut hits = 0;
         for line in streams.lines() {
             let trimmed = line.trim();
@@ -271,26 +287,140 @@ fn streams_shim_surface_is_bounded() {
 }
 
 #[test]
-fn no_filereader_or_dom_surface() {
-    // Neither M3-A nor M3-B introduces readers, events, or DOM shims.
-    // (The M3-B streams shim is covered by the bounded-surface guard above.)
+fn filereader_and_dom_surface_is_bounded() {
+    // M4-A registers exactly: `EventTarget`, `Event`, `ProgressEvent`,
+    // `DOMException`, `FileReader` globals; EventTarget's 3 methods;
+    // Event's 7 attributes + 2 methods; ProgressEvent's 3 attributes;
+    // DOMException's `name`/`message`; FileReader's 5 methods, 3 readonly
+    // attributes, 6 handlers, 3 constants. No FileReaderSync, workers, fs,
+    // URL/clone/WPT, full DOM (tree dispatch, capture/bubble, CustomEvent,
+    // AbortSignal) or full Streams surface may appear in `dom.rs` or
+    // `filereader.rs`.
+    for module in ["dom.rs", "filereader.rs"] {
+        let content = read(&workspace_root().join(format!("crates/boa_fapi/src/{module}")));
+        // Every production mention of an excluded API must be absent; only
+        // negative test/docs comments in the sibling integration suite may
+        // name them.
+        for forbidden in [
+            "FileReaderSync",
+            "DedicatedWorker",
+            "SharedWorker",
+            "createObjectURL",
+            "revokeObjectURL",
+            "structuredClone",
+            "CustomEvent",
+            "AbortSignal",
+            "capturePhase",
+            "\"fs\"",
+            "std::fs",
+            "std::path",
+            "BlobData::materialize",
+        ] {
+            let mut hits = 0;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.contains(forbidden) {
+                    hits += 1;
+                }
+            }
+            assert_eq!(hits, 0, "{module} must not contain {forbidden}");
+        }
+    }
+    let dom = read(&workspace_root().join("crates/boa_fapi/src/dom.rs"));
+    for required in [
+        "\"EventTarget\"",
+        "\"Event\"",
+        "\"ProgressEvent\"",
+        "\"DOMException\"",
+        "\"addEventListener\"",
+        "\"removeEventListener\"",
+        "\"dispatchEvent\"",
+    ] {
+        assert!(dom.contains(required), "dom.rs must contain {required}");
+    }
+    let filereader = read(&workspace_root().join("crates/boa_fapi/src/filereader.rs"));
+    for required in [
+        "\"FileReader\"",
+        "\"readAsArrayBuffer\"",
+        "\"readAsBinaryString\"",
+        "\"readAsText\"",
+        "\"readAsDataURL\"",
+        "\"abort\"",
+        "\"readyState\"",
+        "\"result\"",
+        "\"error\"",
+        "\"onloadstart\"",
+        "\"onloadend\"",
+    ] {
+        assert!(
+            filereader.contains(required),
+            "filereader.rs must contain {required}"
+        );
+    }
+}
+
+#[test]
+fn no_filereader_sync_or_out_of_scope_surface() {
+    // M4-B+ APIs (sync readers, workers, fs, URL/clone/WPT, full DOM) never
+    // appear in production sources. `dom.rs`/`filereader.rs` are the only
+    // modules allowed to mention `FileReader`, `EventTarget`, or
+    // `DOMException` in code.
     let src = workspace_root().join("crates/boa_fapi/src");
+    for entry in walk_rs(&src) {
+        let name = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == "dom.rs" || name == "filereader.rs" || name == "extension.rs" {
+            continue;
+        }
+        let content = read(&entry);
+        for forbidden in [
+            "\"FileReader\"",
+            "\"EventTarget\"",
+            "\"DOMException\"",
+            "FileReaderNative",
+            "DomExceptionNative",
+        ] {
+            let mut hits = 0;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.contains(forbidden) {
+                    hits += 1;
+                }
+            }
+            assert_eq!(
+                hits,
+                0,
+                "{} must not introduce {forbidden}",
+                entry.display()
+            );
+        }
+    }
+    // Out-of-scope APIs are absent everywhere, including the new modules.
+    // (`extension.rs` wires the FileReader constructor, so the literal
+    // global name there is covered by the M4-A integration suite.)
     let mut all = String::new();
     for entry in walk_rs(&src) {
         all.push_str(&read(&entry));
         all.push('\n');
     }
     for forbidden in [
-        "\"FileReader\"",
         "\"FileReaderSync\"",
-        "\"EventTarget\"",
-        "\"DOMException\"",
-        "FileReader",
-        "DOMException",
+        "FileReaderSync",
+        "DedicatedWorker",
+        "SharedWorker",
+        "\"URL\"",
+        "structuredClone",
+        "CustomEvent",
+        "AbortSignal",
     ] {
-        // `js_read_error` documents the absence of DOMException and the
-        // streams module names its error mapping; comments are the only
-        // allowed mentions.
         let mut hits = 0;
         for line in all.lines() {
             let trimmed = line.trim();
@@ -305,8 +435,8 @@ fn no_filereader_or_dom_surface() {
     }
     let extension = read(&src.join("extension.rs"));
     assert!(
-        extension.contains("stream"),
-        "extension must register the streams shim"
+        extension.contains("dom_shim") || extension.contains("dom"),
+        "extension must register the DOM shim"
     );
 }
 
