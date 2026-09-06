@@ -86,6 +86,7 @@ fn blob_data_public_api_is_fixed() {
         "pub fn segment_count(",
         "pub fn concat_shared(",
         "pub fn push_shared(",
+        "pub fn materialize(",
         "pub fn slice(",
     ];
     let mut actual = Vec::new();
@@ -106,13 +107,12 @@ fn blob_data_public_api_is_fixed() {
             "unexpected BlobData public method: {line} (expected {expected})"
         );
     }
-    // No public test probe or content-read accessor may exist.
+    // Exactly one bounded byte-read primitive (M3) beyond segments/probes.
     for forbidden in [
         "pub fn segments(",
         "pub fn read_all(",
         "pub fn shares_sources_with(",
         "pub fn first_segment_shares_source_with(",
-        "pub fn materialize(",
         "pub fn segment_source_ptr(",
     ] {
         assert!(

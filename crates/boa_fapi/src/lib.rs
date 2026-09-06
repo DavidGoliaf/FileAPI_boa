@@ -9,9 +9,15 @@
 //!   `name`/`lastModified` getters and an injectable [`Clock`];
 //! - `FileList` objects created by the host via [`FileApiHandle::file_list`].
 //!
+//! M3-A adds memory-backed promise reads `Blob.prototype.text()`,
+//! `Blob.prototype.arrayBuffer()` and `Blob.prototype.bytes()` (inherited
+//! by `File`). Each call returns a pending `Promise` immediately; the read,
+//! packaging, and settlement run in a Boa promise job after the embedder
+//! calls `Context::run_jobs()`.
+//!
 //! The engine-independent data model and algorithms live in `boa_fapi_core`.
-//! M3-M7 APIs (text/arrayBuffer/bytes/stream, FileReader, blob URLs, WPT)
-//! are intentionally absent.
+//! The rest of M3 (streams), M4–M7 APIs (FileReader, blob URLs, WPT) are
+//! intentionally absent.
 //!
 //! # Example
 //!
@@ -47,6 +53,7 @@ mod blob;
 mod brand;
 mod file;
 mod file_list;
+mod promise_read;
 mod webidl;
 
 mod tests;

@@ -188,6 +188,7 @@ fn internal_binding_modules_expose_no_public_items() {
         "blob.rs",
         "file.rs",
         "file_list.rs",
+        "promise_read.rs",
         "webidl.rs",
     ] {
         let content = read(&src.join(module));
@@ -215,6 +216,53 @@ fn lib_rs_denies_unsafe_and_limits_re_exports() {
     ] {
         assert!(lib.contains(exposed), "lib.rs must contain `{exposed}`");
     }
+}
+
+#[test]
+fn no_stream_filereader_or_dom_surface() {
+    // M3-A must not register streams, readers, events, or DOM shims.
+    let src = workspace_root().join("crates/boa_fapi/src");
+    let mut all = String::new();
+    for entry in walk_rs(&src) {
+        all.push_str(&read(&entry));
+        all.push('\n');
+    }
+    for forbidden in [
+        "\"stream\"",
+        "\"textStream\"",
+        "\"FileReader\"",
+        "\"FileReaderSync\"",
+        "\"EventTarget\"",
+        "\"DOMException\"",
+        "ReadableStream",
+        "FileReader",
+        "DOMException",
+    ] {
+        // `js_read_error` documents the absence of DOMException; that
+        // comment is the only allowed mention.
+        let mut hits = 0;
+        for line in all.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "M3-A must not introduce {forbidden}");
+    }
+    // No M3-B/M4 global is registered by the extension either.
+    let extension = read(&src.join("extension.rs"));
+    assert!(
+        !extension.contains("stream"),
+        "extension must not mention stream"
+    );
+    let blob = read(&src.join("blob.rs"));
+    assert!(
+        !blob.contains("textStream"),
+        "blob.rs must not mention textStream"
+    );
 }
 
 #[test]

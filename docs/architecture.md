@@ -13,7 +13,7 @@ M1 core (data and algorithms, no Boa)
 Platform-independent crate containing:
 
 - **ByteSource trait** — abstraction over immutable byte data. This is the boundary through which future file-backed sources will check snapshot state and cancellation. In M1, only `MemorySource` (in-memory `Bytes` wrapper) exists.
-- **BlobData** — segmented immutable byte storage. Stores `Vec<BlobSegment>`, each holding an `Arc<dyn ByteSource>` with offset and length. Slicing reuses `Arc` pointers without copying payload. Segmentation stays private: bindings compose blobs only through `concat_shared`/`push_shared`; public reads of bytes or source identity do not exist.
+- **BlobData** — segmented immutable byte storage. Stores `Vec<BlobSegment>`, each holding an `Arc<dyn ByteSource>` with offset and length. Slicing reuses `Arc` pointers without copying payload. Segmentation stays private: bindings compose blobs only through `concat_shared`/`push_shared` and read bytes only through the bounded M3 `materialize`; public reads of segments or source identity do not exist.
 - **Resource limits** — `FileApiLimits` struct with validation, enforcing size, count, and concurrency constraints.
 - **Error model** — `FileApiError` enum covering not-found, permission, cancellation, range, and resource limit errors.
 - **MIME normalization** — `normalize_blob_type()` implementing File API spec: ASCII lowercase, reject non-printable.
@@ -47,8 +47,23 @@ Native data owns `Arc<BlobData>` plus immutable Rust strings/numbers only;
 it contains no `JsObject`/`JsValue`/`Context` and is GC-safe through the
 `boa_gc` derive with `#[unsafe_ignore_trace]` on non-GC fields.
 
-Not implemented (M3+): promise-returning reads, streams, FileReader, DOM
-events, blob URLs, structured clone.
+Not implemented (rest of M3, M4+): promise-returning reads beyond the three
+methods, streams, FileReader, DOM events, blob URLs, structured clone.
+
+### Layer 2b: `boa_fapi` promise reads (M3-A)
+
+`promise_read.rs` owns the single conversion/packaging/scheduling path for
+`Blob.prototype.text()`, `arrayBuffer()`, and `bytes()`:
+
+- brand check (`require_blob`) is synchronous; failures never create a `Promise`;
+- `JsPromise::new_pending` creates the pending promise in the current realm;
+- a `PromiseJob` capturing only `Arc<BlobData>`, cloned limits, and the read
+  mode is enqueued via `Context::enqueue_job`; the job calls the bounded
+  `BlobData::materialize`, packages the result (UTF-8 replacement string,
+  fresh `ArrayBuffer`, or fresh offset-0 `Uint8Array`), and settles once;
+- `MaterializeBytes` rejects as `RangeError`; other read failures reject as
+  plain `Error` (no `DOMException` before M4); the embedder runs
+  `context.run_jobs()` explicitly — the job never calls it itself.
 
 ### Layer 3: Host adapters (future M5+)
 

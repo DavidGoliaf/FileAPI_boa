@@ -103,7 +103,9 @@ fn constructor_descriptors_and_metadata() {
         && Object.getOwnPropertyDescriptor(globalThis, 'File').configurable === true
         && Blob.name === 'Blob' && File.name === 'File'
         && Blob.length === 0 && File.length === 2
-        && Blob.prototype.slice.length === 0
+        && Blob.prototype.slice.length === 0 && Blob.prototype.slice.name === 'slice'
+        && Blob.prototype.text.length === 0 && Blob.prototype.arrayBuffer.length === 0
+        && Blob.prototype.bytes.length === 0
         ",
     );
 }
@@ -131,9 +133,19 @@ fn prototype_member_descriptors() {
         r"
         var sizeDesc = Object.getOwnPropertyDescriptor(Blob.prototype, 'size');
         var sliceDesc = Object.getOwnPropertyDescriptor(Blob.prototype, 'slice');
+        var textDesc = Object.getOwnPropertyDescriptor(Blob.prototype, 'text');
+        var arrayBufferDesc = Object.getOwnPropertyDescriptor(Blob.prototype, 'arrayBuffer');
+        var bytesDesc = Object.getOwnPropertyDescriptor(Blob.prototype, 'bytes');
         sizeDesc.enumerable === true && sizeDesc.configurable === true
         && typeof sizeDesc.get === 'function' && sizeDesc.set === undefined
-        && sliceDesc.writable === true && sliceDesc.enumerable === true && sliceDesc.configurable === true
+        && sliceDesc.writable === true && sliceDesc.enumerable === false && sliceDesc.configurable === true
+        && sliceDesc.value.length === 0 && sliceDesc.value.name === 'slice'
+        && textDesc.writable === true && textDesc.enumerable === false && textDesc.configurable === true
+        && textDesc.value.length === 0 && textDesc.value.name === 'text'
+        && arrayBufferDesc.writable === true && arrayBufferDesc.enumerable === false && arrayBufferDesc.configurable === true
+        && arrayBufferDesc.value.length === 0 && arrayBufferDesc.value.name === 'arrayBuffer'
+        && bytesDesc.writable === true && bytesDesc.enumerable === false && bytesDesc.configurable === true
+        && bytesDesc.value.length === 0 && bytesDesc.value.name === 'bytes'
         ",
     );
 }

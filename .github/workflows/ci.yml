@@ -9,8 +9,8 @@ env:
   CARGO_DENY_DB_PATH: target/cargo-deny-advisories
 
 jobs:
-  m2-validation:
-    name: M2 validation (${{ matrix.os }})
+  m3a-validation:
+    name: M3-A validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M2 §8, in order.
+      # Work order M3-A §7, in order.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -41,6 +41,9 @@ jobs:
 
       - name: cargo test (M2 JS integration)
         run: cargo test --package boa_fapi --test m2_blob_file_filelist
+
+      - name: cargo test (M3-A promise reads)
+        run: cargo test --package boa_fapi --test m3_promise_blob_reads
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps

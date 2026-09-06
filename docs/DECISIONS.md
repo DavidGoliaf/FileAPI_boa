@@ -142,3 +142,55 @@ Arc-указатели и тестовые аксессоры в публичн�
 Последствия: контракт M1 расширен минимально и только семантическими
 операциями композиции; guard `blob_data_public_api_is_fixed` фиксирует
 точную поверхность из 9 методов; guard-тесты M1 продолжают проходить.
+
+## ADR-0011 (M3-A): `BlobData::materialize` — единственная ограниченная byte-операция
+
+Контекст: нормативное чтение Blob требует байтов, но M2 запретил
+публичные чтения (`read_all` удалён: материализация до `max_blob_size`
+обходила бы `max_materialize_bytes`).
+
+Решение: `materialize(&self, limits, cancel) -> Result<Bytes, FileApiError>`
+— единственный M3 semantic primitive. Проверяет
+`size <= max_materialize_bytes` до allocation, конвертирует размер
+fallibly в `usize`, резервирует `try_reserve_exact` (failure →
+`ResourceLimit(MaterializeBytes)`), проверяет cancellation до первого и
+перед каждым сегментом, читает ровно `offset..offset+len` с checked
+arithmetic, при любой ошибке возвращает `Err` без partial bytes. Guard
+расширен ровно на `materialize` (10 методов); сегменты, источники и
+identity-пробы по-прежнему не публичны.
+
+Последствия: bindings читают Blob только через этот метод внутри Boa job;
+лимит materialization впервые становится наблюдаемым как `RangeError`
+(см. ADR-0012).
+
+## ADR-0012 (M3-A): Boa job queue как единственный механизм settlement
+
+Контекст: заказ требует pending `Promise` немедленно и settlement только
+из очереди Boa, без `Promise.resolve`-реализации, синхронного settle,
+собственного event loop, потоков и `tokio`.
+
+Решение: методы создают `JsPromise::new_pending` в current realm,
+захватывают `Arc<BlobData>` + клон лимитов + mode в `PromiseJob` с realm
+и ставят через `Context::enqueue_job`. Job вызывает `materialize`,
+упаковывает (UTF-8 replacement / свежий `ArrayBuffer` / свежий offset-0
+`Uint8Array`) и вызывает resolve/reject ровно один раз. `run_jobs()`
+остаётся обязанностью embedder (показано в README); job сам его не
+вызывает. `ResolvingFunctions` (`JsFunction`-пара) путешествуют в capture
+job'а, а не в core/native DTO — GC-safe без `unsafe`.
+
+Последствия: реакции `.then` выполняются следующим проходом Boa jobs;
+порядок FIFO доказан JS-тестами; новых dependencies нет.
+
+## ADR-0013 (M3-A): materialization-limit — `RangeError`, остальное — `Error`
+
+Контекст: M3 фиксирует отображение ошибок чтения, но `DOMException`
+появится только в M4.
+
+Решение: `ResourceLimit(MaterializeBytes)` reject-ится `RangeError`;
+любая другая core/read-ошибка — plain `Error` без path/source/body в
+message (`js_read_error`); packaging-ошибка движка reject-ится её opaque
+значением. Синхронные brand-нарушения остаются `TypeError` без создания
+`Promise`.
+
+Последствия: тип rejection предсказуем и проверен JS-тестами на границе
+`size == limit` / `size == limit + 1`.

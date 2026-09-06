@@ -173,24 +173,37 @@ pub(crate) fn init_prototype(
         )?;
     }
 
-    // slice: writable, enumerable, configurable method.
-    let slice_function = boa_engine::object::FunctionObjectBuilder::new(
-        context.realm(),
-        NativeFunction::from_fn_ptr(slice),
-    )
-    .name(js_string!("slice"))
-    .length(0)
-    .constructor(false)
-    .build();
-    prototype.define_property_or_throw(
-        js_string!("slice"),
-        PropertyDescriptor::builder()
-            .value(slice_function)
-            .writable(true)
-            .enumerable(true)
-            .configurable(true),
-        context,
-    )?;
+    // slice: writable, non-enumerable, configurable method.
+    for (name, method) in [
+        (js_string!("slice"), NativeFunction::from_fn_ptr(slice)),
+        (
+            js_string!("text"),
+            NativeFunction::from_fn_ptr(crate::promise_read::text),
+        ),
+        (
+            js_string!("arrayBuffer"),
+            NativeFunction::from_fn_ptr(crate::promise_read::array_buffer),
+        ),
+        (
+            js_string!("bytes"),
+            NativeFunction::from_fn_ptr(crate::promise_read::bytes),
+        ),
+    ] {
+        let function = boa_engine::object::FunctionObjectBuilder::new(context.realm(), method)
+            .name(name.clone())
+            .length(0)
+            .constructor(false)
+            .build();
+        prototype.define_property_or_throw(
+            name,
+            PropertyDescriptor::builder()
+                .value(function)
+                .writable(true)
+                .enumerable(false)
+                .configurable(true),
+            context,
+        )?;
+    }
 
     // [Symbol.toStringTag] = "Blob" (writable: false, enumerable: false,
     // configurable: true, per Web IDL interface prototype objects).

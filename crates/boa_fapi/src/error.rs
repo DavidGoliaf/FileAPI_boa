@@ -1,6 +1,6 @@
 //! Registration errors and JS-boundary error construction for the File API extension.
 
-use boa_engine::{JsError, JsNativeError};
+use boa_engine::{Context, JsError, JsNativeError};
 use boa_fapi_core::error::ResourceLimitKind;
 use boa_fapi_core::file_api_error::FileApiError;
 
@@ -33,6 +33,17 @@ pub(crate) fn type_error(message: &str) -> JsError {
 pub(crate) fn range_error(message: &str) -> JsError {
     JsNativeError::range()
         .with_message(message.to_owned())
+        .into()
+}
+
+/// Builds a plain JS `Error` for a failed promise read.
+///
+/// Carries no path, source, or body detail, per the M3 rejection contract.
+/// (No `DOMException` exists before M4.)
+pub(crate) fn js_read_error(context: &mut Context) -> boa_engine::JsValue {
+    JsNativeError::error()
+        .with_message("blob read failed")
+        .into_opaque(context)
         .into()
 }
 
