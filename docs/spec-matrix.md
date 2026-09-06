@@ -2,11 +2,10 @@
 
 Public `BlobData` API is exactly the M1 contract (`empty`, `from_segments`, `size`,
 `media_type`, `snapshot`, `segment_count`, `slice`) plus the M2 no-copy
-composition primitives (`concat_shared`, `push_shared`, `read_all`,
-`shares_sources_with`, `first_segment_shares_source_with`). Raw segments are
-never part of the public API. Tests that need internals beyond these probes
-live in the `#[cfg(test)]` module beside `src/blob.rs` and read the private
-fields through normal child-module privacy;
+composition primitives (`concat_shared`, `push_shared`). Raw segments, byte
+reads, and source-identity probes are never public. Tests that need internals
+(content of a blob, `Arc` sharing) live in the `#[cfg(test)]` module beside
+`src/blob.rs` and read the private fields through normal child-module privacy;
 integration suites live in `crates/boa_fapi_core/tests/`.
 
 | ID | Normative rule | Code | Test |
@@ -35,7 +34,7 @@ integration suites live in `crates/boa_fapi_core/tests/`.
 | M2-WIDL-04 | `DOMString`/`USVString` conversions; BigInt/Symbol/throwing coercion → TypeError; getter exceptions propagate | `webidl.rs` — `usv_string`, `dom_string`, `parse_ending_mode`, `BlobOptions::parse`, `FileOptions::parse` | `m2_blob_file_filelist.rs::file_name_conversions`, `::bigint_last_modified_throws`, `::symbol_slice_args_throw`, `::throwing_options_getter_propagates` |
 | M2-BLOB-01 | Blob parts left-to-right: USVString (UTF-8, `endings`), BufferSource, Blob/File; other part → synchronous TypeError, no partial Blob | `webidl.rs` — `blob_parts`, `collect_parts`, `process_part`, `PartsCollector` | `m2_blob_file_filelist.rs::string_parts_and_usv_replacement`, `::nested_blob_and_file_composition`; `src/tests.rs::string_parts_are_utf8_encoded`, `::native_endings_convert_bytes`, `::transparent_endings_preserve_bytes` |
 | M2-BLOB-02 | BufferSource: exact copy of the visible view bytes at construction; detached buffer → empty byte sequence; later mutation invisible | `webidl.rs` — `array_buffer_bytes`, `view_bytes` | `src/tests.rs::buffer_source_copies_visible_range`, `::data_view_copies_visible_range`, `::post_construction_mutation_cannot_change_blob`, `::detached_buffer_copies_empty_sequence`; `m2_blob_file_filelist.rs::buffer_source_visible_ranges`, `::post_construction_mutation_is_invisible` |
-| M2-BLOB-03 | Blob/File parts append shared immutable sources without payload copy; inner type ignored | `webidl.rs` — `PartsCollector::push_shared` → core `BlobData::push_shared`/`concat_shared` (no raw segment access) | `src/tests.rs::nested_blob_composition_shares_source_without_copy`, `::nested_file_composition_shares_source_without_copy` (`first_segment_shares_source_with` identity probe); `blob::tests::concat_shared_*` (4 unit tests) |
+| M2-BLOB-03 | Blob/File parts append shared immutable sources without payload copy; inner type ignored | `webidl.rs` — `PartsCollector::push_shared` → core `BlobData::push_shared`/`concat_shared` (no raw segment access) | `m2_blob_file_filelist.rs::nested_blob_and_file_composition` (JS-observable sizes); `src/tests.rs::nested_blob_composition_shares_source_without_copy`, `::nested_file_composition_shares_source_without_copy` (JS + M1 `size`/`segment_count` only); `blob::tests::concat_shared_*` (4 unit tests, `Arc::ptr_eq` via child-module private access) |
 | M2-BLOB-04 | Options default `{type: "", endings: "transparent"}`; type → M1 normalize; only `transparent`/`native` valid | `webidl.rs` — `BlobOptions::parse`, `parse_ending_mode` | `m2_blob_file_filelist.rs::blob_type_normalization_and_readonly`, `::invalid_endings_throw`, `::empty_blob_defaults` |
 | M2-BLOB-05 | `size`/`type` readonly getters; `Object.prototype.toString.call(blob)` = `[object Blob]` | `blob.rs` — `size_getter`, `type_getter`, `init_prototype` (toStringTag) | `m2_blob_file_filelist.rs::tostring_tags`, `::empty_blob_defaults`, `::blob_type_normalization_and_readonly` |
 | M2-BLOB-06 | `slice` uses M1 `BlobData::slice`; absent contentType → empty type; result is a new Blob sharing sources | `blob.rs` — `slice` | `m2_blob_file_filelist.rs::slice_boundaries`, `::slice_content_type`, `::slice_result_is_new_blob_not_file`, `::sliced_source_stays_immutable`; `src/tests.rs::slice_shares_source_without_copy` |

@@ -1,14 +1,15 @@
 //! Blob data model: segmented immutable byte storage with File API slice semantics.
 //!
 //! The segmentation is an internal representation detail. The public API
-//! exposes only `BlobData` semantics (`size`, `media_type`, `snapshot`,
-//! `segment_count`, `slice`, `concat_shared`, `read_all`) and never hands
-//! out raw segments: [`BlobSegment`] fields are public solely so that
-//! `from_segments` can accept caller-owned segments as *input*.
+//! exposes only the fixed M1 contract (`empty`, `from_segments`, `size`,
+//! `media_type`, `snapshot`, `segment_count`, `slice`) plus, for M2
+//! bindings, the no-copy composition primitives (`concat_shared`,
+//! `push_shared`). No content-read, segment accessor, source-identity or
+//! other test probe is public: [`BlobSegment`] fields are public solely so
+//! that `from_segments` can accept caller-owned segments as *input*.
 
 use std::sync::Arc;
 
-use crate::cancellation::CancellationToken;
 use crate::error::ResourceLimitKind;
 use crate::file_api_error::FileApiError;
 use crate::limits::FileApiLimits;
@@ -199,58 +200,6 @@ impl BlobData {
         *parts += 1;
         Ok(())
     }
-    /// Materializes the blob content without exposing raw segments.
-    ///
-    /// Reads every segment through [`ByteSource::read_range`] in order.
-    /// `cancel` is honoured before each segment read; a cancelled or invalid
-    /// read yields `Err` and no partial result is returned.
-    ///
-    /// Callers must enforce `max_materialize_bytes` themselves: this helper
-    /// performs no limit checks beyond what `read_range` reports.
-    pub fn read_all(&self, cancel: &CancellationToken) -> Result<bytes::Bytes, FileApiError> {
-        use bytes::BytesMut;
-        let mut out = BytesMut::new();
-        for seg in &self.segments {
-            let end = seg
-                .offset
-                .checked_add(seg.len)
-                .ok_or(FileApiError::InvalidRange)?;
-            let chunk = seg.source.read_range(seg.offset..end, cancel)?;
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out.freeze())
-    }
-
-    /// Compares two blobs by source identity, without exposing segments.
-    ///
-    /// Returns `true` when both blobs consist of the same number of segments
-    /// and every pair of segments shares the same `Arc` allocation.
-    /// Offsets and lengths may differ (slices narrow the view into the same
-    /// source). Used by composition tests to prove no payload copy happened.
-    #[must_use]
-    pub fn shares_sources_with(&self, other: &Self) -> bool {
-        if self.segments.len() != other.segments.len() {
-            return false;
-        }
-        self.segments
-            .iter()
-            .zip(other.segments.iter())
-            .all(|(a, b)| Arc::ptr_eq(&a.source, &b.source))
-    }
-
-    /// Returns `true` when the first segment of `self` and `other` share
-    /// the same `Arc` source allocation.
-    ///
-    /// Offsets and lengths may legitimately differ (e.g. a `slice` narrows
-    /// the view into the same source). Used by bindings tests to prove
-    /// zero-copy derivation without exposing raw segments.
-    #[must_use]
-    pub fn first_segment_shares_source_with(&self, other: &Self) -> bool {
-        match (self.segments.first(), other.segments.first()) {
-            (Some(a), Some(b)) => Arc::ptr_eq(&a.source, &b.source),
-            _ => false,
-        }
-    }
 
     /// Creates a new blob by slicing this blob per File API semantics.
     ///
@@ -388,7 +337,30 @@ mod tests {
     }
 
     fn read_blob(blob: &BlobData) -> Vec<u8> {
-        blob.read_all(&cancel()).unwrap().to_vec()
+        // Child-module access to the private `segments` field: proves content
+        // and `Arc` sharing without any public test accessor.
+        let token = cancel();
+        let mut result = Vec::with_capacity(blob.size as usize);
+        for seg in &blob.segments {
+            let end = seg.offset + seg.len;
+            result.extend_from_slice(&seg.source.read_range(seg.offset..end, &token).unwrap());
+        }
+        result
+    }
+
+    /// Asserts that two blobs re-link the same `Arc` source allocations in
+    /// the same order (no payload copy), via private fields only.
+    fn assert_shares_sources(actual: &BlobData, expected: &BlobData) {
+        assert_eq!(
+            actual.segment_count(),
+            expected.segment_count(),
+            "segment counts differ"
+        );
+        for (a, b) in actual.segments.iter().zip(expected.segments.iter()) {
+            assert!(Arc::ptr_eq(&a.source, &b.source), "source Arc differs");
+            assert_eq!(a.offset, b.offset, "segment offset differs");
+            assert_eq!(a.len, b.len, "segment length differs");
+        }
     }
 
     fn make_source(data: &[u8]) -> Arc<dyn ByteSource> {
@@ -778,7 +750,12 @@ mod tests {
         // The sliced blob must share the same Arc allocation as the original
         // source, proving that slice copies no payload data.
         assert_eq!(sliced.segment_count(), 1);
-        assert!(sliced.first_segment_shares_source_with(&blob));
+        assert_eq!(sliced.segments.len(), blob.segments.len());
+        assert!(Arc::ptr_eq(&src, &sliced.segments[0].source));
+        assert!(Arc::ptr_eq(
+            &blob.segments[0].source,
+            &sliced.segments[0].source
+        ));
     }
 
     #[test]
@@ -806,8 +783,15 @@ mod tests {
         assert_eq!(out.size(), 11);
         assert_eq!(out.segment_count(), 2);
         assert_eq!(read_blob(&out), b"hello world");
-        assert!(out.shares_sources_with(&blob1.concat_shared(&blob2, "", &limits()).unwrap()));
-        assert!(out.first_segment_shares_source_with(&blob1));
+        assert_shares_sources(&out, &blob1.concat_shared(&blob2, "", &limits()).unwrap());
+        assert!(Arc::ptr_eq(
+            &out.segments[0].source,
+            &blob1.segments[0].source
+        ));
+        assert!(Arc::ptr_eq(
+            &out.segments[1].source,
+            &blob2.segments[0].source
+        ));
     }
 
     #[test]

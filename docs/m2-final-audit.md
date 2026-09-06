@@ -14,7 +14,7 @@
 | M2-WIDL-04 | DOMString/USVString; BigInt/Symbol/throwing coercion → TypeError; getter exceptions propagate | `webidl.rs:usv_string`, `::dom_string`, `BlobOptions::parse`, `FileOptions::parse` | `::file_name_conversions`, `::bigint_last_modified_throws`, `::symbol_slice_args_throw`, `::throwing_options_getter_propagates` | PASS |
 | M2-BLOB-01 | Parts left-to-right: USVString/BufferSource/Blob/File; other part → TypeError, no partial Blob | `webidl.rs:process_part`, `::collect_parts`, `PartsCollector` | `::string_parts_and_usv_replacement`; `src/tests.rs::string_parts_are_utf8_encoded`, `::native_endings_convert_bytes`, `::transparent_endings_preserve_bytes` | PASS |
 | M2-BLOB-02 | BufferSource snapshot copy of visible range; detached → empty; mutation invisible | `webidl.rs:array_buffer_bytes`, `::view_bytes` | `src/tests.rs::buffer_source_copies_visible_range`, `::data_view_copies_visible_range`, `::post_construction_mutation_cannot_change_blob`, `::detached_buffer_copies_empty_sequence`; `::buffer_source_visible_ranges` (all 11 typed array kinds) | PASS |
-| M2-BLOB-03 | Blob/File parts share sources without payload copy; inner type ignored | `webidl.rs:PartsCollector::push_shared` → core `BlobData::push_shared`/`concat_shared` (no raw segment access) | `src/tests.rs::nested_blob_composition_shares_source_without_copy`, `::nested_file_composition_shares_source_without_copy` (`first_segment_shares_source_with` probe); `blob::tests::concat_shared_*` (4 unit tests) | PASS |
+| M2-BLOB-03 | Blob/File parts share sources without payload copy; inner type ignored | `webidl.rs:PartsCollector::push_shared` → core `BlobData::push_shared`/`concat_shared` (no raw segment access) | `m2_blob_file_filelist.rs::nested_blob_and_file_composition` (JS sizes); `src/tests.rs::nested_*_shares_source_without_copy` (JS + M1 `size`/`segment_count`); `blob::tests::concat_shared_*` (4 unit tests, `Arc::ptr_eq` via child-module private access) | PASS |
 | M2-BLOB-04 | Options defaults; type normalize; endings whitelist | `webidl.rs:BlobOptions::parse`, `::parse_ending_mode` | `::blob_type_normalization_and_readonly`, `::invalid_endings_throw`, `::empty_blob_defaults` | PASS |
 | M2-BLOB-05 | Readonly `size`/`type`; `[object Blob]` toStringTag | `blob.rs:size_getter`, `::type_getter`, `::init_prototype` | `::tostring_tags`, `::empty_blob_defaults` | PASS |
 | M2-BLOB-06 | `slice` via M1 core; absent contentType → empty type; new Blob sharing sources | `blob.rs:slice` | `::slice_boundaries`, `::slice_content_type`, `::slice_result_is_new_blob_not_file`, `::sliced_source_stays_immutable`; `src/tests.rs::slice_shares_source_without_copy` | PASS |
@@ -28,7 +28,7 @@
 | M2-FLIST-03 | Indexed own props enumerable, readonly, non-replaceable | `file_list.rs:create` (writable:false, enumerable:true, configurable:false) | `::file_list_indexed_descriptors`, `::file_list_indexed_properties_are_readonly` | PASS |
 | M2-FLIST-04 | `[object FileList]`; brand gates on borrowed members | `file_list.rs:init_prototype`; `brand.rs:require_file_list` | `::file_list_brand_checks`, `::file_list_order_identity_and_access` | PASS |
 | M2-GC-01 | Native data GC-safe, no Boa types in DTOs, no `unsafe` | `blob.rs`/`file.rs`/`file_list.rs` native structs with `#[unsafe_ignore_trace]` on non-GC fields | `guards::production_source_no_unwrap_expect_panic` (plus `unsafe_code = deny` via workspace lints); all `src/tests.rs` run under the real GC | PASS |
-| M2-GC-02 | No native data/segments/brand keys/test hooks in public APIs | `lib.rs` re-exports; private `mod`s; core exposes only `concat_shared`/`push_shared`/`read_all`/identity probes, never raw segments | `guards::internal_binding_modules_expose_no_public_items`, `::lib_rs_denies_unsafe_and_limits_re_exports`, `::public_api_exposes_no_paths_or_mutable_bytes` | PASS |
+| M2-GC-02 | No native data/segments/brand keys/test hooks in public APIs | `lib.rs` re-exports; private `mod`s; core exposes only `concat_shared`/`push_shared` beyond the M1 contract, never raw segments, byte reads, or identity probes | `guards::internal_binding_modules_expose_no_public_items`, `::lib_rs_denies_unsafe_and_limits_re_exports`, `::public_api_exposes_no_paths_or_mutable_bytes`, core `guards_tests::blob_data_public_api_is_fixed` | PASS |
 
 ## Step B — Defect search findings and fixes
 
@@ -59,10 +59,20 @@
 6. **Review P1: public `BlobData::segments()` exposed raw segments** —
    violated the M2 order (`Do not expose ... raw segments ... in a public
    Rust/JS API`). Fix: accessor removed; composition moved into core
-   primitives `concat_shared`/`push_shared`, byte reads into `read_all`,
-   and sharing proofs into `shares_sources_with`/
-   `first_segment_shares_source_with`. `PartsCollector` now owns a single
-   `BlobData`. Regression tests: `blob::tests::concat_shared_*` (4 tests).
+   primitives `concat_shared`/`push_shared`. No byte reads, no identity
+   probes. Regression tests: `blob::tests::concat_shared_*` (4 tests,
+   `Arc::ptr_eq` via child-module private access, as permitted by M1 §6.6).
+9. **Review P1 (round 2): public identity probes + `read_all`** —
+   `shares_sources_with` / `first_segment_shares_source_with` раскрывали
+   факт совпадения `Arc`-источников и использовались только тестами, что
+   запрещено M2 как публичный test accessor; публичный `read_all`
+   материализовывал blob до `max_blob_size` в обход
+   `max_materialize_bytes` и выходил за M1-контракт. Fix: все три метода
+   удалены; no-copy доказывается только в `#[cfg(test)]` child-модуле
+   `src/blob.rs` через приватные поля; `boa_fapi/src/tests.rs`
+   переписан на JS-наблюдаемое состояние + публичные M1-метаданные
+   (`size`, `segment_count`, `media_type`); добавлен guard
+   `blob_data_public_api_is_fixed` (ровно 9 публичных методов).
 7. **Review P1: `deny.toml` weakened to `wildcards = "warn"`** — a forbidden
    check relaxation. Fix: restored `wildcards = "deny"` with a pinned
    `path + version` on the internal dependency (no `skip`, no exclusion).
@@ -104,6 +114,6 @@ recorded in `docs/m2-validation.md`.
 
 - All M2-REG/WIDL/BLOB/FILE/FLIST/GC requirements verified with code and
   test evidence.
-- 8 defects found during the audit pass and fixed with regression tests.
-- 207 workspace tests pass; boa_fapi line coverage 92.61% (threshold 85%).
+- 9 defects found during the audit pass and fixed with regression tests.
+- 208 workspace tests pass; boa_fapi line coverage 92.61% (threshold 85%).
 - No masked failures, skips, exclusions, or changed acceptance criteria.

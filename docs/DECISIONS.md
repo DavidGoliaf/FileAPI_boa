@@ -117,21 +117,28 @@ BufferSource — точная копия видимого диапазона; Bl
 Последствия: значение используется только когда `lastModified` опущен;
 переданное значение конвертируется обычным `long long` без обращения к часам.
 
-## ADR-0010 (M2): no-copy Blob composition without a public segment accessor
+## ADR-0010 (M2): no-copy Blob composition without public probes
 
 Контекст: композиция Blob без копирования требует доступа к сегментам
-существующего блоба, но M2-заказ запрещает раскрывать raw segments в
-публичном Rust API (`Do not expose ... raw segments ... in a public
-Rust/JS API`).
+существующего блоба, но M2-заказ запрещает раскрывать raw segments,
+Arc-указатели и тестовые аксессоры в публичном Rust/JS API, а M1-контракт
+фиксирует публичную поверхность `BlobData`.
 
-Решение: `BlobData` предоставляет только семантические примитивы —
-`concat_shared(&self, other, media_type, limits)` (перелинковка shared
-`Arc`-источников под теми же лимитами), `push_shared` (пошаговое
-накопление частей для `PartsCollector` с учётом `max_parts`),
-`read_all(&self, cancel)` (материализация байтов без раскрытия
-сегментов) и identity-пробы `shares_sources_with` /
-`first_segment_shares_source_with` для тестов. `PartsCollector` в
-`boa_fapi` владеет одним `BlobData` и никогда не трогает сырые сегменты.
+Решение: публичный API core — ровно M1-контракт плюс два семантических
+примитива композиции: `concat_shared(&self, other, media_type, limits)`
+(перелинковка shared `Arc`-источников под теми же лимитами) и
+`push_shared` (пошаговое накопление частей для `PartsCollector` с учётом
+`max_parts`). Никаких публичных чтений байтов (`read_all` удалён:
+материализация до `max_blob_size` обходила бы `max_materialize_bytes`) и
+никаких identity-проб (`shares_sources_with` /
+`first_segment_shares_source_with` удалены как тестовые аксессоры).
+Доказательство no-copy живёт только в `#[cfg(test)]` child-модуле
+`src/blob.rs` через прямой доступ к приватным полям (`Arc::ptr_eq`),
+что явно разрешено заказом M1 §6.6. `PartsCollector` в `boa_fapi`
+владеет одним `BlobData` и никогда не трогает сырые сегменты; тесты
+`boa_fapi` (`src/tests.rs`) assert'ят только JS-наблюдаемое состояние и
+публичные M1-метаданные (`size`, `segment_count`, `media_type`).
 
-Последствия: контракт M1 (минимальный публичный API) расширен минимально
-и только семантическими операциями; guard-тесты M1 продолжают проходить.
+Последствия: контракт M1 расширен минимально и только семантическими
+операциями композиции; guard `blob_data_public_api_is_fixed` фиксирует
+точную поверхность из 9 методов; guard-тесты M1 продолжают проходить.

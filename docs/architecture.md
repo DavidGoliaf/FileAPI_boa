@@ -13,7 +13,7 @@ M1 core (data and algorithms, no Boa)
 Platform-independent crate containing:
 
 - **ByteSource trait** — abstraction over immutable byte data. This is the boundary through which future file-backed sources will check snapshot state and cancellation. In M1, only `MemorySource` (in-memory `Bytes` wrapper) exists.
-- **BlobData** — segmented immutable byte storage. Stores `Vec<BlobSegment>`, each holding an `Arc<dyn ByteSource>` with offset and length. Slicing reuses `Arc` pointers without copying payload. Segmentation stays private: bindings compose blobs through `concat_shared`/`push_shared`, read bytes through `read_all`, and prove sharing through `shares_sources_with`/`first_segment_shares_source_with`.
+- **BlobData** — segmented immutable byte storage. Stores `Vec<BlobSegment>`, each holding an `Arc<dyn ByteSource>` with offset and length. Slicing reuses `Arc` pointers without copying payload. Segmentation stays private: bindings compose blobs only through `concat_shared`/`push_shared`; public reads of bytes or source identity do not exist.
 - **Resource limits** — `FileApiLimits` struct with validation, enforcing size, count, and concurrency constraints.
 - **Error model** — `FileApiError` enum covering not-found, permission, cancellation, range, and resource limit errors.
 - **MIME normalization** — `normalize_blob_type()` implementing File API spec: ASCII lowercase, reject non-printable.

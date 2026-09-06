@@ -5,12 +5,18 @@
 - M2 JS bindings in `crates/boa_fapi` (extension/brand/blob/file/file_list/
   webidl/clock/error) with atomic registration, native brand gates, Web IDL
   conversions, no-copy `Blob`/`File` composition, injectable `Clock`.
-- Core composition without raw segments: `BlobData::concat_shared`,
-  `push_shared`, `read_all`, `shares_sources_with`,
-  `first_segment_shares_source_with` in
+- Core composition without raw segments or test probes:
+  `BlobData::concat_shared`/`push_shared` only, in
   `crates/boa_fapi_core/src/blob.rs`; `PartsCollector` owns one `BlobData`.
+  No public byte reads, no source-identity probes; no-copy is proven in the
+  `#[cfg(test)]` child module via private fields (M1 §6.6), and
+  `boa_fapi/src/tests.rs` asserts only JS-observable state plus M1 metadata.
 - Review fixes on top of the M2 feature set:
   - P1: removed public `BlobData::segments()`; no raw segments in public API.
+  - P1 (round 2): removed public `read_all` (unbounded materialization
+    bypassed `max_materialize_bytes`, out of M1 contract) and the
+    `shares_sources_with` / `first_segment_shares_source_with` test
+    accessors; added guard `blob_data_public_api_is_fixed` (9 methods).
   - P1: `deny.toml` back to `wildcards = "deny"`; internal dep pins
     `path + version`; `allow-wildcard-paths` is a backstop only.
   - P1: `Cargo.lock` removed from `.gitignore`, tracked in Git.
@@ -55,5 +61,5 @@ commands, matrix IDs, or acceptance criteria.
 - ADR-0007: atomic registration build → preflight → install → rollback.
 - ADR-0008: `BlobPart` union restricted to string/BufferSource/Blob/File.
 - ADR-0009: injectable `Clock` for `File.lastModified`.
-- ADR-0010 (rewritten): no public segment accessor; core exposes only
-  `concat_shared`/`push_shared`/`read_all`/identity probes.
+- ADR-0010 (rewritten): no public segment accessor, byte read, or identity
+  probe; core exposes only `concat_shared`/`push_shared` beyond M1.

@@ -65,8 +65,62 @@ fn public_api_no_path_types() {
 }
 
 // ──────────────────────────────────────────────
-// Production source guard: no unwrap/expect/panic/todo/unimplemented
+// Public BlobData API guard: exactly the fixed M1 contract + M2
+// no-copy composition primitives, no test probes or content reads
 // ──────────────────────────────────────────────
+
+#[test]
+fn blob_data_public_api_is_fixed() {
+    let blob_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blob.rs");
+    let content = match std::fs::read_to_string(&blob_rs) {
+        Ok(s) => s,
+        Err(e) => panic!("could not read blob.rs: {e}"),
+    };
+    // Preamble lists the allowed surface; the impl block must match it.
+    let allowed = [
+        "pub fn empty(",
+        "pub fn from_segments(",
+        "pub fn size(",
+        "pub fn media_type(",
+        "pub fn snapshot(",
+        "pub fn segment_count(",
+        "pub fn concat_shared(",
+        "pub fn push_shared(",
+        "pub fn slice(",
+    ];
+    let mut actual = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("pub fn ") {
+            actual.push(trimmed.to_owned());
+        }
+    }
+    assert_eq!(
+        actual.len(),
+        allowed.len(),
+        "BlobData public API changed: {actual:?}"
+    );
+    for (line, expected) in actual.iter().zip(allowed.iter()) {
+        assert!(
+            line.starts_with(expected),
+            "unexpected BlobData public method: {line} (expected {expected})"
+        );
+    }
+    // No public test probe or content-read accessor may exist.
+    for forbidden in [
+        "pub fn segments(",
+        "pub fn read_all(",
+        "pub fn shares_sources_with(",
+        "pub fn first_segment_shares_source_with(",
+        "pub fn materialize(",
+        "pub fn segment_source_ptr(",
+    ] {
+        assert!(
+            !content.contains(forbidden),
+            "blob.rs must not expose {forbidden}"
+        );
+    }
+}
 
 fn walk_src_files(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut result = Vec::new();

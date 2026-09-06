@@ -14,7 +14,7 @@
 |---|---|---|---|
 | 1 | `cargo fmt --all -- --check` | 0 | PASS |
 | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 | PASS |
-| 3 | `cargo test --workspace --all-features` | 0 | PASS (207 tests: 22 boa_fapi unit, 9 boa_fapi guards, 51 M2 JS integration, 1 boa_fapi doc, 124 core: 41+25+6+17+16+19) |
+| 3 | `cargo test --workspace --all-features` | 0 | PASS (208 tests: 22 boa_fapi unit, 9 boa_fapi guards, 51 M2 JS integration, 1 boa_fapi doc, 125 core: 41+25+7+17+16+19) |
 | 4 | `cargo test --package boa_fapi --test m2_blob_file_filelist` | 0 | PASS (51 tests, all executing JS in a real Boa `Context`) |
 | 5 | `cargo doc --workspace --no-deps` (RUSTDOCFLAGS='-Dwarnings') | 0 | PASS |
 | 6 | `cargo test --package boa_fapi --doc` | 0 | PASS (1 doc test) |
@@ -47,10 +47,13 @@ TOTAL                            1463               148    89.88%          97   
   `boa_engine::Context` and evaluates real JavaScript; Rust-only unit tests
   additionally verify byte content and `Arc` sharing through the
   `#[cfg(test)]` child module (`src/tests.rs`), as permitted by work order §6.
-- Raw segments are not part of any public Rust API: `boa_fapi_core` exposes
-  only `concat_shared`/`push_shared`/`read_all` plus the identity probes
-  `shares_sources_with`/`first_segment_shares_source_with`
-  (ADR-0010); `PartsCollector` owns a single `BlobData`.
+- Raw segments, byte reads, and source-identity probes are not part of any
+  public Rust API: `boa_fapi_core` exposes exactly the M1 contract plus
+  `concat_shared`/`push_shared` (ADR-0010, guard
+  `blob_data_public_api_is_fixed`); `PartsCollector` owns a single
+  `BlobData`. `read_all` was removed — unbounded materialization would
+  bypass `max_materialize_bytes`; no-copy proofs live only in the
+  `#[cfg(test)]` child module via private fields (M1 §6.6).
 - `deny.toml` gained the `Zlib` license (foldhash via the Boa dependency
   tree); `[bans] wildcards` stays `deny` — the workspace-internal
   `boa_fapi_core` dependency pins both `path` and `version`, and
