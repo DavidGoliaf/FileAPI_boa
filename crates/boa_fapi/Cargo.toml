@@ -18,12 +18,15 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 encoding_rs = { workspace = true }
 base64 = { workspace = true }
+getrandom = { workspace = true }
 
 [features]
-default = ["streams-shim", "dom-shim", "fs"]
+default = ["streams-shim", "dom-shim", "fs", "url-shim", "structured-clone"]
 streams-shim = []
 dom-shim = []
 fs = ["dep:boa_fapi_fs"]
+url-shim = []
+structured-clone = []
 
 [dev-dependencies]
 proptest = { workspace = true }

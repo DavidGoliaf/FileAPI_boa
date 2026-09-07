@@ -151,6 +151,7 @@ dependencies = [
  "boa_gc",
  "bytes",
  "encoding_rs",
+ "getrandom 0.3.4",
  "proptest",
  "thiserror",
 ]

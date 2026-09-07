@@ -637,13 +637,15 @@ fn window_and_service_worker_never_expose_sync() {
 
 #[test]
 fn no_filesystem_url_clone_or_full_dom_surface() {
+    // M4-B froze before the M6 URL milestone: this asserts the absence of
+    // the filesystem/full-DOM names. The M6 `URL` namespace (exactly the
+    // two static methods) is the expected addition, pinned by M6 suites.
     let mut context = setup_with_env(FileApiEnvironment::DedicatedWorker);
     assert_eval(
         &mut context,
         r"
         typeof FileReaderSync === 'function'
         && typeof FileReaderSyncSync === 'undefined'
-        && (typeof URL === 'undefined' || typeof URL.createObjectURL === 'undefined')
         && typeof CustomEvent === 'undefined'
         && typeof AbortSignal === 'undefined'
         && typeof FileReaderSync.prototype.readAsTextSync === 'undefined'

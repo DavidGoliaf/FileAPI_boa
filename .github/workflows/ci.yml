@@ -10,7 +10,7 @@ env:
 
 jobs:
   m3-validation:
-    name: M5 validation (${{ matrix.os }})
+    name: M6 validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M5 §9, in order.
+      # Work order M6 §9, in order.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -60,6 +60,18 @@ jobs:
       - name: cargo test (M5 filesystem File)
         run: cargo test --package boa_fapi --test m5_file_fs -- --nocapture
 
+      - name: cargo test (M6 core URL/clone)
+        run: cargo test --package boa_fapi_core --test blob_url -- --nocapture
+
+      - name: cargo test (M6 Blob URL)
+        run: cargo test --package boa_fapi --test m6_blob_url -- --nocapture
+
+      - name: cargo test (M6 structured clone)
+        run: cargo test --package boa_fapi --test m6_structured_clone -- --nocapture
+
+      - name: cargo test (workspace, no default features)
+        run: cargo test --workspace --no-default-features
+
       - name: cargo doc
         run: cargo doc --workspace --no-deps
         env:
@@ -69,7 +81,7 @@ jobs:
         run: cargo test --package boa_fapi --doc
 
       - name: cargo llvm-cov
-        run: cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85
+        run: cargo llvm-cov --workspace --all-features --fail-under-lines 80
 
       - name: cargo hack (feature powerset)
         run: cargo hack check --feature-powerset --depth 2

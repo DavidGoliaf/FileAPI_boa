@@ -15,9 +15,11 @@
 //! destruction. Closers are idempotent (`close_all` is), so duplicate
 //! tracking of one registry is harmless.
 //!
-//! Shutdown owns no Blob URL store or structured-clone lifetime (both are
-//! M6 scope): the extension points stay reserved here without
-//! implementation.
+//! M6 owns the Blob URL store lifetime: every M6 registration tracks one
+//! closer that clears its context-local [`BlobUrlStore`](boa_fapi_core::blob_url::BlobUrlStore),
+//! releasing all strong payload references at shutdown. Pending clone work
+//! observes the same flag: after shutdown no new JS callbacks, promise
+//! settlements or clone writes into a destroyed context may run.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

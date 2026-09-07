@@ -33,6 +33,14 @@ pub enum RegisterError {
     /// milestone implements no host DOM adapter.
     #[error("the DOM shim is disabled and no host DOM adapter is available")]
     DomShimDisabled,
+    /// A host structured-clone bridge speaks a foreign encoding version.
+    ///
+    /// Returned before any `globalThis` mutation when the explicitly
+    /// registered [`CloneAdapter`](crate::CloneAdapter) reports a version
+    /// other than the stable M6 encoding: the bridge is left unregistered
+    /// and no clone globals are installed.
+    #[error("the structured-clone bridge `{0}` speaks an incompatible version")]
+    CloneBridgeIncompatible(String),
     /// A Boa engine error occurred while building or installing the classes.
     #[error(transparent)]
     Js(#[from] JsError),

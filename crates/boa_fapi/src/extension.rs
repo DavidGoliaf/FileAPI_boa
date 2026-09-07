@@ -13,6 +13,9 @@ use boa_engine::object::ConstructorBuilder;
 use boa_engine::object::JsObject;
 use boa_engine::property::{PropertyDescriptor, PropertyKey};
 use boa_engine::{Context, JsData, JsResult, js_string};
+use boa_fapi_core::blob::BlobData;
+use boa_fapi_core::blob_url::{BlobUrlError, BlobUrlStore, EnvironmentDescriptor, EnvironmentKey};
+use boa_fapi_core::clone::{CloneError, FileApiClonePayload};
 use boa_fapi_core::limits::FileApiLimits;
 use boa_gc::{Finalize, Trace};
 use bytes::Bytes;
@@ -24,7 +27,82 @@ use crate::error::{RegisterError, js_from_core};
 use crate::file;
 use crate::file_list;
 
-/// Immutable extension configuration (M2 subset: clock and limits only).
+/// Shared ownership of a context-local Blob URL store.
+///
+/// Cloned into [`RegisteredSpecs`], every URL job payload and the
+/// [`FileApiHandle`]: `clear()` at shutdown releases all strong payload
+/// references at once, while already-handed-out `Arc<BlobData>` reads run
+/// to completion.
+pub(crate) type SharedUrlStore = Arc<BlobUrlStore>;
+
+/// Source of 16 CSPRNG bytes per Blob URL UUID.
+///
+/// The production default draws from the operating system through
+/// `getrandom` (documented in the crate ADR); tests inject a deterministic
+/// sequence. Counters, timestamps and predictable PRNGs are forbidden as
+/// implementations by contract.
+pub trait UrlEntropySource: Send + Sync + 'static {
+    /// Fills 16 bytes of cryptographic entropy for one UUID.
+    fn fill_16(&self) -> [u8; 16];
+}
+
+/// OS entropy via `getrandom`: the production [`UrlEntropySource`].
+///
+/// A platform failure surfaces as [`BlobUrlError::EntropyUnavailable`]
+/// (the same network-error equivalent in JS); no counter/timestamp/PRNG
+/// fallback exists by design.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsEntropy;
+
+impl UrlEntropySource for OsEntropy {
+    fn fill_16(&self) -> [u8; 16] {
+        let mut bytes = [0_u8; 16];
+        if getrandom::fill(&mut bytes).is_ok() {
+            bytes
+        } else {
+            // The caller maps the zero sentinel to `EntropyUnavailable`
+            // without leaking platform detail; `getrandom` leaves the
+            // buffer untouched on failure, and all-zero never escapes as
+            // a UUID because the sentinel check runs first.
+            [0_u8; 16]
+        }
+    }
+}
+
+/// Capability/version descriptor of one structured-clone bridge.
+///
+/// Carries the bridge name and the encoding version it speaks; the
+/// bindings compare `version` against
+/// [`CLONE_ENCODING_VERSION`](boa_fapi_core::clone::CLONE_ENCODING_VERSION)
+/// before touching any global or payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneBridgeDescriptor {
+    /// Human-readable bridge name (e.g. `"fake-idb-bridge"` in tests).
+    pub name: String,
+    /// The clone encoding version the bridge speaks.
+    pub version: u32,
+}
+
+/// Host bridge connecting clone payloads to an external structured-clone
+/// / IndexedDB runtime.
+///
+/// `boa_fapi` never depends on `boa-idb`: this trait is the only coupling,
+/// implemented by the host (or by the fake bridge in tests). DTOs carry
+/// materialized bytes and public metadata only — never `Context`,
+/// `JsObject`, paths, capabilities, OS handles or snapshot identities —
+/// so ownership stays GC-safe under the accepted M2–M4 patterns.
+pub trait CloneAdapter: Send + Sync + 'static {
+    /// Returns the capability/version descriptor of this bridge.
+    fn descriptor(&self) -> CloneBridgeDescriptor;
+
+    /// Encodes one live payload into bytes for external storage.
+    fn encode(&self, payload: &FileApiClonePayload) -> Result<Vec<u8>, CloneError>;
+
+    /// Decodes bytes previously produced by [`CloneAdapter::encode`].
+    fn decode(&self, bytes: &[u8]) -> Result<FileApiClonePayload, CloneError>;
+}
+
+/// Immutable extension configuration.
 #[derive(Clone)]
 pub(crate) struct ExtensionConfig {
     /// Clock for `File.lastModified` defaults.
@@ -36,9 +114,25 @@ pub(crate) struct ExtensionConfig {
     /// Whether the M4-A DOM shim (`EventTarget`, `Event`, `ProgressEvent`,
     /// `DOMException`, `FileReader`) is registered.
     pub(crate) dom_shim: bool,
+    /// Whether the M6 URL shim (`URL.createObjectURL/revokeObjectURL`) is
+    /// registered.
+    pub(crate) url_shim: bool,
+    /// Whether the M6 structured-clone bridge is enabled.
+    pub(crate) structured_clone: bool,
     /// The host-controlled environment descriptor. Only worker descriptors
-    /// install `FileReaderSync`.
+    /// install `FileReaderSync`; the service-worker kind forbids Blob URL
+    /// creation.
     pub(crate) environment: FileApiEnvironment,
+    /// Serialized origin embedded in `blob:` URLs of this context.
+    pub(crate) origin: String,
+    /// Opaque storage-partition identity for same-partition checks.
+    pub(crate) partition: u64,
+    /// Per-global nonce so opaque origins never share a key.
+    pub(crate) nonce: u64,
+    /// CSPRNG entropy for Blob URL UUIDs.
+    pub(crate) entropy: Arc<dyn UrlEntropySource>,
+    /// Optional host structured-clone bridge.
+    pub(crate) clone_adapter: Option<Arc<dyn CloneAdapter>>,
 }
 
 /// The host-controlled environment descriptor selecting which globals the
@@ -72,6 +166,17 @@ impl FileApiEnvironment {
     pub(crate) fn file_reader_sync_enabled(&self) -> bool {
         matches!(self, Self::DedicatedWorker | Self::SharedWorker)
     }
+
+    /// Maps this kind onto the core [`EnvironmentKind`](boa_fapi_core::blob_url::EnvironmentKind).
+    pub(crate) fn core_kind(&self) -> boa_fapi_core::blob_url::EnvironmentKind {
+        use boa_fapi_core::blob_url::EnvironmentKind as Core;
+        match self {
+            Self::Window => Core::Window,
+            Self::DedicatedWorker => Core::DedicatedWorker,
+            Self::SharedWorker => Core::SharedWorker,
+            Self::ServiceWorker => Core::ServiceWorker,
+        }
+    }
 }
 
 /// The registered classes and configuration of a context.
@@ -96,9 +201,20 @@ pub(crate) struct RegisteredSpecs {
     /// environment descriptors with the DOM shim on).
     #[cfg(feature = "dom-shim")]
     pub(crate) sync_reader: Option<crate::filereader_sync::FileReaderSyncSpecs>,
-    /// Shared shutdown flag (M5 `fs` lifecycle). Cloned into the handle;
-    /// every filesystem-backed read observes the same closed state.
-    #[cfg(feature = "fs")]
+    /// URL namespace object (present when the URL shim is on; the
+    /// service-worker environment still installs the namespace for a
+    /// uniform error surface while forbidding creation). Retained for
+    /// atomic install/rollback ownership: the live store is `url_store`.
+    #[cfg(feature = "url-shim")]
+    #[allow(dead_code)]
+    pub(crate) url: Option<crate::url_shim::UrlSpecs>,
+    /// Context-local Blob URL store (M6). Always present: the store exists
+    /// even when the JS surface is off, so host `resolve_blob_url` keeps
+    /// working and shutdown can clear it.
+    pub(crate) url_store: SharedUrlStore,
+    /// Shared shutdown flag. Cloned into the handle; filesystem-backed
+    /// reads, URL creation and pending clone work observe the same closed
+    /// state (no longer `fs`-gated: shutdown exists in every configuration).
     pub(crate) shutdown: crate::lifecycle::ShutdownFlag,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
@@ -191,6 +307,25 @@ impl RegisteredSpecs {
         self.dom.clone()
     }
 
+    /// Returns the context-local Blob URL store.
+    pub(crate) fn url_store(&self) -> SharedUrlStore {
+        Arc::clone(&self.url_store)
+    }
+
+    /// Builds the core environment descriptor of this context.
+    ///
+    /// Fails only when the configured origin is not a valid serialized
+    /// origin; registration preflights this before touching `globalThis`,
+    /// so this helper is infallible in every registered context.
+    pub(crate) fn environment_descriptor(&self) -> Result<EnvironmentDescriptor, BlobUrlError> {
+        EnvironmentDescriptor::new(
+            self.config.environment.core_kind(),
+            self.config.origin.clone(),
+            self.config.partition,
+            self.config.nonce,
+        )
+    }
+
     /// Returns the environment descriptor this context was registered with.
     pub(crate) fn environment(&self) -> FileApiEnvironment {
         self.config.environment
@@ -215,7 +350,14 @@ pub struct FileApiExtensionBuilder {
     limits: Option<FileApiLimits>,
     streams_shim: Option<bool>,
     dom_shim: Option<bool>,
+    url_shim: Option<bool>,
+    structured_clone: Option<bool>,
     environment: Option<FileApiEnvironment>,
+    origin: Option<String>,
+    partition: Option<u64>,
+    nonce: Option<u64>,
+    entropy: Option<Arc<dyn UrlEntropySource>>,
+    clone_adapter: Option<Arc<dyn CloneAdapter>>,
 }
 
 impl FileApiExtensionBuilder {
@@ -255,6 +397,28 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Enables or disables the M6 URL shim registration.
+    ///
+    /// Defaults to `true`. When `false` (or the `url-shim` Cargo feature
+    /// is off), no `URL` global is installed and `URL.createObjectURL` is
+    /// unavailable from JS; host-side `create_blob_url`/`resolve_blob_url`
+    /// keep working against the context-local store.
+    pub fn url_shim(&mut self, enabled: bool) -> &mut Self {
+        self.url_shim = Some(enabled);
+        self
+    }
+
+    /// Enables or disables the M6 structured-clone bridge.
+    ///
+    /// Defaults to `true`. When `false` (or the `structured-clone` Cargo
+    /// feature is off), clone globals/encode entry points stay absent and
+    /// M1–M5 behavior is unchanged; the host encode/decode helpers keep
+    /// working as pure Rust functions.
+    pub fn structured_clone(&mut self, enabled: bool) -> &mut Self {
+        self.structured_clone = Some(enabled);
+        self
+    }
+
     /// Selects the host-controlled environment descriptor.
     ///
     /// Defaults to [`FileApiEnvironment::Window`]. Only
@@ -268,6 +432,59 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Sets the serialized origin embedded in `blob:` URLs.
+    ///
+    /// Defaults to `"https://localhost"`. The value is validated as a
+    /// serialized origin (non-empty, bounded, printable ASCII, no
+    /// whitespace); invalid values fail `register` before any `globalThis`
+    /// mutation. For opaque origins pass the fixed `"null"` origin here
+    /// with a fresh `nonce` per global (see [`Self::nonce`]), so opaque
+    /// globals never share a key.
+    pub fn origin(&mut self, origin: impl Into<String>) -> &mut Self {
+        self.origin = Some(origin.into());
+        self
+    }
+
+    /// Sets the opaque storage-partition identity.
+    ///
+    /// Defaults to `0`. Same-partition checks require origin *and*
+    /// partition *and* nonce to match; the value never appears in a URL.
+    pub fn partition(&mut self, partition: u64) -> &mut Self {
+        self.partition = Some(partition);
+        self
+    }
+
+    /// Sets the per-global nonce (opaque-origin uniqueness).
+    ///
+    /// Defaults to `0`. Hosts creating several globals with the same
+    /// origin/partition must pass a fresh nonce per global; URL
+    /// unguessability itself comes from the UUID.
+    pub fn nonce(&mut self, nonce: u64) -> &mut Self {
+        self.nonce = Some(nonce);
+        self
+    }
+
+    /// Injects the CSPRNG entropy source for Blob URL UUIDs.
+    ///
+    /// Defaults to [`OsEntropy`]. Tests inject a deterministic sequence;
+    /// counters, timestamps and predictable PRNGs are forbidden by
+    /// contract.
+    pub fn entropy(&mut self, entropy: Arc<dyn UrlEntropySource>) -> &mut Self {
+        self.entropy = Some(entropy);
+        self
+    }
+
+    /// Registers the host structured-clone bridge for this context.
+    ///
+    /// The bridge is capability/version-checked before any `globalThis`
+    /// mutation: a missing bridge (when the feature is on) leaves clone
+    /// entry points absent without failing; an explicitly registered
+    /// bridge with an incompatible version fails registration atomically.
+    pub fn clone_adapter(&mut self, adapter: Arc<dyn CloneAdapter>) -> &mut Self {
+        self.clone_adapter = Some(adapter);
+        self
+    }
+
     /// Creates the extension.
     #[must_use]
     pub fn build(&self) -> FileApiExtension {
@@ -277,7 +494,17 @@ impl FileApiExtensionBuilder {
                 limits: self.limits.clone().unwrap_or_default(),
                 streams_shim: self.streams_shim.unwrap_or(true),
                 dom_shim: self.dom_shim.unwrap_or(true),
+                url_shim: self.url_shim.unwrap_or(true),
+                structured_clone: self.structured_clone.unwrap_or(true),
                 environment: self.environment.unwrap_or_default(),
+                origin: self
+                    .origin
+                    .clone()
+                    .unwrap_or_else(|| String::from("https://localhost")),
+                partition: self.partition.unwrap_or(0),
+                nonce: self.nonce.unwrap_or(0),
+                entropy: self.entropy.clone().unwrap_or_else(|| Arc::new(OsEntropy)),
+                clone_adapter: self.clone_adapter.clone(),
             },
         }
     }
@@ -325,6 +552,27 @@ impl FileApiExtension {
             return Err(RegisterError::DomShimDisabled);
         }
 
+        // URL shim availability is informational, not fatal: with the flag
+        // or the feature off the `URL` global simply stays absent while
+        // host-side store operations keep working. What *is* fatal is a
+        // conflicting pre-existing `URL` name when the shim would install.
+        // The binding keeps the flag live in every feature configuration
+        // (no `cfg`-gated unused-variable warning).
+        let url_shim_available = self.config.url_shim && cfg!(feature = "url-shim");
+        let _ = url_shim_available || !self.config.url_shim;
+
+        // Structured-clone availability is informational as well: with the
+        // flag or the feature off no clone globals exist and M1–M5
+        // behavior is unchanged. An explicitly registered bridge with a
+        // foreign version fails before any `globalThis` mutation.
+        let clone_available = self.config.structured_clone && cfg!(feature = "structured-clone");
+        if clone_available && let Some(adapter) = self.config.clone_adapter.as_ref() {
+            let descriptor = adapter.descriptor();
+            if descriptor.version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
+                return Err(RegisterError::CloneBridgeIncompatible(descriptor.name));
+            }
+        }
+
         // Host limits are validated before any globalThis mutation: an
         // invalid configuration fails with a typed error and installs
         // nothing. This is the full `FileApiLimits::validate()` contract,
@@ -361,6 +609,24 @@ impl FileApiExtension {
         } else {
             None
         };
+        // The `URL` namespace object is built whenever the shim is
+        // available: installation decides the global name below. The
+        // environment descriptor is validated here as well, so a bad
+        // origin fails before any `globalThis` mutation.
+        #[cfg(feature = "url-shim")]
+        let url_specs = if url_shim_available {
+            Some(crate::url_shim::build_url_specs(context)?)
+        } else {
+            None
+        };
+        let environment_descriptor = EnvironmentDescriptor::new(
+            self.config.environment.core_kind(),
+            self.config.origin.clone(),
+            self.config.partition,
+            self.config.nonce,
+        )
+        .map_err(|_| RegisterError::Js(crate::error::type_error("invalid serialized origin")))?;
+        let _ = &environment_descriptor;
         // Preflight: extensibility and every own global name.
         let global = context.global_object();
         if !global.is_extensible(context).map_err(RegisterError::Js)? {
@@ -404,6 +670,15 @@ impl FileApiExtension {
                 return Err(RegisterError::NameConflict("FileReaderSync".to_owned()));
             }
         }
+        // The `URL` name is preflighted only when the shim would install
+        // it; otherwise a host `URL` stays untouched.
+        #[cfg(feature = "url-shim")]
+        if url_shim_available {
+            let key = PropertyKey::from(js_string!("URL"));
+            if keys.contains(&key) {
+                return Err(RegisterError::NameConflict("URL".to_owned()));
+            }
+        }
 
         // Install phase with rollback.
         if let Err(error) = install_globals(
@@ -418,15 +693,29 @@ impl FileApiExtension {
             &filereader_specs,
             #[cfg(feature = "dom-shim")]
             sync_specs.as_ref(),
+            #[cfg(feature = "url-shim")]
+            url_specs.as_ref(),
         ) {
             rollback_globals(
                 context,
                 #[cfg(feature = "dom-shim")]
                 sync_specs.is_some(),
+                #[cfg(feature = "url-shim")]
+                url_specs.is_some(),
             )?;
             return Err(RegisterError::Js(error));
         }
 
+        // The context-local store plus shutdown wiring: a tracked closer
+        // clears the store at shutdown, releasing every strong payload
+        // reference. The flag is created per registration, so two contexts
+        // never share a store or a shutdown state.
+        let url_store: SharedUrlStore = Arc::new(BlobUrlStore::new());
+        let shutdown = crate::lifecycle::ShutdownFlag::new();
+        {
+            let store = Arc::clone(&url_store);
+            shutdown.track(move || store.clear());
+        }
         let specs = RegisteredSpecs {
             blob: blob_spec,
             file: file_spec,
@@ -439,17 +728,78 @@ impl FileApiExtension {
             filereader: Some(filereader_specs),
             #[cfg(feature = "dom-shim")]
             sync_reader: sync_specs,
-            #[cfg(feature = "fs")]
-            shutdown: crate::lifecycle::ShutdownFlag::new(),
+            #[cfg(feature = "url-shim")]
+            url: url_specs,
+            url_store: Arc::clone(&url_store),
+            shutdown: shutdown.clone(),
             config: self.config.clone(),
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
 
         Ok(FileApiHandle {
             specs: specs.clone(),
-            #[cfg(feature = "fs")]
             shutdown: specs.shutdown.clone(),
         })
+    }
+}
+
+/// Creates and stores a Blob URL for the registered specs.
+///
+/// Single shared helper behind both `URL.createObjectURL` and the host
+/// [`FileApiHandle::create_blob_url`]: brand checks happen at the call
+/// boundary, everything below is identical (environment gate, shutdown,
+/// quota, CSPRNG UUID, collision retry, atomic insert). Service-worker
+/// contexts fail with [`BlobUrlError::Forbidden`] before touching the
+/// store or the entropy source.
+///
+/// Without the `url-shim` feature the store insert runs inline (the shim
+/// module owns only the JS namespace); with the feature it delegates to
+/// the shim's retry helper so both paths share one implementation.
+pub(crate) fn create_url_for_specs(
+    specs: &RegisteredSpecs,
+    data: &Arc<BlobData>,
+) -> Result<String, BlobUrlError> {
+    if specs.shutdown.is_shutdown() {
+        return Err(BlobUrlError::Shutdown);
+    }
+    let descriptor = specs
+        .environment_descriptor()
+        .map_err(|_| BlobUrlError::Malformed)?;
+    if descriptor.creation_forbidden() {
+        return Err(BlobUrlError::Forbidden);
+    }
+    let owner: EnvironmentKey = descriptor.key();
+    let cap = specs.config.limits.max_blob_urls_per_global;
+    if cap == 0 {
+        return Err(BlobUrlError::LimitExceeded);
+    }
+    #[cfg(feature = "url-shim")]
+    {
+        crate::url_shim::insert_url(
+            &specs.url_store,
+            descriptor.serialized_origin(),
+            &owner,
+            data,
+            specs.config.entropy.as_ref(),
+            cap,
+        )
+    }
+    #[cfg(not(feature = "url-shim"))]
+    {
+        use boa_fapi_core::blob_url::{format_blob_url, format_uuid_v4};
+        for _ in 0..8 {
+            let uuid = format_uuid_v4(specs.config.entropy.fill_16());
+            let url = format_blob_url(descriptor.serialized_origin(), &uuid);
+            match specs
+                .url_store
+                .insert_capped(url.clone(), owner.clone(), Arc::clone(data), cap)
+            {
+                Ok(()) => return Ok(url),
+                Err(BlobUrlError::Collision) => continue,
+                Err(other) => return Err(other),
+            }
+        }
+        Err(BlobUrlError::Collision)
     }
 }
 
@@ -505,7 +855,12 @@ struct OrdinaryPrototype;
 /// The streams shim installs `ReadableStream` and
 /// `ReadableStreamDefaultReader` the same way; the DOM shim installs
 /// `EventTarget`, `Event`, `ProgressEvent`, `DOMException` and `FileReader`;
-/// worker environments additionally install `FileReaderSync`.
+/// worker environments additionally install `FileReaderSync`; the URL shim
+/// installs the `URL` namespace object the same way.
+///
+/// Eight parameters (one per surface) are the atomic-install contract, not
+/// accidental complexity: every global installs or none does.
+#[allow(clippy::too_many_arguments)]
 fn install_globals(
     context: &mut Context,
     blob_spec: &StandardConstructor,
@@ -514,6 +869,7 @@ fn install_globals(
     #[cfg(feature = "dom-shim")] dom_specs: &crate::dom::DomSpecs,
     #[cfg(feature = "dom-shim")] filereader_specs: &crate::filereader::FileReaderSpecs,
     #[cfg(feature = "dom-shim")] sync_specs: Option<&crate::filereader_sync::FileReaderSyncSpecs>,
+    #[cfg(feature = "url-shim")] url_specs: Option<&crate::url_shim::UrlSpecs>,
 ) -> JsResult<()> {
     let global = context.global_object();
     for (name, constructor) in [
@@ -578,6 +934,18 @@ fn install_globals(
             context,
         )?;
     }
+    #[cfg(feature = "url-shim")]
+    if let Some(url) = url_specs {
+        global.define_property_or_throw(
+            js_string!("URL"),
+            PropertyDescriptor::builder()
+                .value(url.url.clone())
+                .writable(true)
+                .enumerable(false)
+                .configurable(true),
+            context,
+        )?;
+    }
     Ok(())
 }
 
@@ -585,10 +953,12 @@ fn install_globals(
 ///
 /// `remove_sync` mirrors the worker capability: when the failed
 /// registration would have installed `FileReaderSync`, its name is rolled
-/// back as well; otherwise the name is left untouched.
+/// back as well; otherwise the name is left untouched. `remove_url`
+/// mirrors the URL shim the same way.
 fn rollback_globals(
     context: &mut Context,
     #[cfg(feature = "dom-shim")] remove_sync: bool,
+    #[cfg(feature = "url-shim")] remove_url: bool,
 ) -> Result<(), RegisterError> {
     let global = context.global_object();
     for name in [
@@ -622,6 +992,12 @@ fn rollback_globals(
             .delete_property_or_throw(js_string!("FileReaderSync"), context)
             .map_err(RegisterError::Js)?;
     }
+    #[cfg(feature = "url-shim")]
+    if remove_url {
+        global
+            .delete_property_or_throw(js_string!("URL"), context)
+            .map_err(RegisterError::Js)?;
+    }
     Ok(())
 }
 
@@ -631,15 +1007,17 @@ fn rollback_globals(
 /// allowing the host to create Blob/File/FileList objects without JS.
 /// After [`FileApiHandle::shutdown`] the handle rejects every new host
 /// operation; already-created JS objects keep their payload but their
-/// filesystem reads fail on the next chunk boundary.
+/// filesystem reads fail on the next chunk boundary. M6 adds the Blob URL
+/// store and the structured-clone entry points to the same handle; the
+/// target `FileApiExtension::shutdown` shape of the TZ is covered by this
+/// handle method (compatibility recorded in the crate ADR): `register`
+/// returns the handle, and the handle owns `shutdown`.
 #[derive(Clone)]
 pub struct FileApiHandle {
     specs: RegisteredSpecs,
-    #[cfg(feature = "fs")]
     shutdown: crate::lifecycle::ShutdownFlag,
 }
 
-#[cfg(feature = "fs")]
 impl FileApiHandle {
     /// Returns `true` after [`FileApiHandle::shutdown`].
     fn is_shutdown(&self) -> bool {
@@ -655,6 +1033,21 @@ impl FileApiHandle {
         }
         Ok(())
     }
+
+    /// Returns the context-local Blob URL store.
+    pub fn url_store(&self) -> SharedUrlStore {
+        Arc::clone(&self.specs.url_store)
+    }
+
+    /// Returns the environment key of this context for `resolve_blob_url`.
+    ///
+    /// The key covers origin, storage partition and the per-global nonce;
+    /// it is never serialized into a URL and never exposed to JavaScript.
+    /// Fails only when the registered origin is not a valid serialized
+    /// origin (impossible after successful registration).
+    pub fn environment_key(&self) -> Result<EnvironmentKey, BlobUrlError> {
+        self.specs.environment_descriptor().map(|d| d.key())
+    }
 }
 
 impl FileApiHandle {
@@ -669,7 +1062,6 @@ impl FileApiHandle {
         media_type: &str,
         _context: &mut Context,
     ) -> JsResult<JsObject> {
-        #[cfg(feature = "fs")]
         self.reject_if_shutdown()?;
         let data = blob::data_from_bytes(bytes.into(), media_type, self.specs.limits())
             .map_err(js_from_core)?;
@@ -692,7 +1084,6 @@ impl FileApiHandle {
         options: HostFileOptions,
         _context: &mut Context,
     ) -> JsResult<JsObject> {
-        #[cfg(feature = "fs")]
         self.reject_if_shutdown()?;
         let native = file::native_from_bytes(
             bytes.into(),
@@ -819,7 +1210,6 @@ impl FileApiHandle {
         files: impl IntoIterator<Item = JsObject>,
         context: &mut Context,
     ) -> JsResult<JsObject> {
-        #[cfg(feature = "fs")]
         self.reject_if_shutdown()?;
         let mut validated = Vec::new();
         for file in files {
@@ -836,13 +1226,291 @@ impl FileApiHandle {
     /// (they are rejected once closed). Pending filesystem reads observe
     /// the shared cancellation; every tracked registry runs `close_all`,
     /// so OS handles are dropped immediately (not deferred to registry
-    /// destruction); new reads, materializations, stream pulls, and
-    /// FileReader jobs after shutdown settle nothing against a destroyed
-    /// context. No locations or identities leak into queues, errors, or JS
-    /// objects.
-    #[cfg(feature = "fs")]
+    /// destruction); the context-local Blob URL store is cleared, releasing
+    /// every strong payload reference; new reads, materializations, stream
+    /// pulls, FileReader jobs, URL creations and clone writes after
+    /// shutdown settle nothing against a destroyed context. No locations
+    /// or identities leak into queues, errors, or JS objects.
     pub fn shutdown(&self, context: &mut Context) -> Result<(), RegisterError> {
         crate::lifecycle::shutdown_runtime(&self.shutdown, context)
+    }
+
+    /// Creates and stores a Blob URL for a brand-validated `Blob`/`File`.
+    ///
+    /// Accepts only objects carrying the Blob brand (`File` passes through
+    /// the same gate; `FileList`, forged and foreign objects fail with a
+    /// synchronous `TypeError` before touching the store, the quota or the
+    /// entropy source). Serialization, quota, UUID and collision semantics
+    /// are identical to `URL.createObjectURL` (shared helper): the URL is
+    /// `blob:<serialized-origin>/<uuid-v4>`, the insert is atomic against
+    /// `max_blob_urls_per_global`, collisions retry with fresh entropy and
+    /// never overwrite. After `shutdown` the call fails before touching
+    /// any state.
+    pub fn create_blob_url(&self, object: &JsObject) -> JsResult<String> {
+        self.reject_if_shutdown()?;
+        let data = brand::require_blob(&boa_engine::JsValue::from(object.clone()))
+            .map_err(|_| crate::error::type_error("URL.createObjectURL requires a Blob"))?;
+        create_url_for_specs(&self.specs, &data).map_err(|error| match error {
+            BlobUrlError::Forbidden => {
+                crate::error::type_error("URL creation is not allowed in this context")
+            }
+            BlobUrlError::LimitExceeded => crate::error::type_error("blob URL quota exceeded"),
+            BlobUrlError::Shutdown => crate::error::type_error("the File API runtime is shut down"),
+            _ => crate::error::type_error("blob URL is not available"),
+        })
+    }
+
+    /// Resolves a Blob URL for this context's environment.
+    ///
+    /// The host-side Fetch boundary: same-partition checks run before the
+    /// shared payload is handed out. Malformed, unknown, revoked and
+    /// foreign-partition URLs share one failure class
+    /// ([`BlobUrlError::Malformed`]/[`BlobUrlError::Unavailable`] with the
+    /// identical display string); the error carries no token, UUID, origin
+    /// internals, existence bit or host metadata. `boa-fapi` registers no
+    /// network handler: the host drives Fetch from this result.
+    pub fn resolve_blob_url(
+        &self,
+        url: &str,
+    ) -> Result<boa_fapi_core::blob_url::ResolvedBlob, BlobUrlError> {
+        let key = self.environment_key()?;
+        self.specs.url_store.resolve(url, &key)
+    }
+
+    /// Revokes a Blob URL idempotently.
+    ///
+    /// Malformed URLs and URLs owned by another partition are silent
+    /// no-ops, so revoke can never serve as an enumeration oracle. Revoke
+    /// stops new resolutions; reads that already hold the `Arc<BlobData>`
+    /// run to completion.
+    pub fn revoke_blob_url(&self, url: &str) {
+        self.specs.url_store.revoke(url);
+    }
+
+    /// Encodes a live `Blob` object into its clone payload.
+    ///
+    /// Materializes through the existing checked path
+    /// (`max_materialize_bytes`); snapshot/permission/short-read failures
+    /// yield a typed [`CloneError`] with no partial payload. The payload
+    /// carries bytes and public metadata only — never a path, capability,
+    /// OS handle or snapshot identity. After `shutdown` the call fails
+    /// before touching any state.
+    pub fn clone_blob(&self, object: &JsObject) -> Result<FileApiClonePayload, CloneError> {
+        if self.is_shutdown() {
+            return Err(CloneError::Shutdown);
+        }
+        let data = brand::require_blob(&boa_engine::JsValue::from(object.clone()))
+            .map_err(|_| CloneError::InvalidObject)?;
+        let bytes = data
+            .materialize(
+                self.specs.limits(),
+                &boa_fapi_core::cancellation::CancellationToken::new(),
+            )
+            .map_err(clone_error_from_core)?;
+        boa_fapi_core::clone::serialized_blob(bytes, data.media_type())
+            .map(FileApiClonePayload::Blob)
+    }
+
+    /// Encodes a live `File` object into its clone payload.
+    ///
+    /// Same materialization and failure semantics as [`Self::clone_blob`];
+    /// `name` is the already-sanitized display name and `lastModified` the
+    /// stored timestamp — no clock is read here.
+    pub fn clone_file(&self, object: &JsObject) -> Result<FileApiClonePayload, CloneError> {
+        if self.is_shutdown() {
+            return Err(CloneError::Shutdown);
+        }
+        let (data, name, last_modified) =
+            brand::require_file(&boa_engine::JsValue::from(object.clone()))
+                .map_err(|_| CloneError::InvalidObject)?;
+        let bytes = data
+            .materialize(
+                self.specs.limits(),
+                &boa_fapi_core::cancellation::CancellationToken::new(),
+            )
+            .map_err(clone_error_from_core)?;
+        boa_fapi_core::clone::serialized_file(bytes, data.media_type(), &name, last_modified)
+            .map(FileApiClonePayload::File)
+    }
+
+    /// Encodes a live `FileList` object into its clone payload.
+    ///
+    /// Every element is brand-validated before any output exists; a
+    /// non-`File` element fails with no partial list. Order, count and all
+    /// `File` metadata survive the round-trip; identity holds only within
+    /// the decoded result.
+    pub fn clone_file_list(
+        &self,
+        object: &JsObject,
+        context: &mut Context,
+    ) -> Result<FileApiClonePayload, CloneError> {
+        use boa_engine::property::PropertyKey;
+        if self.is_shutdown() {
+            return Err(CloneError::Shutdown);
+        }
+        let value = boa_engine::JsValue::from(object.clone());
+        let len = brand::require_file_list(&value).map_err(|_| CloneError::InvalidObject)?;
+        let mut files = Vec::new();
+        for index in 0..len {
+            let index_u32 = u32::try_from(index).map_err(|_| CloneError::LimitExceeded)?;
+            let element = object
+                .get(PropertyKey::from(index_u32), context)
+                .map_err(|_| CloneError::InvalidObject)?;
+            let Some(element) = element.as_object() else {
+                return Err(CloneError::InvalidObject);
+            };
+            let (data, name, last_modified) =
+                brand::require_file(&boa_engine::JsValue::from(element.clone()))
+                    .map_err(|_| CloneError::InvalidObject)?;
+            let bytes = data
+                .materialize(
+                    self.specs.limits(),
+                    &boa_fapi_core::cancellation::CancellationToken::new(),
+                )
+                .map_err(clone_error_from_core)?;
+            files.push(boa_fapi_core::clone::serialized_file(
+                bytes,
+                data.media_type(),
+                &name,
+                last_modified,
+            )?);
+            if files.len() > boa_fapi_core::clone::MAX_ENCODE_FILES {
+                return Err(CloneError::LimitExceeded);
+            }
+        }
+        Ok(FileApiClonePayload::FileList(files))
+    }
+
+    /// Decodes a clone payload into a live `Blob` object.
+    ///
+    /// Only `Blob` payloads are accepted here; `File`/`FileList` payloads
+    /// fail with [`CloneError::UnexpectedKind`] before touching JS state.
+    /// The result gets a new immutable backing and never shares mutable JS
+    /// buffers with the source. After `shutdown` the call fails before
+    /// touching JS state.
+    pub fn blob_from_clone(
+        &self,
+        payload: &FileApiClonePayload,
+        context: &mut Context,
+    ) -> Result<JsObject, CloneError> {
+        self.reject_clone_if_shutdown()?;
+        let FileApiClonePayload::Blob(blob) = payload else {
+            return Err(CloneError::UnexpectedKind);
+        };
+        let data = blob::data_from_bytes(blob.bytes.clone(), &blob.media_type, self.specs.limits())
+            .map_err(clone_error_from_core)?;
+        let _ = context;
+        Ok(blob::create_instance(
+            BlobNative::new(data),
+            self.specs.blob_proto().clone(),
+        ))
+    }
+
+    /// Decodes a clone payload into a live `File` object.
+    ///
+    /// Only `File` payloads are accepted; the stored `name`/`lastModified`
+    /// are reused verbatim (no clock read, no re-sanitization beyond the
+    /// constructor-equivalent slash replacement, which is idempotent).
+    pub fn file_from_clone(
+        &self,
+        payload: &FileApiClonePayload,
+        context: &mut Context,
+    ) -> Result<JsObject, CloneError> {
+        self.reject_clone_if_shutdown()?;
+        let FileApiClonePayload::File(file) = payload else {
+            return Err(CloneError::UnexpectedKind);
+        };
+        let data = blob::data_from_bytes(file.bytes.clone(), &file.media_type, self.specs.limits())
+            .map_err(clone_error_from_core)?;
+        let _ = context;
+        Ok(JsObject::from_proto_and_data(
+            self.specs.file_proto().clone(),
+            file::FileNative::new(
+                data,
+                file::normalize_file_name(&file.name),
+                file.last_modified,
+            ),
+        ))
+    }
+
+    /// Decodes a clone payload into a live `FileList` object.
+    ///
+    /// Only `FileList` payloads are accepted; every decoded `File` is
+    /// created through the same checked path as [`Self::file_from_clone`]
+    /// before the list object exists, so a failure leaves no partial list.
+    pub fn file_list_from_clone(
+        &self,
+        payload: &FileApiClonePayload,
+        context: &mut Context,
+    ) -> Result<JsObject, CloneError> {
+        self.reject_clone_if_shutdown()?;
+        let FileApiClonePayload::FileList(files) = payload else {
+            return Err(CloneError::UnexpectedKind);
+        };
+        let mut objects = Vec::new();
+        for file in files {
+            let data =
+                blob::data_from_bytes(file.bytes.clone(), &file.media_type, self.specs.limits())
+                    .map_err(clone_error_from_core)?;
+            objects.push(JsObject::from_proto_and_data(
+                self.specs.file_proto().clone(),
+                file::FileNative::new(
+                    data,
+                    file::normalize_file_name(&file.name),
+                    file.last_modified,
+                ),
+            ));
+        }
+        file_list::create(objects, &self.specs.file_list_proto, context)
+            .map_err(|_| CloneError::Internal)
+    }
+
+    /// Encodes a payload through the registered host bridge.
+    ///
+    /// Fails with [`CloneError::NoBridge`] when no bridge is registered
+    /// (or the feature is off) and with [`CloneError::UnsupportedVersion`]
+    /// when the bridge speaks a foreign version — both before touching any
+    /// global or payload. After `shutdown` the call fails as well.
+    pub fn clone_encode_via_bridge(
+        &self,
+        payload: &FileApiClonePayload,
+    ) -> Result<Vec<u8>, CloneError> {
+        if self.is_shutdown() {
+            return Err(CloneError::Shutdown);
+        }
+        let Some(adapter) = self.specs.config.clone_adapter.as_ref() else {
+            return Err(CloneError::NoBridge);
+        };
+        if adapter.descriptor().version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
+            return Err(CloneError::UnsupportedVersion);
+        }
+        adapter.encode(payload)
+    }
+
+    /// Decodes bridge bytes into a payload.
+    ///
+    /// Same bridge/version/shutdown preflights as
+    /// [`Self::clone_encode_via_bridge`]; decoding itself enforces the
+    /// version and the checked bounds.
+    pub fn clone_decode_via_bridge(&self, bytes: &[u8]) -> Result<FileApiClonePayload, CloneError> {
+        if self.is_shutdown() {
+            return Err(CloneError::Shutdown);
+        }
+        let Some(adapter) = self.specs.config.clone_adapter.as_ref() else {
+            return Err(CloneError::NoBridge);
+        };
+        if adapter.descriptor().version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
+            return Err(CloneError::UnsupportedVersion);
+        }
+        adapter.decode(bytes)
+    }
+
+    /// Fails with [`CloneError::Shutdown`] when the runtime is shut down.
+    fn reject_clone_if_shutdown(&self) -> Result<(), CloneError> {
+        if self.is_shutdown() {
+            return Err(CloneError::Shutdown);
+        }
+        Ok(())
     }
 
     /// Returns the environment descriptor this handle was registered with.
@@ -851,6 +1519,30 @@ impl FileApiHandle {
     /// `Window` and `ServiceWorker` did not.
     pub fn environment(&self) -> FileApiEnvironment {
         self.specs.environment()
+    }
+}
+
+/// Maps a core materialization failure onto the clone error.
+///
+/// No separate error mapping is introduced: resource limits become
+/// [`CloneError::LimitExceeded`], cancellation into
+/// [`CloneError::Shutdown`]-adjacent `Cancelled`, everything else into
+/// [`CloneError::SourceFailed`]. Messages stay generic (no path, bytes,
+/// or source detail).
+fn clone_error_from_core(error: boa_fapi_core::file_api_error::FileApiError) -> CloneError {
+    use boa_fapi_core::file_api_error::FileApiError;
+    match error {
+        FileApiError::ResourceLimit(_) => CloneError::LimitExceeded,
+        FileApiError::Cancelled => CloneError::Shutdown,
+        FileApiError::NotFound
+        | FileApiError::UnsafeFile
+        | FileApiError::TooManyReads
+        | FileApiError::SnapshotChanged
+        | FileApiError::FileLocked
+        | FileApiError::PermissionDenied
+        | FileApiError::InvalidRange
+        | FileApiError::Internal => CloneError::SourceFailed,
+        _ => CloneError::SourceFailed,
     }
 }
 

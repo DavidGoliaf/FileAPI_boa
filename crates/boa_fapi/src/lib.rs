@@ -37,8 +37,17 @@
 //! explicit display name; every range operation revalidates the opaque
 //! snapshot. [`FileApiHandle::shutdown`] cancels pending filesystem work,
 //! rejects new operations, and lets late jobs settle nothing after context
-//! destruction. Blob URLs, clone, full DOM/Workers runtime, and the WPT
-//! harness are not included.
+//! destruction.
+//!
+//! M6 adds the isolated Blob URL store with `URL.createObjectURL()` /
+//! `URL.revokeObjectURL()` (feature `url-shim`, default on) and the
+//! versioned structured-clone bridge for `Blob`/`File`/`FileList`
+//! (feature `structured-clone`, default on, no `boa-idb` dependency):
+//! URLs serialize as `blob:<serialized-origin>/<uuid-v4>` and resolve
+//! only within the same origin *and* storage partition; clone payloads
+//! carry materialized immutable bytes plus public metadata, never paths,
+//! capabilities, OS handles or snapshot identities. Full DOM/Workers
+//! runtime and the WPT harness are not included.
 //!
 //! The engine-independent data model and algorithms live in `boa_fapi_core`.
 //!
@@ -76,19 +85,22 @@ pub mod extension;
 
 mod blob;
 mod brand;
+#[cfg(feature = "structured-clone")]
+mod clone_bridge;
 mod file;
 mod file_list;
 #[cfg(feature = "dom-shim")]
 mod filereader;
 #[cfg(feature = "dom-shim")]
 mod filereader_sync;
-#[cfg(feature = "fs")]
 mod lifecycle;
 #[cfg(feature = "dom-shim")]
 mod package;
 mod promise_read;
 #[cfg(feature = "streams-shim")]
 mod streams;
+#[cfg(feature = "url-shim")]
+mod url_shim;
 mod webidl;
 
 mod tests;
@@ -96,5 +108,6 @@ mod tests;
 pub use clock::{Clock, SystemClock};
 pub use error::RegisterError;
 pub use extension::{
-    FileApiEnvironment, FileApiExtension, FileApiExtensionBuilder, FileApiHandle, HostFileOptions,
+    CloneAdapter, CloneBridgeDescriptor, FileApiEnvironment, FileApiExtension,
+    FileApiExtensionBuilder, FileApiHandle, HostFileOptions, OsEntropy, UrlEntropySource,
 };
