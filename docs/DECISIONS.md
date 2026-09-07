@@ -403,3 +403,95 @@ partial result невозможен.
 Последствия: M4-A поведение не изменилось (вся M4-A сюита зелёная без
 правок тестов); sync ошибки идут через тот же центральный
 `DOMException` mapping.
+
+## ADR-0024 (M5): capability representation — opaque registry slot, no path
+
+Контекст: ТЗ §3.3/§4 требует capability-based FS: JS никогда не открывает
+произвольный путь, capability не превращается в `PathBuf`, не
+сериализуется в JS и не имеет getter'а пути; хост открывает read-only
+ресурс до создания JS `File`.
+
+Решение: `boa_fapi_core::policy` (Boa-free) владеет типами
+`HostResourceId(u64)` (opaque слот), `FileOpenRequest { resource,
+display_name, max_bytes }` (без пути), `FileGrant { resource, snapshot }`
+(opaque capability), `trait FileResource` (positional `read_at` +
+`current_snapshot`/`import_snapshot`, без пути), `trait
+FileResourceOpener` (host callback, возвращающий только id),
+`trait FileAccessPolicy` целевой формы ТЗ (`authorize_open`/
+`authorize_read`) и `DenyAllPolicy` (default deny). `boa_fapi_fs`
+владеет `FsRegistry` (map id → открытый `std::fs::File` + import
+snapshot, короткие блокировки, positional reads без общего курсора) и
+`RegisteredResource` (только id + клон registry). `file_from_resource`
+принимает `Arc<dyn FileResource>` вместо целевого `&dyn` (иначе
+`ByteSource: 'static` нельзя построить без lifetime в публичном типе);
+backing `ArcResourceSource` хранит только id/снапшот/shutdown и
+делегирует каждое чтение ресурсу с pre/post snapshot-проверкой.
+
+Последствия: путь не пересекает границу ни в одном публичном типе,
+методе или ошибке (guards `public_api_no_path_types`,
+`public_api_exposes_no_paths_or_mutable_bytes` расширены); закрытие
+идемпотентно; чтения после закрытия — `NotFound`.
+
+## ADR-0025 (M5): snapshot identity и fallback `copy_on_import`
+
+Контекст: ТЗ §4.1 требует opaque identity + size + modification marker,
+детект replacement (не только mtime/size), без `mtime + size` как
+«полноценной защиты»; если платформа не гарантирует identity —
+`copy_on_import` либо отказ, никогда string-prefix пути.
+
+Решение: `FileSnapshot { identity: u64, size, mtime_secs, mtime_nanos }`
+(FNV-1a hash; Unix: `dev`+`ino` через `MetadataExt`, Windows: stable
+`file_attributes`+`creation_time` + size/mtime — NTFS file id недоступен
+в safe Rust 1.91 без `windows_by_handle`, что задокументировано как
+ограничение). `BlobData` вычисляет blob-level snapshot через
+`snapshot_for_segments` (первый `Filesystem` в порядке сегментов;
+информативен — границей является per-source проверка в `read_range`).
+`FileSource::read_range` и `ArcResourceSource::read_range`: cancel →
+shutdown → checked arithmetic → live snapshot == import → policy hook →
+positional read → exact-length check → post-read snapshot confirm.
+Несовпадение — `SnapshotChanged` (JS: `NotReadableError`), без partial
+bytes. `open_copy_on_import` материализует точечный снимок под
+`max_bytes` для недоверенного JS/строгих платформ. `RootConfinedPolicy`
+сверяет только opaque identity открытого handle; `starts_with(root)`
+запрещён guards по построению (пути нет вообще).
+
+Последствия: truncate/replacement/delete/rename детектятся до нового
+chunk; short read — `InvalidRange`; mtime+size одни никогда не
+объявляются достаточными (identity hash обязателен, fallback
+задокументирован).
+
+## ADR-0026 (M5): lifecycle API — `FileApiHandle::shutdown`
+
+Контекст: ТЗ §4.1 требует host-controlled shutdown; текущий `register`
+возвращает `FileApiHandle`, целевая форма — `FileApiExtension::shutdown`.
+
+Решение: выбрана форма `FileApiHandle::shutdown(&self, context) ->
+Result<(), RegisterError>` (mapping зафиксирован здесь): эквивалентные
+гарантии целевой форме без разрыва существующего `register → handle`
+контракта. `ShutdownFlag { closed: Arc<AtomicBool>, cancel:
+CancellationToken }` живёт в `RegisteredSpecs` и клонируется в handle и
+в каждый fs-import. Shutdown идемпотентен, атомарен относительно новых
+host-операций (reject до мутации `globalThis`), отменяет pending fs-work
+через существующий cancellation protocol (без abort unsafe-кодом),
+освобождает handles (close registry), а late Boa jobs (promise reads,
+FileReader pump/dispatch, stream `pump_one`) находят closed state и не
+посылают jobs/callbacks в уничтоженный context. Blob URL store и
+structured-clone lifetime — M6 scope: extension points зарезервированы в
+`lifecycle.rs` без реализации.
+
+Последствия: повторный shutdown не паникует и не ставит callbacks; новые
+reads/materialize/stream/FileReader после shutdown запрещены; M2–M4
+regression зелёная.
+
+## ADR-0027 (M5): новая Cargo feature `fs` без новых dependencies
+
+Контекст: заказ требует feature-поведение (все комбинации собираются,
+`fs` off не оставляет partial global) и ADR на каждую новую dependency.
+
+Решение: новая feature `fs` (default on) в `boa_fapi`
+(`fs = ["dep:boa_fapi_fs"]`); без неё `file_from_resource`, fs-типы и
+shutdown не компилируются, memory API и регистрация работают
+бит-в-бит. Новых dependencies нет: только std (`fs`, `collections`,
+`sync`) + существующие `bytes`/`thiserror`/`boa_fapi_core`; отдельный
+dependency-ADR не нужен. `cargo hack check --feature-powerset --depth 2`
+зелёный.

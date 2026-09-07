@@ -80,6 +80,23 @@ pub(crate) fn native_from_bytes(
     Ok(FileNative::new(data, normalize_file_name(name), timestamp))
 }
 
+/// Builds the native state for a File over an existing [`BlobData`].
+///
+/// Used by the `fs` host import: the payload already carries its
+/// filesystem snapshot, and only the display name/timestamp are attached
+/// here. No basename is computed; `display_name` is the only name JS
+/// observes.
+#[cfg(feature = "fs")]
+pub(crate) fn native_from_data(
+    data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    display_name: &str,
+    last_modified: Option<i64>,
+    clock: &dyn Clock,
+) -> FileNative {
+    let timestamp = last_modified.unwrap_or_else(|| clock.now_unix_millis());
+    FileNative::new(data, normalize_file_name(display_name), timestamp)
+}
+
 /// The `File` constructor: `new File(fileBits, fileName, options?)`.
 pub(crate) fn constructor(
     new_target: &JsValue,

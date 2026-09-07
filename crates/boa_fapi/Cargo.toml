@@ -13,15 +13,17 @@ workspace = true
 boa_engine = { workspace = true }
 boa_gc = { workspace = true }
 boa_fapi_core = { path = "../boa_fapi_core", version = "0.1.0" }
+boa_fapi_fs = { path = "../boa_fapi_fs", version = "0.1.0", optional = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 encoding_rs = { workspace = true }
 base64 = { workspace = true }
 
 [features]
-default = ["streams-shim", "dom-shim"]
+default = ["streams-shim", "dom-shim", "fs"]
 streams-shim = []
 dom-shim = []
+fs = ["dep:boa_fapi_fs"]
 
 [dev-dependencies]
 proptest = { workspace = true }

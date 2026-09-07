@@ -63,6 +63,32 @@ pub(crate) fn create_instance(data: BlobNative, prototype: JsObject) -> JsObject
     JsObject::from_proto_and_data(prototype, data)
 }
 
+/// Builds the core payload for a host-authorized filesystem source.
+///
+/// Preflights the source length against `max_blob_size` (`==` ok, `+1`
+/// rejected) before any JS-visible object exists; segment validation
+/// re-checks the bounds. No bytes are read here.
+#[cfg(feature = "fs")]
+pub(crate) fn data_from_fs_source(
+    source: std::sync::Arc<dyn ByteSource>,
+    media_type: &str,
+    limits: &FileApiLimits,
+) -> Result<Arc<BlobData>, boa_fapi_core::file_api_error::FileApiError> {
+    use boa_fapi_core::error::ResourceLimitKind;
+    if source.len() > limits.max_blob_size {
+        return Err(boa_fapi_core::file_api_error::FileApiError::ResourceLimit(
+            ResourceLimitKind::BlobSize,
+        ));
+    }
+    let len = source.len();
+    let segment = boa_fapi_core::blob::BlobSegment {
+        source,
+        offset: 0,
+        len,
+    };
+    BlobData::from_segments(vec![segment], media_type, limits).map(Arc::new)
+}
+
 /// The `Blob` constructor: `new Blob(blobParts?, options?)`.
 pub(crate) fn constructor(
     new_target: &JsValue,

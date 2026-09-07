@@ -28,8 +28,17 @@
 //! memory-backed `Blob`/`File`, selected explicitly with
 //! [`FileApiEnvironment`]. Sync methods run fully on the calling stack
 //! with no jobs or events and package through the same helpers as the
-//! async reader. Filesystem sources, blob URLs, clone, full DOM/Workers
-//! runtime, and the WPT harness are not included.
+//! async reader.
+//!
+//! M5 adds the capability-based filesystem `File` under the `fs` feature
+//! (default on): the host registers an already-open read-only resource in
+//! `boa_fapi_fs::FsRegistry` and imports it with
+//! [`FileApiHandle::file_from_resource`]. JS observes only content and the
+//! explicit display name; every range operation revalidates the opaque
+//! snapshot. [`FileApiHandle::shutdown`] cancels pending filesystem work,
+//! rejects new operations, and lets late jobs settle nothing after context
+//! destruction. Blob URLs, clone, full DOM/Workers runtime, and the WPT
+//! harness are not included.
 //!
 //! The engine-independent data model and algorithms live in `boa_fapi_core`.
 //!
@@ -73,6 +82,8 @@ mod file_list;
 mod filereader;
 #[cfg(feature = "dom-shim")]
 mod filereader_sync;
+#[cfg(feature = "fs")]
+mod lifecycle;
 #[cfg(feature = "dom-shim")]
 mod package;
 mod promise_read;

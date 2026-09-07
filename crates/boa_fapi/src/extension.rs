@@ -96,6 +96,10 @@ pub(crate) struct RegisteredSpecs {
     /// environment descriptors with the DOM shim on).
     #[cfg(feature = "dom-shim")]
     pub(crate) sync_reader: Option<crate::filereader_sync::FileReaderSyncSpecs>,
+    /// Shared shutdown flag (M5 `fs` lifecycle). Cloned into the handle;
+    /// every filesystem-backed read observes the same closed state.
+    #[cfg(feature = "fs")]
+    pub(crate) shutdown: crate::lifecycle::ShutdownFlag,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
 }
@@ -435,11 +439,17 @@ impl FileApiExtension {
             filereader: Some(filereader_specs),
             #[cfg(feature = "dom-shim")]
             sync_reader: sync_specs,
+            #[cfg(feature = "fs")]
+            shutdown: crate::lifecycle::ShutdownFlag::new(),
             config: self.config.clone(),
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
 
-        Ok(FileApiHandle { specs })
+        Ok(FileApiHandle {
+            specs: specs.clone(),
+            #[cfg(feature = "fs")]
+            shutdown: specs.shutdown.clone(),
+        })
     }
 }
 
@@ -619,22 +629,48 @@ fn rollback_globals(
 ///
 /// The handle owns the registered constructors/prototypes and configuration,
 /// allowing the host to create Blob/File/FileList objects without JS.
+/// After [`FileApiHandle::shutdown`] the handle rejects every new host
+/// operation; already-created JS objects keep their payload but their
+/// filesystem reads fail on the next chunk boundary.
 #[derive(Clone)]
 pub struct FileApiHandle {
     specs: RegisteredSpecs,
+    #[cfg(feature = "fs")]
+    shutdown: crate::lifecycle::ShutdownFlag,
+}
+
+#[cfg(feature = "fs")]
+impl FileApiHandle {
+    /// Returns `true` after [`FileApiHandle::shutdown`].
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.is_shutdown()
+    }
+
+    /// Fails with a `TypeError` when the runtime is shut down.
+    fn reject_if_shutdown(&self) -> JsResult<()> {
+        if self.is_shutdown() {
+            return Err(crate::error::type_error(
+                "the File API runtime is shut down",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl FileApiHandle {
     /// Creates a `Blob` from host bytes.
     ///
     /// The bytes are wrapped in an immutable memory source; the media type
-    /// is normalized by the M1 rules.
+    /// is normalized by the M1 rules. After `shutdown` the call fails
+    /// before touching JS state.
     pub fn blob_from_bytes(
         &self,
         bytes: impl Into<Bytes>,
         media_type: &str,
         _context: &mut Context,
     ) -> JsResult<JsObject> {
+        #[cfg(feature = "fs")]
+        self.reject_if_shutdown()?;
         let data = blob::data_from_bytes(bytes.into(), media_type, self.specs.limits())
             .map_err(js_from_core)?;
         Ok(blob::create_instance(
@@ -647,7 +683,8 @@ impl FileApiHandle {
     ///
     /// `name` is a display name: no basename is computed, but `/` is
     /// replaced by `:` like the JS constructor. `options.last_modified` of
-    /// `None` reads the injected clock.
+    /// `None` reads the injected clock. After `shutdown` the call fails
+    /// before touching JS state.
     pub fn file_from_bytes(
         &self,
         bytes: impl Into<Bytes>,
@@ -655,6 +692,8 @@ impl FileApiHandle {
         options: HostFileOptions,
         _context: &mut Context,
     ) -> JsResult<JsObject> {
+        #[cfg(feature = "fs")]
+        self.reject_if_shutdown()?;
         let native = file::native_from_bytes(
             bytes.into(),
             name,
@@ -670,15 +709,81 @@ impl FileApiHandle {
         ))
     }
 
+    /// Creates a `File` from a pre-authorized filesystem resource.
+    ///
+    /// The host passes an opaque [`FileResource`](boa_fapi_core::policy::FileResource)
+    /// handle (already open, read-only, capability-checked) plus the only
+    /// name JS observes, `display_name` (no basename is computed from any
+    /// secret host path; `/` becomes `:` like the JS constructor). The
+    /// resource is validated (live snapshot matches the import snapshot,
+    /// plus a preflight size check against `max_blob_size`) before any
+    /// JS-visible object exists, so a denial leaves no partial state. Name
+    /// normalization matches the M1/M2 `File` behavior. Without the `fs`
+    /// Cargo feature this method does not exist; the memory API and
+    /// registration keep working unchanged.
+    ///
+    /// Signature adaptation (recorded in the ADR): the target shape takes
+    /// `&dyn FileResource`, but `ByteSource: 'static` cannot borrow it, so
+    /// this method takes `Arc<dyn FileResource>` ownership instead. The
+    /// backing `ArcResourceSource` revalidates the live snapshot before
+    /// every read and verifies exact bytes afterwards, with no partial
+    /// result and no location/identity disclosure.
+    #[cfg(feature = "fs")]
+    pub fn file_from_resource(
+        &self,
+        resource: std::sync::Arc<dyn boa_fapi_core::policy::FileResource>,
+        display_name: &str,
+        options: HostFileOptions,
+        _context: &mut Context,
+    ) -> JsResult<JsObject> {
+        use std::sync::Arc;
+        self.reject_if_shutdown()?;
+        // Authorize before any JS-visible object exists. The grant check
+        // uses the live snapshot so a resource that changed between open
+        // and import is denied with no partial state.
+        let live = resource
+            .current_snapshot()
+            .map_err(crate::error::js_from_core)?;
+        let grant = boa_fapi_core::policy::FileGrant::new(
+            resource.resource_id(),
+            resource.import_snapshot(),
+        );
+        // A grant whose import snapshot no longer matches the live state
+        // is stale: deny without creating anything.
+        if grant.snapshot != live {
+            return Err(crate::error::js_from_core(
+                boa_fapi_core::file_api_error::FileApiError::SnapshotChanged,
+            ));
+        }
+        let adapter: Arc<dyn boa_fapi_core::source::ByteSource> =
+            Arc::new(ArcResourceSource::new(resource, self.shutdown.clone()));
+        let data = blob::data_from_fs_source(adapter, &options.media_type, self.specs.limits())
+            .map_err(js_from_core)?;
+        let native = file::native_from_data(
+            data,
+            display_name,
+            options.last_modified,
+            self.specs.config.clock.as_ref(),
+        );
+        Ok(JsObject::from_proto_and_data(
+            self.specs.file_proto().clone(),
+            native,
+        ))
+    }
+
     /// Creates a `FileList` from File objects.
     ///
     /// Every element is brand-validated as a File before any output object
-    /// is created; a non-File element fails without partial state.
+    /// is created; a non-File element fails without partial state. Only
+    /// explicit `File` objects are accepted: this never enumerates a
+    /// directory. After `shutdown` the call fails before touching JS state.
     pub fn file_list(
         &self,
         files: impl IntoIterator<Item = JsObject>,
         context: &mut Context,
     ) -> JsResult<JsObject> {
+        #[cfg(feature = "fs")]
+        self.reject_if_shutdown()?;
         let mut validated = Vec::new();
         for file in files {
             brand::require_file_object(&file)?;
@@ -687,12 +792,125 @@ impl FileApiHandle {
         file_list::create(validated, &self.specs.file_list_proto, context)
     }
 
+    /// Shuts down the registered File API runtime.
+    ///
+    /// Idempotent: repeated calls neither panic nor enqueue callbacks.
+    /// Atomic with respect to new host-created `File`/resource operations
+    /// (they are rejected once closed). Pending filesystem reads observe
+    /// the shared cancellation; new reads, materializations, stream pulls,
+    /// and FileReader jobs after shutdown settle nothing against a
+    /// destroyed context. Releases file handles/capabilities without
+    /// leaving paths or identities in queues, errors, or JS objects.
+    #[cfg(feature = "fs")]
+    pub fn shutdown(&self, context: &mut Context) -> Result<(), RegisterError> {
+        crate::lifecycle::shutdown_runtime(&self.shutdown, context)
+    }
+
     /// Returns the environment descriptor this handle was registered with.
     ///
     /// Worker descriptors installed the normative `FileReaderSync`;
     /// `Window` and `ServiceWorker` did not.
     pub fn environment(&self) -> FileApiEnvironment {
         self.specs.environment()
+    }
+}
+
+/// Shutdown-aware [`ByteSource`](boa_fapi_core::source::ByteSource) over an
+/// owned host [`FileResource`](boa_fapi_core::policy::FileResource).
+///
+/// Captures the import snapshot and length once; every `read_range`
+/// validates, in order: caller cancellation, the runtime shutdown flag,
+/// checked range arithmetic, the live snapshot against the import snapshot
+/// (before reading), then exact byte-count verification (after reading).
+/// Never returns partial bytes; never touches Boa from completion; never
+/// exposes paths or identities.
+#[cfg(feature = "fs")]
+struct ArcResourceSource {
+    resource: std::sync::Arc<dyn boa_fapi_core::policy::FileResource>,
+    import_snapshot: boa_fapi_core::snapshot::SnapshotState,
+    len: u64,
+    shutdown: crate::lifecycle::ShutdownFlag,
+}
+
+#[cfg(feature = "fs")]
+impl ArcResourceSource {
+    /// Captures the import snapshot and length without creating JS state.
+    fn new(
+        resource: std::sync::Arc<dyn boa_fapi_core::policy::FileResource>,
+        shutdown: crate::lifecycle::ShutdownFlag,
+    ) -> Self {
+        let import_snapshot = resource.import_snapshot();
+        let len = match &import_snapshot {
+            boa_fapi_core::snapshot::SnapshotState::Filesystem(state) => state.size(),
+            _ => 0,
+        };
+        Self {
+            resource,
+            import_snapshot,
+            len,
+            shutdown,
+        }
+    }
+}
+
+#[cfg(feature = "fs")]
+impl boa_fapi_core::source::ByteSource for ArcResourceSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn snapshot(&self) -> boa_fapi_core::snapshot::SnapshotState {
+        self.import_snapshot.clone()
+    }
+
+    fn read_range(
+        &self,
+        range: std::ops::Range<u64>,
+        cancel: &boa_fapi_core::cancellation::CancellationToken,
+    ) -> Result<bytes::Bytes, boa_fapi_core::file_api_error::FileApiError> {
+        use boa_fapi_core::file_api_error::FileApiError;
+        if cancel.is_cancelled() || self.shutdown.cancel_token().is_cancelled() {
+            return Err(FileApiError::Cancelled);
+        }
+        if self.shutdown.is_shutdown() {
+            return Err(FileApiError::Cancelled);
+        }
+        if range.start > range.end {
+            return Err(FileApiError::InvalidRange);
+        }
+        let len_u64 = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(FileApiError::InvalidRange)?;
+        if range.end > self.len {
+            return Err(FileApiError::InvalidRange);
+        }
+        let len = usize::try_from(len_u64).map_err(|_| {
+            FileApiError::ResourceLimit(boa_fapi_core::error::ResourceLimitKind::MaterializeBytes)
+        })?;
+        if len == 0 {
+            return Ok(bytes::Bytes::new());
+        }
+        // Snapshot validation before the read: replacement, truncation,
+        // deletion, or permission change fails here with no bytes out.
+        let live = self.resource.current_snapshot()?;
+        if live != self.import_snapshot {
+            return Err(FileApiError::SnapshotChanged);
+        }
+        if cancel.is_cancelled() || self.shutdown.cancel_token().is_cancelled() {
+            return Err(FileApiError::Cancelled);
+        }
+        let bytes = self.resource.read_at(range.start, len)?;
+        if bytes.len() != len {
+            return Err(FileApiError::InvalidRange);
+        }
+        // Post-read identity confirmation: a replacement racing the read
+        // surfaces here (or on the next chunk), never as partial old bytes.
+        let after = self.resource.current_snapshot()?;
+        if after != self.import_snapshot {
+            return Err(FileApiError::SnapshotChanged);
+        }
+        Ok(bytes::Bytes::from(bytes))
     }
 }
 

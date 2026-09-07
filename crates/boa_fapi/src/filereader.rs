@@ -414,6 +414,16 @@ fn start_read(
             )));
         }
     }
+    #[cfg(feature = "fs")]
+    if specs.shutdown.is_shutdown() {
+        return fail_fast(
+            &object,
+            data.size(),
+            "AbortError",
+            "the File API runtime is shut down",
+            context,
+        );
+    }
 
     // Quota: the 65th active reader with the default limit fails through
     // the normal error path, consuming no slot.
@@ -697,7 +707,9 @@ fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<J
 ///
 /// Every late job whose generation differs from the reader's current
 /// generation is a strict no-op: it cannot read, mutate state, free a quota
-/// slot, or emit an event.
+/// slot, or emit an event. After `fs` shutdown, dispatch jobs are strict
+/// no-ops as well: no Boa job, Promise resolution, stream callback, or
+/// FileReader event reaches a destroyed context.
 fn run_reading_job(job: FileReadingJob, context: &mut Context) -> JsResult<JsValue> {
     let FileReadingJob {
         reader,
@@ -746,6 +758,17 @@ fn run_pump(
 ) -> JsResult<JsValue> {
     // Stale pump: strict no-op (no read, no mutation, no slot, no event).
     if !generation_current(reader, generation) {
+        return Ok(JsValue::undefined());
+    }
+    #[cfg(feature = "fs")]
+    if crate::extension::snapshot(context)
+        .map(|specs| specs.shutdown.is_shutdown())
+        .unwrap_or(false)
+    {
+        // Shutdown while queued: settle nothing further. The operation was
+        // counted active; release its slot once without dispatching any
+        // event against a possibly destroyed context.
+        release_slot(context)?;
         return Ok(JsValue::undefined());
     }
     let specs = crate::extension::snapshot(context)?;
@@ -1060,6 +1083,14 @@ fn run_dispatch(
 ) -> JsResult<JsValue> {
     // Stale dispatch: strict no-op.
     if !generation_current(reader, generation) {
+        return Ok(JsValue::undefined());
+    }
+    #[cfg(feature = "fs")]
+    if crate::extension::snapshot(context)
+        .map(|specs| specs.shutdown.is_shutdown())
+        .unwrap_or(false)
+    {
+        // Shutdown while queued: no event reaches a destroyed context.
         return Ok(JsValue::undefined());
     }
     let DispatchState {

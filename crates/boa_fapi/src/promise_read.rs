@@ -110,16 +110,27 @@ fn snapshot_limits(context: &Context) -> JsResult<FileApiLimits> {
 
 /// Runs inside the promise job: materializes, packages, and settles once.
 ///
-/// Materialization failure rejects with the central M4-A `DOMException`
-/// mapping (`ResourceLimit` → `QuotaExceededError`, other core failures →
-/// the mapped name), built in the same realm. No path, source, or body
-/// detail leaks into the message. Packaging failure rejects with the engine
-/// error. The promise is settled exactly once; the blob is never mutated.
+/// After `fs` shutdown the job rejects with the central `AbortError`
+/// mapping and settles nothing against a destroyed context.
 fn settle_read(
     request: &ReadRequest,
     resolvers: &ResolvingFunctions,
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "fs")]
+    if crate::extension::snapshot(context)
+        .map(|specs| specs.shutdown.is_shutdown())
+        .unwrap_or(false)
+    {
+        reject_with(&FileApiError::Cancelled, &resolvers.reject, context)?;
+        return Ok(JsValue::undefined());
+    }
+    // Materialization failure rejects with the central M4-A `DOMException`
+    // mapping (`ResourceLimit` → `QuotaExceededError`, other core failures
+    // → the mapped name), built in the same realm. No path, source, or
+    // body detail leaks into the message. Packaging failure rejects with
+    // the engine error. The promise is settled exactly once; the blob is
+    // never mutated.
     let cancel = CancellationToken::new();
     let bytes = match request.data.materialize(&request.limits, &cancel) {
         Ok(bytes) => bytes,
