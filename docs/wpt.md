@@ -53,9 +53,10 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict
   [--timeout-ms <N>]
 ```
 
-- `--threads N`: opt-in parallelism (default `1`); files run in manifest
-  order per worker chunk, rows append in order — default results are
-  byte-identical with any `--threads` value for this corpus.
+- `--threads N`: accepted for interface parity; files always run
+  sequentially in manifest order (determinism first — parallelism is not
+  claimed; `N > 1` currently returns a launch error instead of silently
+  ignoring the flag).
 - `--filter`: diagnostic subset without changing strict-gate semantics
   (empty match is a launch error).
 - `--timeout-ms`: overrides per-subtest pump budget; default from manifest.
@@ -128,7 +129,8 @@ Example (truncated):
 
 - Adapted subset only (7 files / 38 subtests); full `FileAPI/**` needs
   browser capabilities out of scope (Fetch, navigation, workers, server).
-- Single-worker deterministic by default; `--threads` is order-preserving
-  opt-in, not a speed claim.
+- Single-worker deterministic; `--threads` is interface parity only
+  (sequential manifest order, `N > 1` is a launch error, not a speed
+  claim).
 - Wall-clock appears only as an internal pump guard; reports carry no
   timing comparisons.

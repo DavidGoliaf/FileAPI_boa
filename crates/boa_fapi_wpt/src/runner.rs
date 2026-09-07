@@ -170,14 +170,20 @@ fn eval_string(context: &mut Context, source: &str) -> Result<String, RunError> 
 }
 
 /// Reads a JS integer evaluation, mapping failure to [`RunError::Readback`].
+///
+/// `to_number` may invoke user `valueOf`/`toString`; the probe reads a
+/// plain number property on the harness object, so no user code runs here.
 fn eval_u64(context: &mut Context, source: &str) -> Result<u64, RunError> {
     let value = context
         .eval(Source::from_bytes(source))
         .map_err(|_| RunError::Readback)?;
-    value
-        .to_number(context)
-        .map(|n| n as u64)
-        .map_err(|_| RunError::Readback)
+    let number = value.to_number(context).map_err(|_| RunError::Readback)?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(RunError::Readback);
+    }
+    // `as u64` saturates instead of wrapping; the caller additionally
+    // clamps to 10 000 entries, so hostile lengths cannot allocate.
+    Ok(number as u64)
 }
 
 /// Executes one manifest file and maps recorded entries to subtest rows.
@@ -214,13 +220,20 @@ pub fn run_file(
         passes += 1;
     }
     // Read back recorded entries: `pass|name|message` per index.
+    // The count is clamped (10 000) and every per-index read is fallible:
+    // a hostile file redefining the probe between reads degrades to fewer
+    // entries (possibly TIMEOUT), never to a panic or an unbounded loop.
     let count = match eval_u64(context, harness::results_probe_source()) {
         Ok(n) => n.min(10_000),
         Err(_) => 0,
     };
     let mut recorded: Vec<(bool, String, String)> = Vec::new();
     for index in 0..count {
-        let entry = eval_string(context, &harness::result_entry_source(index as usize))?;
+        // `entry` sources are built from an integer index only — no file
+        // or manifest text is interpolated into evaluated JS.
+        let Ok(entry) = eval_string(context, &harness::result_entry_source(index as usize)) else {
+            break;
+        };
         let mut parts = entry.splitn(3, '|');
         let pass = parts.next() == Some("1");
         let name = parts.next().unwrap_or("").to_owned();
@@ -322,6 +335,8 @@ pub fn run_file(
     }
     // Unexpected extra entries (recorded names outside the manifest) are
     // surfaced as file-level FAIL rows so strict mode breaks on them.
+    // `unexpected:*` rows always expect PASS, so `strict_pass` (which
+    // requires actual PASS for PASS-expected rows) fails on them.
     for name in by_name.keys() {
         if !expected_names.contains(name) {
             subtests.push(SubtestResult {

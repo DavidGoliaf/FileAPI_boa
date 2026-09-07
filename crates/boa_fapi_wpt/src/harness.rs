@@ -51,6 +51,13 @@ pub fn prelude_source(file_label: &str) -> String {
     t.step_func = function(f) { return function() { return f.apply(this, arguments); }; };
     t.add_cleanup = function(f) { t.cleanup.push(f); };
     t.done = function() {
+      // Second `done()` is a harness failure, not a silent pass: record
+      // explicitly so duplicate completion breaks strict instead of
+      // masquerading as PASS.
+      if (!t.pending) {
+        record("test", t.name, false, "async_test done() called twice");
+        return;
+      }
       t.pending = false;
       record("test", t.name, true, "");
       for (var i = 0; i < t.cleanup.length; i++) { t.cleanup[i](); }

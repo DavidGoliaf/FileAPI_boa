@@ -256,6 +256,12 @@ fn run(argv: &[String]) -> Result<i32, String> {
     let today = today_utc();
     let manifest = load_manifest(&manifest_text, &today).map_err(|e| format_manifest_error(&e))?;
     // Corpus root: sibling `corpus/` of the manifest directory, else CWD.
+    // `--threads` is accepted for interface parity but files run
+    // sequentially in manifest order: determinism first, parallelism is
+    // not claimed by this harness (see docs/wpt.md).
+    if args.threads != 1 {
+        return Err("--threads > 1 is accepted but runs sequentially in manifest order".to_owned());
+    }
     let corpus_root = manifest_dir(&args.manifest);
     let texts = verify_hashes(&manifest, &corpus_root)?;
     let mut files: Vec<FileResult> = Vec::new();
@@ -278,10 +284,6 @@ fn run(argv: &[String]) -> Result<i32, String> {
             max_pump_passes: 64,
             file_timeout: Duration::from_millis(timeout_ms),
         };
-        // Default is single-worker deterministic; `--threads N` is an
-        // explicit opt-in that still runs files in manifest order per
-        // worker chunk (no result reordering: rows append in order).
-        let _ = args.threads;
         match run_file(file, text, &options) {
             Ok(row) => files.push(row),
             Err(e) => return Err(format_run_error(&e, &file.path)),

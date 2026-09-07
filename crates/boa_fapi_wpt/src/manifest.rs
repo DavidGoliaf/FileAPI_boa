@@ -232,10 +232,16 @@ impl Json {
 /// duplicate *expectations* separately). Depth is bounded to avoid
 /// stack exhaustion on hostile input.
 pub fn parse_json(text: &str) -> Result<Json, ManifestError> {
+    // Defense in depth: manifests are small checked-in files; refuse
+    // megabyte-scale inputs before parsing (the array cap below is the
+    // second layer, the depth cap in `value` the third).
+    if text.len() > 1024 * 1024 {
+        return Err(ManifestError::BadType("document too large".to_owned()));
+    }
     let bytes = text.as_bytes();
     let mut parser = JsonParser { bytes, pos: 0 };
     parser.skip_ws();
-    let value = parser.value()?;
+    let value = parser.value(0)?;
     parser.skip_ws();
     if parser.pos != bytes.len() {
         return Err(ManifestError::BadType("trailing characters".to_owned()));
@@ -268,11 +274,14 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, ManifestError> {
+    fn value(&mut self, depth: usize) -> Result<Json, ManifestError> {
+        if depth > 64 {
+            return Err(ManifestError::BadType("nesting too deep".to_owned()));
+        }
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth.saturating_add(1)),
+            Some(b'[') => self.array(depth.saturating_add(1)),
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
@@ -293,7 +302,10 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn object(&mut self) -> Result<Json, ManifestError> {
+    fn object(&mut self, depth: usize) -> Result<Json, ManifestError> {
+        if depth > 64 {
+            return Err(ManifestError::BadType("nesting too deep".to_owned()));
+        }
         self.pos += 1;
         let mut entries = Vec::new();
         self.skip_ws();
@@ -310,7 +322,7 @@ impl<'a> JsonParser<'a> {
             if !self.eat(b':') {
                 return Err(ManifestError::BadType("object colon".to_owned()));
             }
-            let value = self.value()?;
+            let value = self.value(depth.saturating_add(1))?;
             if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
                 slot.1 = value;
             } else {
@@ -326,13 +338,12 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn array(&mut self) -> Result<Json, ManifestError> {
+    fn array(&mut self, depth: usize) -> Result<Json, ManifestError> {
+        if depth > 64 {
+            return Err(ManifestError::BadType("nesting too deep".to_owned()));
+        }
         self.pos += 1;
         let mut items = Vec::new();
-        // Bounded input: manifests are small checked-in files.
-        if items.len() > 1_000_000 {
-            return Err(ManifestError::BadType("array too large".to_owned()));
-        }
         self.skip_ws();
         if self.eat(b']') {
             return Ok(Json::Arr(items));
@@ -341,7 +352,7 @@ impl<'a> JsonParser<'a> {
             if items.len() > 100_000 {
                 return Err(ManifestError::BadType("array too large".to_owned()));
             }
-            items.push(self.value()?);
+            items.push(self.value(depth.saturating_add(1))?);
             self.skip_ws();
             if self.eat(b']') {
                 return Ok(Json::Arr(items));
@@ -388,6 +399,12 @@ impl<'a> JsonParser<'a> {
                         let unit = u32::from_str_radix(hex, 16)
                             .map_err(|_| ManifestError::BadType("bad unicode escape".to_owned()))?;
                         self.pos += 4;
+                        if (0xD800..0xE000).contains(&unit) {
+                            // Surrogate halves never appear alone in valid
+                            // JSON output: reject instead of emitting U+FFFD
+                            // (which would silently corrupt names/hashes).
+                            return Err(ManifestError::BadType("lone surrogate escape".to_owned()));
+                        }
                         let ch = char::from_u32(unit).ok_or_else(|| {
                             ManifestError::BadType("bad unicode escape".to_owned())
                         })?;
@@ -397,11 +414,23 @@ impl<'a> JsonParser<'a> {
                 }
             } else if byte < 0x20 {
                 return Err(ManifestError::BadType("control character".to_owned()));
-            } else {
-                // UTF-8 bytes pass through; validity is checked when the
-                // surrounding `&str` is sliced on load (inputs are `&str`).
+            } else if byte < 0x80 {
                 out.push(byte as char);
                 self.pos += 1;
+            } else {
+                // Multi-byte UTF-8: consume the full code point (rejecting
+                // lone continuation bytes and truncated sequences) instead
+                // of pushing one `char` per byte (which would emit U+FFFD
+                // per byte and corrupt names/hashes).
+                let rest = &self.bytes[self.pos..];
+                let text = std::str::from_utf8(rest)
+                    .map_err(|_| ManifestError::BadType("bad utf-8".to_owned()))?;
+                let mut chars = text.chars();
+                let Some(ch) = chars.next() else {
+                    return Err(ManifestError::BadType("bad utf-8".to_owned()));
+                };
+                self.pos += ch.len_utf8();
+                out.push(ch);
             }
         }
     }
@@ -416,7 +445,7 @@ impl<'a> JsonParser<'a> {
             self.pos += 1;
             digits += 1;
         }
-        if digits == 0 {
+        if digits == 0 || digits > 20 {
             return Err(ManifestError::BadType("number".to_owned()));
         }
         if self.eat(b'.') {
@@ -474,6 +503,8 @@ fn is_date(text: &str) -> bool {
 /// `today` is the `YYYY-MM-DD` review clock (UTC date at load time);
 /// expectations with `review_by` before `today` fail the load so stale
 /// capability gaps break strict runs instead of lingering silently.
+/// Duplicate file `path` entries are rejected (same as duplicate
+/// expectations): two files must never claim one adapted path.
 pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError> {
     let root = parse_json(text)?;
     if !matches!(root, Json::Obj(_)) {
@@ -518,8 +549,12 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
         .need("files")?
         .as_arr()
         .ok_or_else(|| ManifestError::BadType("files".to_owned()))?;
+    if files_json.len() > 10_000 {
+        return Err(ManifestError::BadType("files too large".to_owned()));
+    }
     let mut files = Vec::new();
     let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
+    let mut seen_paths: BTreeMap<String, ()> = BTreeMap::new();
     for file_json in files_json {
         let path = file_json
             .need("path")?
@@ -551,8 +586,15 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             .as_str()
             .ok_or_else(|| ManifestError::BadType("files[].capability".to_owned()))?
             .to_owned();
+        if path.is_empty() || upstream_path.is_empty() || group.is_empty() || capability.is_empty()
+        {
+            return Err(ManifestError::BadType("files[] empty field".to_owned()));
+        }
         if path.contains('*') || upstream_path.contains('*') || capability.contains('*') {
             return Err(ManifestError::Wildcard(path.clone(), String::new()));
+        }
+        if seen_paths.insert(path.clone(), ()).is_some() {
+            return Err(ManifestError::Duplicate(path.clone(), String::new()));
         }
         if !is_hex(&upstream_blob_sha, 20) {
             return Err(ManifestError::BadHex(
@@ -566,7 +608,7 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             .need("subtests")?
             .as_arr()
             .ok_or_else(|| ManifestError::BadType("files[].subtests".to_owned()))?;
-        if subtests_json.is_empty() {
+        if subtests_json.is_empty() || subtests_json.len() > 10_000 {
             return Err(ManifestError::BadType("files[].subtests".to_owned()));
         }
         let mut subtests = Vec::new();
@@ -758,5 +800,36 @@ mod tests {
             load_manifest(&bad_hash, today()),
             Err(ManifestError::BadHex(_))
         ));
+    }
+
+    #[test]
+    fn rejects_deep_nesting_surrogate_and_dup_path() {
+        let mut deep = String::from("[");
+        for _ in 0..80 {
+            deep.push('[');
+        }
+        assert!(matches!(parse_json(&deep), Err(ManifestError::BadType(_))));
+        let surrogate = minimal_manifest("PASS").replace("corpus/a.js", "corpus/\\ud800.js");
+        assert!(matches!(
+            load_manifest(&surrogate, today()),
+            Err(ManifestError::BadType(_))
+        ));
+        let base = minimal_manifest("PASS");
+        // Insert a second file entry with the same `path` before the
+        // closing of the `files` array (i.e. right before the final `]`).
+        let cut = base.rfind(']').expect("fixture shape changed");
+        let dup_tail = ",{\"path\": \"corpus/a.js\", \"upstream_path\": \"FileAPI/blob/a.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"".to_owned()
+            + &"e".repeat(64)
+            + "\", \"group\": \"FileAPI/blob\", \"capability\": \"blob\", \"subtests\": [{\"test\": \"t2\", \"subtest\": \"s2\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}]}";
+        let mut dup_path = base[..cut].to_owned();
+        dup_path.push_str(&dup_tail);
+        dup_path.push_str(&base[cut..]);
+        assert!(
+            matches!(
+                load_manifest(&dup_path, today()),
+                Err(ManifestError::Duplicate(_, _))
+            ),
+            "duplicate adapted path must be rejected"
+        );
     }
 }
