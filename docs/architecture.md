@@ -5,7 +5,8 @@
 ```text
 M1 core (data and algorithms, no Boa)
   → M2 boa_fapi (Web IDL bindings, brands, GC integration)
-  → future host adapters (FS / DOM / Streams / URL)
+  → M5/M6 host adapters (FS / URL / clone bridge)
+  → M7 conformance (WPT harness + acceptance/race/hardening suites)
 ```
 
 ### Layer 1: `boa_fapi_core` (M1)
@@ -258,5 +259,29 @@ boa_fapi_core (no external runtime deps beyond bytes/thiserror)
 
 boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror + encoding_rs + base64 + getrandom (+ boa_fapi_fs with `fs`)
 boa_fapi_fs → boa_fapi_core + bytes + thiserror + std::fs
-boa_fapi_wpt (future) → boa_fapi_core + test harness
+boa_fapi_wpt → boa_fapi + boa_engine + thiserror (M7 harness: manifest, runner, reports, CLI; zero new deps)
 ```
+
+### Layer 4: `boa_fapi_wpt` conformance harness (M7)
+
+The harness adds no JS API and changes no binding: it drives the
+accepted M1–M6 surface from adapted WPT files in fresh Boa `Context`s.
+
+- `manifest.rs` — strict `wpt-manifest.json` loader (schema 1, pinned
+  commit hex, per-file SHA-256, exact subtest entries; unknown status,
+  wildcards, missing gap fields and expired `review_by` are load
+  errors, never silent `NOTRUN`);
+- `harness.rs` — minimal testharness prelude (`test`/`async_test`/
+  `promise_test`, assertions, `done`/`step`, cleanup) injected as JS
+  source (no upstream fetch, no DOM);
+- `runner.rs` — per-file fresh `Context` + `FileApiExtension`, bounded
+  `run_jobs()` pump (64 passes + wall guard, no sleep), one terminal
+  `PASS`/`FAIL`/`TIMEOUT` per subtest, `NOTRUN` rows from manifest gaps,
+  `blob:`-scrubbed details, unexpected entries as explicit FAIL rows;
+- `report.rs` — deterministic JSON/JUnit (manifest order, fixed keys,
+  no timestamps/paths/secrets) plus the `strict_pass` gate;
+- `main.rs` — CLI (`--manifest/--strict/--threads/--filter/--json/`
+  `--junit/--timeout-ms`), SHA-256 verification before execution,
+  self-contained SHA-256 (FIPS 180-4) and UTC-date review clock, 8 MiB
+  worker thread for deeply recursive Boa evaluation (identical behavior
+  on every platform).

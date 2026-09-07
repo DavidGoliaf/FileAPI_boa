@@ -4,7 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "WPT test harness for File API (placeholder — functionality arrives in M7)"
+description = "Deterministic WPT harness for the File API (M7)"
 
 [lints]
 workspace = true
+
+[dependencies]
+boa_engine = { workspace = true }
+boa_fapi = { path = "../boa_fapi", version = "0.1.0" }
+thiserror = { workspace = true }
+
+[[bin]]
+name = "boa_fapi_wpt"
+path = "src/main.rs"

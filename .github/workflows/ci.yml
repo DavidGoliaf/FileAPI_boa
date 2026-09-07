@@ -69,6 +69,41 @@ jobs:
       - name: cargo test (M6 structured clone)
         run: cargo test --package boa_fapi --test m6_structured_clone -- --nocapture
 
+      - name: cargo test (M7 appendix-A acceptance)
+        run: cargo test --package boa_fapi --test appendix_a_acceptance -- --nocapture
+
+      - name: cargo test (M7 abort races)
+        run: cargo test --package boa_fapi --test abort_races -- --nocapture
+
+      - name: cargo test (M7 abort races, fs)
+        run: cargo test --package boa_fapi --test abort_races_fs -- --nocapture
+
+      - name: cargo test (M7 hardening hooks)
+        run: cargo test --package boa_fapi --test hardening_hooks -- --nocapture
+
+      - name: cargo test (M7 WPT harness units)
+        run: cargo test --package boa_fapi_wpt -- --nocapture
+
+      - name: WPT strict run
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --json target/wpt-report.json --junit target/wpt-report.xml
+
+      - name: Upload WPT reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-reports-${{ matrix.os }}
+          path: |
+            target/wpt-report.json
+            target/wpt-report.xml
+
+      - name: SBOM (cargo tree)
+        run: cargo tree --workspace --all-features --prefix none > target/sbom.txt
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.os }}
+          path: target/sbom.txt
+
       # NOTE: there is deliberately no `cargo test --workspace
       # --no-default-features` step. The lib unit suites (`src/tests.rs`,
       # `promise_read/streams/filereader*/webidl` child modules) and every

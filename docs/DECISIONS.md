@@ -693,3 +693,26 @@ capability/version check до изменения глобалов
 Последствия: `M6-CLONE-01..05` — round-trip, fs-safety (unix live),
 versioned encoding, adapter/lifecycle; `boa-idb` не зависит ни в одной
 комбинации; M7 exclusions (WPT, benchmark-hardening) — вне scope.
+
+## ADR-0033 (M7): ноль новых production-зависимостей для WPT harness
+
+Контекст: M7 требует CLI harness с manifest-парсингом, SHA-256,
+детерминированными JSON/JUnit отчётами и реальным Boa Context; заказ
+§2.4 требует ADR на каждую новую dependency, SPEC §4 предпочитает уже
+принятые крейты.
+
+Решение: новых зависимостей нет. `boa_engine`/`boa_fapi`/`thiserror` уже
+в дереве (транзитивно через `boa_fapi`); JSON-парсинг и сериализация —
+свой маленький проверенный модуль (`manifest.rs`/`report.rs`, только
+std); SHA-256 — собственная FIPS 180-4 реализация в CLI (~60 строк,
+только для проверки corpus-хэшей, не для security boundary — UUID
+по-прежнему из `getrandom` через M6 `OsEntropy`); CLI-парсинг —
+ручной `Args::parse` (6 флагов, без `clap`/`lexopt`); параллелизм —
+std threads в порядке manifest (без `rayon`); время — `std::time`
+(дата для `review_by` — civil-from-days, без `chrono`/`time`).
+`cargo-deny` не меняется (allow-list тот же); `cargo tree` новых узлов
+не показывает.
+
+Последствия: `boa_fapi_wpt` зависит только от уже принятых крейтов;
+SBOM-артефакт CI подтверждает отсутствие новых лицензий; отдельный
+dependency-ADR не нужен сверх этой записи.

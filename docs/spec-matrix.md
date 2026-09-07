@@ -160,3 +160,35 @@ integration suites live in `crates/boa_fapi_core/tests/`.
 | M6-RW-R2 | required-arg/DOMString revoke | `url_shim.rs` — `revoke_object_url` via central `webidl::dom_string`; missing arg throws `TypeError`; abrupt conversion propagates; converted strings revoke silently | `m6_blob_url.rs::revoke_webidl_conversion`, `::create_revoke_semantics` (missing-arg case) |
 | M6-RW-R3 | symmetric clone encode bounds | `clone.rs` — `serialized_blob` enforces `MAX_CLONE_STRING_BYTES`; `encode` runs `validate_payload` (bytes/strings/count/total, checked) before any byte; format unchanged | `blob_url.rs::clone_encode_bounds_are_symmetric`; `m6_structured_clone.rs::clone_host_path_enforces_blob_media_type_bound` |
 | M6-RW-R4 | redacted key identity | `blob_url.rs` — manual redacted `Debug` for `EnvironmentKey` (origin visible; partition/nonce `<redacted>`); `Eq`/`Hash` unchanged | `blob_url.rs::url_key_debug_redacts_partition_and_nonce` |
+
+## M7-WPT — deterministic harness over the pinned adapted subset (`boa_fapi_wpt`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-WPT-01 | pinned corpus, SHA-256 and manifest completeness | `crates/boa_fapi_wpt/src/manifest.rs` — `load_manifest` (schema 1, pinned commit hex, per-file SHA-256, exact subtests); `src/main.rs` — `verify_hashes` before execution, mismatch is a launch error | `manifest::tests::accepts_pass_manifest`, `::rejects_bad_schema_and_bad_hash`; strict CLI run on `wpt-manifest.json` (7 files / 38 subtests, all PASS) |
+| M7-WPT-02 | `.any.js`/JS-only adaptation in a real Boa Context | `src/harness.rs` — `prelude_source` (no upstream fetch/DOM); `src/runner.rs` — `run_file` (fresh `Context` + `FileApiExtension` per file); `corpus/*.js` adapted subsets | `blob-constructor` (11), `blob-slice` (5), `file-constructor` (5), `filelist-section` (2), `bloburl-create-revoke` (6) subtests via `--strict` |
+| M7-WPT-03 | assertions, async/promise tests, job pump and timeout | `src/harness.rs` — `test`/`async_test`/`promise_test`, assertions, `done`/`step`; `src/runner.rs` — bounded `run_jobs()` pump (64 passes + wall guard), `TIMEOUT` vs JS-failure split | `reading-data-section` (5, `promise_test`), `filereader-read` (4), `runner::tests::passing_file_maps_to_pass`, `::failing_assertion_maps_to_fail` |
+| M7-WPT-04 | deterministic statuses and JSON/JUnit output | `src/report.rs` — `to_json`/`to_junit` (manifest order, fixed keys, no timestamps/paths/secrets; `scrub_detail` redacts `blob:`) | `report::tests::strict_gate_needs_exact_match`, `::json_and_junit_escape_deterministically`; `--json`/`--junit` strict artifacts in CI |
+| M7-WPT-05 | exact expectations and strict unexpected-result gate | `src/manifest.rs` — exact entries, no wildcards, `MissingReason`/expiry load errors; `src/report.rs` — `strict_pass` (unexpected rows break strict) | `manifest::tests::rejects_unknown_status_and_wildcards`, `::rejects_missing_reason_and_expired_review`; strict CLI exit non-zero on any mismatch |
+
+## M7-RACE — deterministic race matrix (`boa_fapi`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-RACE-01 | FileReader abort/stale completion/quota races | `crates/boa_fapi/tests/abort_races.rs` — abort before first chunk, abort between progress events, stale-after-restart, 64+1 quota with recovery | `::abort_before_first_chunk_reports_abort_loadend`, `::abort_between_progress_events_suppresses_stale_load`, `::stale_completion_after_new_operation_is_noop`, `::concurrent_read_quota_recovers` |
+| M7-RACE-02 | URL revoke/resolve and context shutdown races | `abort_races.rs` — revoke-before/after-resolve with live Arc reads, shutdown with pending promise/reader (no late settlement, late creation rejected) | `::revoke_before_and_after_resolve`, `::context_shutdown_settles_nothing_late` |
+| M7-RACE-03 | filesystem snapshot mutation and UTF-8 boundary matrix | `abort_races_fs.rs` — post-creation mutation → mapped `DOMException`, never partial bytes (Unix live / non-Unix copy); `abort_races.rs` — `i64::MIN/MAX`/empty/reversed slices, multibyte sizes, BOM strip | `::filesystem_mutation_after_creation`, `::slice_and_utf8_boundary_matrix`, `::worker_environment_sync_without_jobs` |
+
+## M7-HARD — leak/repeat, differential/fuzz/bench, CI/nightly (`boa_fapi`, `boa_fapi_wpt`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-HARD-01 | leak/repeat tests and no late JS settlement | `crates/boa_fapi/tests/hardening_hooks.rs` — `leak_repeat` (8× create/revoke/shutdown cycles, counts to zero, fresh contexts isolated) | `hardening_hooks::leak_repeat` |
+| M7-HARD-02 | bounded differential/fuzz/bench hooks | `hardening_hooks.rs` — `differential_smoke` (Node when present else skip-with-reason), `fuzz_decode_bounded` (fixed seed, 64 KiB cap, 512 cases), `bench_smoke` (clone/resolve medians, informational) | `hardening_hooks::differential_smoke`, `::fuzz_decode_bounded`, `::bench_smoke` |
+| M7-HARD-03 | CI matrix, SBOM artifact and scheduled nightly checks | `.github/workflows/ci.yml` (M7 steps + SBOM artifact), `.github/workflows/nightly.yml` (scheduled fuzz/miri-shape runs, visible failures) | CI Ubuntu + Windows strict run; nightly schedule |
+
+## M7-DOC — documentation
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-DOC-01 | WPT/spec-delta/README/changelog documentation | `docs/wpt.md`, `docs/spec-delta.md`, `README.md` (M7 scope), `CHANGELOG.md`, `QUESTIONS.md` (supply decision), `docs/DECISIONS.md` (ADR-0033 harness deps) | `cargo doc --workspace --no-deps` (`-Dwarnings`); reproduced strict run from docs alone |
