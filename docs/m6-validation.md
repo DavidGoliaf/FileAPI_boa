@@ -9,7 +9,7 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 |---|---|---|---|
 | 1 | `cargo fmt --all -- --check` | 0 | PASS |
 | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 | PASS |
-| 3 | `cargo test --workspace --all-features` | 0 | PASS (42 boa_fapi unit, 13 guards, 51 M2, 28 M3-B, 16 M3-A, 33 M4-A, 21 M4-B, 15 M5-JS, 9 M6-URL-JS, 5 M6-clone-JS, 58+11+25+8+20+16+19 core incl. 11 M6-core, 9 fs, 1 doc) |
+| 3 | `cargo test --workspace --all-features` | 0 | PASS (42 boa_fapi unit, 13 guards, 51 M2, 28 M3-B, 16 M3-A, 33 M4-A, 21 M4-B, 15 M5-JS, 10 M6-URL-JS, 5 M6-clone-JS, 58+12+25+8+20+16+19 core incl. 12 M6-core, 9 fs, 1 doc) |
 | 4 | `cargo test --package boa_fapi_fs --all-features -- --nocapture` | 0 | PASS (9 on Windows; Unix live tests `#[cfg(unix)]`, run in Linux CI) |
 | 5 | `cargo test --package boa_fapi --test m2_blob_file_filelist -- --nocapture` | 0 | PASS (51) |
 | 6 | `cargo test --package boa_fapi --test m3_promise_blob_reads -- --nocapture` | 0 | PASS (16) |
@@ -17,8 +17,8 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 | 8 | `cargo test --package boa_fapi --test m4_filereader_async -- --nocapture` | 0 | PASS (33) |
 | 9 | `cargo test --package boa_fapi --test m4_filereader_sync -- --nocapture` | 0 | PASS (21) |
 | 10 | `cargo test --package boa_fapi --test m5_file_fs -- --nocapture` | 0 | PASS (15 on Windows; Unix live tests `#[cfg(unix)]`, run in Linux CI) |
-| 11 | `cargo test --package boa_fapi_core --test blob_url -- --nocapture` | 0 | PASS (11: 7 URL + 4 clone) |
-| 12 | `cargo test --package boa_fapi --test m6_blob_url -- --nocapture` | 0 | PASS (9) |
+| 11 | `cargo test --package boa_fapi_core --test blob_url -- --nocapture` | 0 | PASS (12: 8 URL + 4 clone) |
+| 12 | `cargo test --package boa_fapi --test m6_blob_url -- --nocapture` | 0 | PASS (10) |
 | 13 | `cargo test --package boa_fapi --test m6_structured_clone -- --nocapture` | 0 | PASS (5; Unix fs-safety test `#[cfg(unix)]`, runs in Linux CI) |
 | 14 | `cargo test --workspace --no-default-features` | — | MIXED (pre-existing M5 baseline behavior: unit suites requiring shims fail with `StreamsShimDisabled`/`DomShimDisabled` without default features — verified identical on the M5 base via `git stash`; all feature-gated integration suites compile and run) |
 | 15 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (17/17 incl. `fs`/`url-shim`/`structured-clone` on/off) |
@@ -49,6 +49,8 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 
 - `url_descriptor_debug_redacts_partition`, `url_failures_share_one_opaque_class`, `same_origin_partitions_isolate` (partition + nonce, foreign === missing).
 - `url_revoke_keeps_live_reads_and_clear_releases` + `url_shutdown_lifetime` (revoke keeps handed-out `Arc`; `clear()` at shutdown releases all strong refs; repeated shutdown idempotent; no late jobs).
+- `url_revoke_is_ownership_blind` + `create_revoke_semantics` (specified `revokeObjectURL` semantics: silent, ownership-blind, never an oracle).
+- `zero_entropy_fails_without_minting` (entropy failure → opaque error, zero UUID never minted, no store write).
 - `clone_filesystem_safety_unix` (cfg unix): changed source → `SourceFailed`, no partial payload, no path/capability in the error.
 - Guards: `no_out_of_scope_surface` (bounded URL methods only in `url_shim.rs`/`extension.rs`, no `structuredClone` global, no `MediaSource`/`boa-idb`), `public_api_exposes_no_paths_or_mutable_bytes` (no `boa-idb` dep in any manifest, no `use boa_idb`).
 

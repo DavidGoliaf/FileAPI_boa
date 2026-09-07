@@ -397,6 +397,13 @@ fn decode_payload(input: &[u8]) -> Result<FileApiClonePayload, CloneError> {
             if count > MAX_CLONE_FILES {
                 return Err(CloneError::LimitExceeded);
             }
+            // Pre-size the output without trusting the declared count for
+            // allocation: one entry is at least 20 bytes on the wire
+            // (three empty length frames + timestamp), so more entries
+            // than remaining bytes can hold is truncated input.
+            if count > cursor.remaining().saturating_add(19) / 20 {
+                return Err(CloneError::Malformed);
+            }
             let mut files = Vec::new();
             for _ in 0..count {
                 files.push(decode_file_body(&mut cursor)?);

@@ -93,9 +93,11 @@ fn create_object_url(this: &JsValue, args: &[JsValue], context: &mut Context) ->
 
 /// `URL.revokeObjectURL(url)`: idempotent, oracle-free, always `undefined`.
 ///
-/// Malformed URLs, unknown URLs and URLs owned by another partition are
-/// silent no-ops: revoke can never reveal whether an entry exists. Like
-/// creation, this never enqueues a Boa job.
+/// Ownership-blind by specified `revokeObjectURL` semantics: any
+/// well-formed URL removes its entry regardless of who asks (revoke is
+/// not a gated read). Malformed input and unknown URLs are silent
+/// no-ops. Either way nothing is reported, so revoke can never reveal
+/// whether an entry exists. Like creation, this never enqueues a Boa job.
 fn revoke_object_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     require_url(this)?;
     let specs = crate::extension::snapshot(context)?;
@@ -173,8 +175,10 @@ pub(crate) fn map_url_error(error: &BlobUrlError) -> boa_engine::JsError {
 /// Serializes and inserts a store URL for `data` under `owner`.
 ///
 /// Retries a bounded number of times on UUID collision with fresh entropy
-/// per attempt; the live entry is never overwritten. Quota and shape
-/// failures surface without partial state.
+/// per attempt; the live entry is never overwritten. The all-zero block
+/// is the entropy-failure sentinel (see `UrlEntropySource`) and maps to
+/// `EntropyUnavailable` before any store write. Quota and shape failures
+/// surface without partial state.
 pub(crate) fn insert_url(
     store: &SharedUrlStore,
     origin: &str,
@@ -184,7 +188,11 @@ pub(crate) fn insert_url(
     cap: usize,
 ) -> Result<String, BlobUrlError> {
     for _ in 0..8 {
-        let uuid = format_uuid_v4(entropy.fill_16());
+        let raw = entropy.fill_16();
+        if raw == [0_u8; 16] {
+            return Err(BlobUrlError::EntropyUnavailable);
+        }
+        let uuid = format_uuid_v4(raw);
         let url = format_blob_url(origin, &uuid);
         match store.insert_capped(url.clone(), owner.clone(), Arc::clone(data), cap) {
             Ok(()) => return Ok(url),

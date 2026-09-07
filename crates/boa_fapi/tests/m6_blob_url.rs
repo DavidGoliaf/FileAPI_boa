@@ -136,6 +136,30 @@ fn stuck_entropy_collides_without_overwrite() {
     assert_eval(&mut context, "typeof globalThis.first === 'string'");
 }
 
+/// M6-URL-01: an entropy failure (all-zero sentinel) is the opaque
+/// network-error equivalent — never a minted zero UUID.
+#[test]
+fn zero_entropy_fails_without_minting() {
+    /// Failing source: always the reserved all-zero block.
+    #[derive(Debug)]
+    struct FailingEntropy;
+    impl UrlEntropySource for FailingEntropy {
+        fn fill_16(&self) -> [u8; 16] {
+            [0; 16]
+        }
+    }
+    let (mut context, handle) =
+        setup_with_entropy(Arc::new(FailingEntropy), FileApiEnvironment::Window);
+    assert_eval_type_error(&mut context, "URL.createObjectURL(new Blob(['x']))");
+    assert_eq!(handle.url_store().len(), 0);
+    // The zero UUID was never minted: the store has no such entry.
+    assert!(
+        handle
+            .resolve_blob_url("blob:https://localhost/00000000-0000-4000-8000-000000000000")
+            .is_err()
+    );
+}
+
 /// M6-URL-02: two partitions with the same origin isolate entries; the
 /// foreign lookup is indistinguishable from a missing URL.
 #[test]
@@ -213,6 +237,12 @@ fn create_revoke_semantics() {
     );
     let url = eval_string(&mut context, "globalThis.u1");
     assert!(handle.resolve_blob_url(&url).is_err());
+    // `revokeObjectURL` on a foreign-partition URL is a silent no-op that
+    // reports nothing (ownership-blind revoke, never an oracle).
+    assert_eval(
+        &mut context,
+        "URL.revokeObjectURL(globalThis.u2) === undefined && typeof globalThis.u2 === 'string'",
+    );
     // Host-created entries revoke through the handle with the same result.
     let blob = handle
         .blob_from_bytes(

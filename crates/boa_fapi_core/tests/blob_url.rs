@@ -89,6 +89,10 @@ fn url_format_and_parse_round_trip() {
         "blob:origin/not-a-uuid",
         "blob:origin/00000000-0000-0000-0000-000000000000",
         "blob:origin/00000000-0000-1000-0000-000000000000",
+        // Same origin-shape rule as descriptors: whitespace, controls,
+        // non-ASCII and over-long origins never parse.
+        "blob:bad origin/00000000-0000-4000-8000-000000000000",
+        "blob:bad\norigin/00000000-0000-4000-8000-000000000000",
     ] {
         assert_eq!(
             parse_blob_url(bad),
@@ -203,7 +207,6 @@ fn url_partition_and_nonce_isolation() {
         Err(BlobUrlError::Unavailable)
     );
 }
-
 /// M6-URL-02: the descriptor debug rendering redacts partition and nonce.
 #[test]
 fn url_descriptor_debug_redacts_partition() {
@@ -213,6 +216,35 @@ fn url_descriptor_debug_redacts_partition() {
     );
     assert!(!text.contains("123"));
     assert!(!text.contains("456"));
+}
+
+/// M6-URL-02: revoke is ownership-blind (specified `revokeObjectURL`
+/// semantics): any well-formed URL removes its entry regardless of who
+/// asks; malformed input is a silent no-op. Nothing is reported either
+/// way, so revoke is never an enumeration oracle.
+#[test]
+fn url_revoke_is_ownership_blind() {
+    let store = BlobUrlStore::new();
+    let owner = descriptor(EnvironmentKind::Window, "https://a.test", 1, 1).key();
+    let foreign = descriptor(EnvironmentKind::Window, "https://a.test", 2, 2).key();
+    let data = memory_blob(b"blind", "");
+    let url = format_blob_url("https://a.test", &format_uuid_v4([21; 16]));
+    store
+        .insert_capped(url.clone(), owner.clone(), Arc::clone(&data), 10)
+        .expect("insert");
+    // Revoking without owning still removes the entry (no oracle either
+    // way: both calls are silent).
+    store.revoke(&url);
+    assert_eq!(
+        resolve_err(&store, &url, &owner),
+        Err(BlobUrlError::Unavailable)
+    );
+    store
+        .insert_capped(url.clone(), owner.clone(), data, 10)
+        .expect("reinsert");
+    let _ = &foreign;
+    store.revoke("blob:not-a-url");
+    assert!(store.resolve(&url, &owner).is_ok());
 }
 
 /// M6-URL-04: the quota check and the insert are atomic; cap 0 always
@@ -397,6 +429,16 @@ fn clone_decode_rejects_bad_input() {
     assert_eq!(
         boa_fapi_core::clone::serialized_blob(Bytes::from(vec![0; MAX_CLONE_BYTES + 1]), ""),
         Err(CloneError::LimitExceeded)
+    );
+    // A declared 100k-file list on a 16-byte input claims more entries
+    // than the wire can hold: truncated, never pre-allocated.
+    let mut many = b"FCL1".to_vec();
+    many.extend_from_slice(&1_u32.to_le_bytes());
+    many.extend_from_slice(&boa_fapi_core::clone::SCF_FILE_LIST_TAG.to_le_bytes());
+    many.extend_from_slice(&100_000_u32.to_le_bytes());
+    assert_eq!(
+        FileApiClonePayload::decode(&many),
+        Err(CloneError::Malformed)
     );
 }
 

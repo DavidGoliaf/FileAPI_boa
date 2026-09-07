@@ -329,9 +329,12 @@ impl BlobUrlStore {
     /// Revokes `url` idempotently.
     ///
     /// Removing the entry only stops *new* resolutions: reads that already
-    /// hold the `Arc<BlobData>` continue to completion. Malformed URLs and
-    /// URLs owned by another partition are silent no-ops, so revoke can
-    /// never serve as an enumeration oracle. Never fails.
+    /// hold the `Arc<BlobData>` continue to completion. Revoke is
+    /// deliberately ownership-blind: malformed URLs are no-ops, and a
+    /// well-formed URL removes its entry regardless of who asks (matching
+    /// the specified `revokeObjectURL` semantics — revoke is not gated by
+    /// the requester). Revoke therefore can never serve as an enumeration
+    /// oracle: it reports nothing either way. Never fails.
     pub fn revoke(&self, url: &str) {
         if parse_blob_url(url).is_err() {
             return;
@@ -368,6 +371,10 @@ impl BlobUrlStore {
 /// so callers pass raw CSPRNG output; counters, timestamps and predictable
 /// PRNGs are forbidden as the byte source by contract, not by code — the
 /// production entropy source documents its CSPRNG property.
+///
+/// The all-zero block never reaches this function: `insert_url` maps it
+/// to `EntropyUnavailable` first (see `UrlEntropySource`), so a zero UUID
+/// can never be minted from an entropy failure.
 pub fn format_uuid_v4(random: [u8; 16]) -> String {
     let mut b = random;
     b[6] = (b[6] & 0x0F) | 0x40;
@@ -405,17 +412,19 @@ pub struct ParsedBlobUrl<'a> {
 
 /// Parses the store URL shape without resolving anything.
 ///
-/// Requires the `blob:` scheme, a non-empty origin and a strict version-4
-/// UUID token (36 characters, hyphens at 8/13/18/23, `4` version nibble,
-/// `8/9/a/b` variant nibble). Anything else is [`BlobUrlError::Malformed`].
-/// A well-shaped but unknown URL still needs a store lookup, which reports
+/// Requires the `blob:` scheme, a non-empty validated origin and a strict
+/// version-4 UUID token (36 characters, hyphens at 8/13/18/23, `4`
+/// version nibble, `8/9/a/b` variant nibble). The origin half is checked
+/// with the same shape rule as descriptors (non-empty, bounded,
+/// printable ASCII, no whitespace), so a stored URL can never smuggle
+/// whitespace, controls, non-ASCII or an over-long origin past the
+/// parser. Anything else is [`BlobUrlError::Malformed`]. A well-shaped
+/// but unknown URL still needs a store lookup, which reports
 /// [`BlobUrlError::Unavailable`] — never a distinct "not found" oracle.
 pub fn parse_blob_url(url: &str) -> Result<ParsedBlobUrl<'_>, BlobUrlError> {
     let rest = url.strip_prefix("blob:").ok_or(BlobUrlError::Malformed)?;
     let (origin, uuid) = rest.rsplit_once('/').ok_or(BlobUrlError::Malformed)?;
-    if origin.is_empty() || origin.len() > EnvironmentDescriptor::MAX_ORIGIN_LEN {
-        return Err(BlobUrlError::Malformed);
-    }
+    validate_origin(origin)?;
     if !is_uuid_v4(uuid) {
         return Err(BlobUrlError::Malformed);
     }

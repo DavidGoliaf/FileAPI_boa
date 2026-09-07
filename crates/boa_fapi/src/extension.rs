@@ -40,7 +40,10 @@ pub(crate) type SharedUrlStore = Arc<BlobUrlStore>;
 /// The production default draws from the operating system through
 /// `getrandom` (documented in the crate ADR); tests inject a deterministic
 /// sequence. Counters, timestamps and predictable PRNGs are forbidden as
-/// implementations by contract.
+/// implementations by contract. The all-zero block is reserved as the
+/// failure sentinel: `insert_url` maps it to `EntropyUnavailable` without
+/// leaking platform detail, so it never escapes as a UUID (a legitimate
+/// all-zero draw, probability 2^-128, is safely retried as a failure).
 pub trait UrlEntropySource: Send + Sync + 'static {
     /// Fills 16 bytes of cryptographic entropy for one UUID.
     fn fill_16(&self) -> [u8; 16];
@@ -788,7 +791,11 @@ pub(crate) fn create_url_for_specs(
     {
         use boa_fapi_core::blob_url::{format_blob_url, format_uuid_v4};
         for _ in 0..8 {
-            let uuid = format_uuid_v4(specs.config.entropy.fill_16());
+            let raw = specs.config.entropy.fill_16();
+            if raw == [0_u8; 16] {
+                return Err(BlobUrlError::EntropyUnavailable);
+            }
+            let uuid = format_uuid_v4(raw);
             let url = format_blob_url(descriptor.serialized_origin(), &uuid);
             match specs
                 .url_store
@@ -1279,10 +1286,12 @@ impl FileApiHandle {
 
     /// Revokes a Blob URL idempotently.
     ///
-    /// Malformed URLs and URLs owned by another partition are silent
-    /// no-ops, so revoke can never serve as an enumeration oracle. Revoke
-    /// stops new resolutions; reads that already hold the `Arc<BlobData>`
-    /// run to completion.
+    /// Ownership-blind by specified `revokeObjectURL` semantics: any
+    /// well-formed URL removes its entry regardless of who asks (revoke is
+    /// not a gated read), malformed input is a no-op. Either way nothing
+    /// is reported, so revoke can never serve as an enumeration oracle.
+    /// Revoke stops new resolutions; reads that already hold the
+    /// `Arc<BlobData>` run to completion.
     pub fn revoke_blob_url(&self, url: &str) {
         self.specs.url_store.revoke(url);
     }
@@ -1338,7 +1347,9 @@ impl FileApiHandle {
     /// Every element is brand-validated before any output exists; a
     /// non-`File` element fails with no partial list. Order, count and all
     /// `File` metadata survive the round-trip; identity holds only within
-    /// the decoded result.
+    /// the decoded result. The entry count is bounded before materializing
+    /// (a forged `length` larger than the u32 index space or the encode
+    /// ceiling fails without per-element work).
     pub fn clone_file_list(
         &self,
         object: &JsObject,
@@ -1350,6 +1361,13 @@ impl FileApiHandle {
         }
         let value = boa_engine::JsValue::from(object.clone());
         let len = brand::require_file_list(&value).map_err(|_| CloneError::InvalidObject)?;
+        if len > boa_fapi_core::clone::MAX_ENCODE_FILES {
+            return Err(CloneError::LimitExceeded);
+        }
+        // The indexed slots are non-configurable own properties (see
+        // `file_list::create`), so a brand-valid list always yields exactly
+        // `len` elements; a missing slot is a corrupted list, not a short
+        // one — fail rather than emit a partial payload.
         let mut files = Vec::new();
         for index in 0..len {
             let index_u32 = u32::try_from(index).map_err(|_| CloneError::LimitExceeded)?;
@@ -1374,9 +1392,6 @@ impl FileApiHandle {
                 &name,
                 last_modified,
             )?);
-            if files.len() > boa_fapi_core::clone::MAX_ENCODE_FILES {
-                return Err(CloneError::LimitExceeded);
-            }
         }
         Ok(FileApiClonePayload::FileList(files))
     }
@@ -1438,6 +1453,8 @@ impl FileApiHandle {
     /// Only `FileList` payloads are accepted; every decoded `File` is
     /// created through the same checked path as [`Self::file_from_clone`]
     /// before the list object exists, so a failure leaves no partial list.
+    /// A forged oversized `Vec` fails on the entry-count bound before any
+    /// per-file allocation.
     pub fn file_list_from_clone(
         &self,
         payload: &FileApiClonePayload,
@@ -1447,6 +1464,9 @@ impl FileApiHandle {
         let FileApiClonePayload::FileList(files) = payload else {
             return Err(CloneError::UnexpectedKind);
         };
+        if files.len() > boa_fapi_core::clone::MAX_ENCODE_FILES {
+            return Err(CloneError::LimitExceeded);
+        }
         let mut objects = Vec::new();
         for file in files {
             let data =
@@ -1525,10 +1545,9 @@ impl FileApiHandle {
 /// Maps a core materialization failure onto the clone error.
 ///
 /// No separate error mapping is introduced: resource limits become
-/// [`CloneError::LimitExceeded`], cancellation into
-/// [`CloneError::Shutdown`]-adjacent `Cancelled`, everything else into
-/// [`CloneError::SourceFailed`]. Messages stay generic (no path, bytes,
-/// or source detail).
+/// [`CloneError::LimitExceeded`], cancellation into [`CloneError::Shutdown`],
+/// everything else into [`CloneError::SourceFailed`]. Messages stay generic
+/// (no path, bytes, or source detail).
 fn clone_error_from_core(error: boa_fapi_core::file_api_error::FileApiError) -> CloneError {
     use boa_fapi_core::file_api_error::FileApiError;
     match error {
