@@ -184,10 +184,11 @@ updated until no unresolved item remained.
   old test names (`*_with_range_error`, `*_plain_error_*`) renamed to the
   mapped assertions. — PASS.
 - False evidence: validation/audit/handoff state only actual final data
-  (commands + exit codes above; coverage 89.79% lines); `cargo deny
-  check` is BLOCKED (independent run exit 1, advisory-DB fetch failure;
-  the local exit 0 is not claimed as acceptance evidence); CI is
-  `awaiting customer verification`; no TODO/FIXME added. — PASS.
+  (commands + exit codes above; coverage 89.79% lines); local and
+  independent `cargo deny check` attempts are BLOCKED before advisory
+  evaluation by the unavailable RustSec database fetch; final CI is
+  recorded with the verified workflow and OS job links; no TODO/FIXME
+  added. — PASS.
 
 ## G. Findings and fixes (all resolved)
 
@@ -202,8 +203,9 @@ updated until no unresolved item remained.
    `for_label_no_replacement` + manual single UTF-8 BOM strip; label
    tests green.
 5. `cargo deny` rejected `BSD-3-Clause` — fixed by allow-listing it
-   (+ ADR-0020 note); local deny green, acceptance classification
-   BLOCKED (see §F).
+   (+ ADR-0020 note); the current local check is blocked before advisory
+   evaluation by the database fetch, while the final CI workflow is green
+   (see §F).
 6. `cargo hack` powerset failed without `dom-shim` — fixed with
    `cfg`-gated pre-M4 fallbacks in `promise_read.rs`/`streams.rs`;
    powerset green.
@@ -213,10 +215,10 @@ updated until no unresolved item remained.
 
 1. Truthful validation evidence — `docs/m4a-validation.md`,
    `docs/m4a-final-audit.md` (§F, this section), and
-   `docs/reviews/M4A-handoff.md` record `cargo deny check` as BLOCKED
-   with the exact independent-run reason (exit 1, advisory-DB fetch
-   failure); no claim that all commands exited 0, no invented advisory
-   result, CI run, URL, or run ID.
+   `docs/reviews/M4A-handoff.md` record both local `cargo deny check`
+   attempts as BLOCKED with the exact advisory-DB fetch reason; they do not
+   claim a local advisory result, and now record the owner-verified final CI
+   workflow and both OS job links.
 2. README updated — installed M4-A surface, explicit
    `context.run_jobs()` contract with examples, memory-backed-only
    boundary, `dom-shim` capability, and explicitly omitted M4-B

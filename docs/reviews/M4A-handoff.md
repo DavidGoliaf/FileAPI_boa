@@ -66,8 +66,8 @@
   (resolved via `git log`); rework findings R1–R6 are all resolved
   (stale-generation race, extra Clock sample, source-failure coverage,
   real model corpus, README, truthful validation evidence). No
-  production code, tests, or validation results changed after the final
-  green run except this handoff file.
+  production code or tests changed after the final local green run; this
+  handoff now records the owner-verified external CI result.
 
 ## Demo commands (work order §7, in order)
 
@@ -111,15 +111,17 @@ Final audit trace and findings: `docs/m4a-final-audit.md` (§G + §H).
 
 ## CI / acceptance status
 
-`cargo deny check`: BLOCKED — the independent acceptance run exited 1
-because the RustSec advisory database could not be fetched from GitHub;
-the local exit 0 (against the locally available database) is not claimed
-as acceptance evidence. No advisory result, CI run, URL, or run ID is
-claimed anywhere.
+`cargo deny check`: locally BLOCKED — the independent and local attempts
+exited 1 before advisory evaluation because the RustSec advisory database
+could not be fetched from GitHub. No local advisory result is claimed.
 
-`CI: awaiting customer verification` — the customer checks green Windows
-and Ubuntu runs for the final commit before acceptance; no run URL/ID is
-claimed here.
+`CI: PASS` for final commit
+`88fe48725e473f4a6ce62e46fe9e77d78a3e5de2` in run
+[34095967341](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34095967341):
+[Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34095967341/job/101659595262)
+and
+[Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34095967341/job/101659595566)
+both completed successfully.
 
 ## Findings / fixes
 

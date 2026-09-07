@@ -2,7 +2,7 @@
 
 ## Environment
 
-- **Date**: 2026-09-08 (rework revalidation; initial report 2026-09-07)
+- **Date**: 2026-09-07 (rework revalidation and CI evidence update)
 - **Toolchain**: rustc 1.91.0 (edition 2024)
 - **OS**: Windows (win32)
 - **Shell**: PowerShell 7+
@@ -24,7 +24,7 @@
 | 9 | `cargo test --package boa_fapi --doc` | 0 | PASS (1 doc test) |
 | 10 | `cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85` | 0 | PASS (89.79% lines, threshold 85%) |
 | 11 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (all feature combinations, incl. `--no-default-features`) |
-| 12 | `cargo deny check` | 1 independent / 0 local | BLOCKED — the independent acceptance run exited 1 because the RustSec advisory database could not be fetched from GitHub. The local revalidation passes only against the locally available database and is not claimed as acceptance evidence; no advisory result, CI run, URL, or run ID is claimed. |
+| 12 | `cargo deny check` | 1 independent / 1 local | BLOCKED locally — both checks exited 1 before advisory evaluation because cargo-deny attempted to fetch the RustSec advisory database from GitHub and network access was unavailable. The CI workflow performs its documented database fetch and passed on the final commit; no local advisory result is claimed. |
 | 13 | `git diff --check` | 0 | PASS (CRLF warnings only) |
 
 ## Coverage Summary (boa_fapi)
@@ -73,9 +73,10 @@ TOTAL                            5729               761    86.72%         353   
 - `deny.toml` gained `BSD-3-Clause` for `encoding_rs`
   (`(Apache-2.0 OR MIT) AND BSD-3-Clause`); `base64` needs no change
   (MIT OR Apache-2.0).
-- `cargo deny check` is BLOCKED (see row 12): the independent acceptance
-  run exited 1 on the advisory-database fetch; the local exit 0 is not
-  acceptance evidence.
-- CI: `awaiting customer verification` — the owner checks green Windows
-  and Ubuntu runs for the final commit before acceptance; no run URL/ID is
-  claimed here.
+- `cargo deny check` is locally BLOCKED (see row 12) before advisory
+  evaluation because the RustSec database fetch cannot reach GitHub.
+- CI run `34095967341` passed for final commit
+  `88fe48725e473f4a6ce62e46fe9e77d78a3e5de2`:
+  [workflow](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34095967341),
+  [Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34095967341/job/101659595262),
+  [Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34095967341/job/101659595566).
