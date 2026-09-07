@@ -1,6 +1,6 @@
 # M5 validation
 
-Date: 2026-09-07 (rework after R1–R3 review). Branch `task/m5`, base `f5404de6a105c52dc128e686e18d92b376603bd4`.
+Date: 2026-09-07 (rework after R1–R5 review). Branch `task/m5`, base `f5404de6a105c52dc128e686e18d92b376603bd4`.
 Local platform: Windows (weak-identity target — live-handle tests are Unix-only by construction).
 
 ## Commands (all exit 0 unless noted)
@@ -21,10 +21,10 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 | 12 | `cargo test --package boa_fapi --doc` | 0 | PASS (1) |
 | 13 | `cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85` | 0 | PASS (TOTAL 85.29% lines) |
 | 14 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (11/11 incl. `fs` on/off) |
-| 15 | `cargo deny check` | 0 | PASS (advisories ok, bans ok, licenses ok, sources ok; local DB fetch succeeded, network available) |
+| 15 | `cargo deny check` | 1 | BLOCKED (RustSec advisory DB unavailable in this environment; CI completed `cargo deny fetch db` and `cargo deny check` successfully) |
 | 16 | `git diff --check` | 0 | PASS |
 
-## R1–R3 rework evidence
+## R1–R5 rework evidence
 
 - R1 (shutdown drops handles): `fs_tests::close_removes_slot_and_drops_handle`,
   `::close_all_drops_every_handle`, `::shutdown_closers_run_once_outside_lock`
@@ -68,3 +68,7 @@ M2/M3/M4-A/M4-B regression suites green (memory behavior unchanged).
   — **success** on Ubuntu + Windows (full order §9 sequence on the final SHA).
 - Unix-only tests (`#[cfg(unix)]` live-handle/snapshot tests) executed in the
   Ubuntu job; Windows executed the refusal + copy-fallback tests.
+
+The CI evidence above is for the final code commit. The later documentation
+commits do not change production code; the local `cargo deny check` result
+remains `BLOCKED` when the advisory database cannot be fetched.

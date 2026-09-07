@@ -2,7 +2,7 @@
 
 - Base: `f5404de6a105c52dc128e686e18d92b376603bd4` (accepted M4-B final).
 - Branch: `task/m5`.
-- Status: acceptance requested (second submission, after R1–R3 rework).
+- Status: acceptance requested (third submission, after R1–R5 rework).
   No M6 started.
 
 ## What was built
@@ -44,9 +44,9 @@ and lifecycle shutdown (order `M5-FS-FILE-SECURITY`):
   exception documented inline).
 - Docs: `README.md`, `docs/architecture.md`, `docs/security.md` (new),
   `docs/host-integration.md` (new, both host paths),
-  `docs/DECISIONS.md` (ADR-0024–0027, R1–R3 corrections),
-  `docs/spec-matrix.md` (M5-FS-01..10, R1–R3 rows), `docs/m5-validation.md`,
-  `docs/m5-final-audit.md` (R1–R3 section); CI
+  `docs/DECISIONS.md` (ADR-0024–0027, R1–R5 corrections),
+  `docs/spec-matrix.md` (M5-FS-01..10, R1–R5 rows), `docs/m5-validation.md`,
+  `docs/m5-final-audit.md` (R1–R5 sections); CI
   (`.github/workflows/ci.yml`) gains the `boa_fapi_fs` and M5
   host-integration jobs on Ubuntu + Windows.
 
@@ -66,6 +66,16 @@ and lifecycle shutdown (order `M5-FS-FILE-SECURITY`):
   `try_clone` under a short lock; all metadata/byte I/O runs after
   unlock (Unix positional reads on the clone; independent cursor
   elsewhere).
+
+- **R4 — copy fallback leaked handles on failure.** `open_copy_on_import`
+  now wraps `open_copy_inner` with unconditional close, so limit refusal,
+  allocation failure and read failure release the registered handle too.
+  The copy consumes its registration; another copy requires a fresh
+  registration.
+
+- **R5 — the `+1` boundary test previously observed `NotFound`.** The
+  copy-limit tests now re-register a fresh resource, assert the exact
+  `ResourceLimit` error and verify `live_slot_count() == 0` after failure.
 
 ## Omitted (M6+ scope, untouched)
 
@@ -93,8 +103,10 @@ cargo deny check
 git diff --check
 ```
 
-All green locally (see `docs/m5-validation.md` for the exact counts;
-`cargo deny check` exit 0 with network-available advisory DB).
+All code and test commands are green locally; `cargo deny check` is
+currently `BLOCKED` only because this environment cannot fetch the RustSec
+advisory DB. The CI run below completed both `cargo deny fetch db` and
+`cargo deny check` successfully.
 
 ## Deviations
 
@@ -107,7 +119,7 @@ order §3.1-mandated behavior, recorded in ADR-0025.
 
 ## Audit findings
 
-See `docs/m5-final-audit.md` (initial findings + R1–R3 section, all
+See `docs/m5-final-audit.md` (initial findings + R1–R5 sections, all
 fixed and re-validated; no unresolved items).
 
 ## Honest CI status
@@ -117,7 +129,9 @@ fixed and re-validated; no unresolved items).
   — **success** on `ubuntu-latest` and `windows-latest` (full M5 order §9
   sequence, including `boa_fapi_fs` + M5 host-integration jobs).
 
-Local: all commands exit 0 on this branch (`docs/m5-validation.md`).
+Local: all commands except `cargo deny check` exit 0 on this branch;
+the local deny result is recorded as `BLOCKED` in
+`docs/m5-validation.md`.
 Two earlier pushes failed Linux-only clippy lints (`map_io` by-value,
 `Write` import scope, dead helper) that Windows clippy did not flag;
 all three fixed, re-validated locally, and green in CI. The R4–R5 push
