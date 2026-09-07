@@ -105,19 +105,6 @@ fn import_file(
     }
 }
 
-/// Live-handle import helper (Unix-only): bypasses the copy fallback to
-/// exercise `file_from_resource` snapshot validation directly.
-#[cfg(unix)]
-fn import_live(
-    handle: &boa_fapi::FileApiHandle,
-    context: &mut Context,
-    registry: &boa_fapi_fs::FsRegistry,
-    content: &[u8],
-    display: &str,
-) -> (std::path::PathBuf, boa_engine::JsObject) {
-    import_file(handle, context, registry, content, display)
-}
-
 fn publish(context: &mut Context, name: &str, object: boa_engine::JsObject) {
     context
         .register_global_property(
