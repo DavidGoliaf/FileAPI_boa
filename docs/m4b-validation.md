@@ -25,7 +25,7 @@
 | 10 | `cargo test --package boa_fapi --doc` | 0 | PASS (1 doc test) |
 | 11 | `cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 85` | 0 | PASS (89.95% lines, threshold 85%) |
 | 12 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (all feature combinations, incl. `--no-default-features`; no warnings) |
-| 13 | `cargo deny check` | 1 acceptance / 0 local | BLOCKED — the acceptance run exited 1 because the RustSec advisory database was unavailable in that environment. The local revalidation passes only against the locally available database and is not claimed as acceptance evidence; no advisory result is claimed here. The verified CI run below executed `cargo deny fetch db` + `cargo deny check` green on both OS. |
+| 13 | `cargo deny check` | 1 local | BLOCKED — the current local run exited 1 before advisory evaluation because the RustSec advisory database could not be fetched from GitHub. The verified CI run below executed `cargo deny fetch db` + `cargo deny check` green on both OS. |
 | 14 | `git diff --check` | 0 | PASS (CRLF warnings only) |
 
 ## Coverage Summary (boa_fapi)
@@ -61,18 +61,15 @@ TOTAL                            6352               832    86.90%         402   
 - The M4-A async surface is byte-for-byte behavior-preserving under the
   `package.rs` extraction: the full M4-A suite (33 integration + 37
   unit + model corpus) passes unchanged, with zero M4-A test edits.
-- `cargo deny check` records its factual acceptance result (exit 1,
-  BLOCKED, advisory DB unavailable there). The local exit 0 and the
-  green CI deny steps below are supporting evidence only, never a
-  rewrite of the acceptance result.
-- CI (verified via the GitHub API, not invented): run `34100515645`
-  (`CI #10`, push of `51e6eda` on `task/m4b`) completed with conclusion
-  `success` — `M4-B validation (windows-latest)` job `101673651515`
-  green and `M4-B validation (ubuntu-latest)` job `101673651739`
+- `cargo deny check` records its factual local result (exit 1, BLOCKED,
+  advisory DB unavailable). The green CI deny steps are supporting
+  evidence and do not rewrite the local result.
+- CI (verified via the GitHub API, not invented): run `34101779438`
+  (`CI #11`, push of `a17c3d8` on `task/m4b`) completed with conclusion
+  `success` — `M4-B validation (windows-latest)` job `101677622816`
+  green and `M4-B validation (ubuntu-latest)` job `101677622527`
   green, every step green on both OS including `cargo deny fetch db`,
   `cargo deny check`, and `git diff --check`:
-  [run](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645),
-  [Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645/job/101673651515),
-  [Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645/job/101673651739).
-  That run predates the acceptance-blocker fixes in this report; the
-  current tip additionally awaits its own CI verification by the owner.
+  [run](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34101779438),
+  [Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34101779438/job/101677622816),
+  [Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34101779438/job/101677622527).

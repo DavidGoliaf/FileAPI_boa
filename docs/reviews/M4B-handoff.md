@@ -61,9 +61,10 @@ cargo deny check
 git diff --check
 ```
 
-All exit 0 locally (deny included: no new dependencies); recorded in
-`docs/m4b-validation.md` (coverage 89.95% lines). Green CI never
-rewrites these local results. Final audit trace and findings:
+All local commands pass except `cargo deny check`, which exits 1 because
+the advisory database cannot be fetched in this environment; recorded in
+`docs/m4b-validation.md` (coverage 89.95% lines). Green CI never rewrites
+this local result. Final audit trace and findings:
 `docs/m4b-final-audit.md`.
 
 ## Matrix / ADR
@@ -83,18 +84,14 @@ rewrites these local results. Final audit trace and findings:
 
 ## CI
 
-CI (verified via the GitHub API): run `34100515645` (`CI #10`, push of
-`51e6eda` on `task/m4b`) completed with conclusion `success` —
-`M4-B validation (windows-latest)` job `101673651515` green and
-`M4-B validation (ubuntu-latest)` job `101673651739` green, every step
+CI (verified via the GitHub API): run `34101779438` (`CI #11`, push of
+`a17c3d8` on `task/m4b`) completed with conclusion `success` —
+`M4-B validation (windows-latest)` job `101677622816` green and
+`M4-B validation (ubuntu-latest)` job `101677622527` green, every step
 green on both OS:
-[run](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645),
-[Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645/job/101673651515),
-[Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645/job/101673651739).
-That run predates the acceptance-blocker fixes (preflight order,
-`diff --check` hygiene, truthful deny/CI evidence); the current tip
-additionally awaits its own CI verification by the owner before
-acceptance. No other run URL/ID is claimed here.
+[run](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34101779438),
+[Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34101779438/job/101677622816),
+[Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34101779438/job/101677622527).
 
 ## Findings / fixes
 
@@ -111,9 +108,8 @@ the `throwing_label_is_converted_after_brand_and_argument_checks`
 regression test; `docs/spec-matrix.md` M4-B rows rewritten without
 control characters or wrapped lines (`git diff --check` exit 0);
 `docs/DECISIONS.md` trailing blank line removed; `cargo deny check`
-recorded as BLOCKED with the exact acceptance-run reason while the
-verified CI run `34100515645` (success on both OS) is recorded with
-URLs.
+recorded as BLOCKED with the exact local-run reason while the verified CI
+run `34101779438` (success on both OS) is recorded with URLs.
 
 ## Explicitly omitted (separate future orders)
 

@@ -70,14 +70,12 @@ updated until no unresolved item remained.
 
 ## F. Document truthfulness
 
-- Validation table records factual exits (deny: acceptance exit 1,
-  BLOCKED, advisory DB unavailable there; the local exit 0 and the
-  green CI deny steps are supporting evidence only, never a rewrite of
-  the acceptance result); coverage is the measured 89.95% lines; no
-  TODO/FIXME added; no `docs/security.md`, WPT, or filesystem docs
-  created. Verified CI run `34100515645` for `51e6eda` (success, both
-  OS, URLs in `docs/m4b-validation.md`); the current tip additionally
-  awaits its own CI verification — no other run is claimed. — PASS.
+- Validation table records factual exits (local `cargo deny check` exit 1,
+  BLOCKED, advisory DB unavailable; the green CI deny steps are supporting
+  evidence only, never a rewrite of the local result); coverage is the
+  measured 89.95% lines; no TODO/FIXME added; no `docs/security.md`, WPT,
+  or filesystem docs created. Verified CI run `34101779438` for `a17c3d8`
+  (success, both OS, URLs in `docs/m4b-validation.md`). — PASS.
 
 ## G. Findings and fixes (all resolved)
 
@@ -104,7 +102,8 @@ updated until no unresolved item remained.
    `docs/spec-matrix.md` M4-B rows carried wrapped lines and control
    characters — rewritten cleanly (`git diff --check` exit 0);
    `docs/DECISIONS.md` trailing blank line removed; deny recorded as
-   BLOCKED with the exact acceptance reason while verified CI run
-   `34100515645` is recorded with URLs; counts updated to 352/21.
+   BLOCKED with the exact local-run reason while verified CI run
+   `34101779438` for the fixed tip is recorded with URLs; counts updated
+   to 352/21.
 
 No unresolved items remain.
