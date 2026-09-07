@@ -218,6 +218,34 @@ fn url_descriptor_debug_redacts_partition() {
     assert!(!text.contains("456"));
 }
 
+/// M6-URL-02 (R4): the key debug rendering redacts partition and nonce as
+/// well — host identity values never appear in debug output, tracing or
+/// test assertions. No URL/error string carries them either.
+#[test]
+fn url_key_debug_redacts_partition_and_nonce() {
+    let descriptor = descriptor(EnvironmentKind::Window, "https://a.test", 789, 101112);
+    let text = format!("{:?}", descriptor.key());
+    assert!(
+        text.contains("https://a.test"),
+        "origin stays visible: {text}"
+    );
+    assert!(!text.contains("789"), "partition leaked: {text}");
+    assert!(!text.contains("101112"), "nonce leaked: {text}");
+    for secret in [
+        "partition",
+        "nonce",
+        "token",
+        "capability",
+        "handle",
+        "path",
+    ] {
+        if secret == "partition" || secret == "nonce" {
+            continue;
+        }
+        assert!(!text.contains(secret), "leak in {text}");
+    }
+}
+
 /// M6-URL-02: revoke is ownership-blind (specified `revokeObjectURL`
 /// semantics): any well-formed URL removes its entry regardless of who
 /// asks; malformed input is a silent no-op. Nothing is reported either
@@ -364,6 +392,76 @@ fn clone_round_trips_preserve_bytes_and_metadata() {
         let decoded = FileApiClonePayload::decode(&bytes).expect("decode");
         assert_eq!(decoded, payload);
     }
+}
+
+/// M6-CLONE-04 (R3): encode bounds are symmetric with decode — direct
+/// public-field construction faces the same ceilings, including the Blob
+/// media-type string bound. Boundary: exactly `MAX` accepted, `MAX + 1`
+/// rejected, for every variant.
+#[test]
+fn clone_encode_bounds_are_symmetric() {
+    use boa_fapi_core::clone::MAX_CLONE_STRING_BYTES;
+    let max = "t".repeat(MAX_CLONE_STRING_BYTES);
+    let over = "t".repeat(MAX_CLONE_STRING_BYTES + 1);
+    // Positive boundary: max-size strings encode and decode back.
+    for payload in [
+        FileApiClonePayload::Blob(SerializedBlob {
+            bytes: Bytes::from_static(b"x"),
+            media_type: max.clone(),
+        }),
+        FileApiClonePayload::File(SerializedFile {
+            bytes: Bytes::from_static(b"x"),
+            media_type: max.clone(),
+            name: max.clone(),
+            last_modified: 0,
+        }),
+    ] {
+        let bytes = payload.encode().expect("max boundary must encode");
+        assert_eq!(FileApiClonePayload::decode(&bytes), Ok(payload));
+    }
+    // Negative boundary: `MAX + 1` rejected without partial output —
+    // including direct `SerializedBlob` construction (the R3 asymmetry).
+    assert_eq!(
+        FileApiClonePayload::Blob(SerializedBlob {
+            bytes: Bytes::from_static(b"x"),
+            media_type: over.clone(),
+        })
+        .encode(),
+        Err(CloneError::LimitExceeded)
+    );
+    assert_eq!(
+        boa_fapi_core::clone::serialized_blob(Bytes::from_static(b"x"), &over),
+        Err(CloneError::LimitExceeded)
+    );
+    assert_eq!(
+        FileApiClonePayload::File(SerializedFile {
+            bytes: Bytes::from_static(b"x"),
+            media_type: over.clone(),
+            name: String::new(),
+            last_modified: 0,
+        })
+        .encode(),
+        Err(CloneError::LimitExceeded)
+    );
+    assert_eq!(
+        FileApiClonePayload::File(SerializedFile {
+            bytes: Bytes::from_static(b"x"),
+            media_type: String::new(),
+            name: over.clone(),
+            last_modified: 0,
+        })
+        .encode(),
+        Err(CloneError::LimitExceeded)
+    );
+    // Direct oversized-bytes construction is rejected by `encode` too.
+    assert_eq!(
+        FileApiClonePayload::Blob(SerializedBlob {
+            bytes: Bytes::from(vec![0; MAX_CLONE_BYTES + 1]),
+            media_type: String::new(),
+        })
+        .encode(),
+        Err(CloneError::LimitExceeded)
+    );
 }
 
 /// M6-CLONE-04: malformed, truncated, overflowing and unknown-version

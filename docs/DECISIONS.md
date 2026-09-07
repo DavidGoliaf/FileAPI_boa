@@ -540,7 +540,9 @@ partition, nonce }` (Boa-free, `boa_fapi_core::blob_url`) + сравнимый
 дефолты `Window`/`"https://localhost"`/`0`/`0`); никакого вывода из
 потока/контекста нет. `serialized_origin` — единственное, что попадает в
 URL (`blob:<origin>/<uuid>`); partition и nonce не сериализуются и
-отредактированы даже из `Debug`. Opaque origin — фиксированная строка
+отредактированы из обоих `Debug` (`EnvironmentDescriptor` и
+`EnvironmentKey` — ручные redacted-impl; регрессия
+`url_key_debug_redacts_partition_and_nonce`). Opaque origin — фиксированная строка
 `"null"`, но ключ несёт host-supplied `nonce`, поэтому два opaque global
 никогда не делят ключ при общем `blob:null/`-префиксе. Resolve требует
 равенства полного ключа (одного origin недостаточно). Маппинг целевой
@@ -599,12 +601,16 @@ Fetch-регистрации в `boa-fapi`.
 Решение: `BlobUrlStore` (core, Boa-free: `Mutex<HashMap<String, Entry>>`
 + `AtomicU64 seq`, амортизированный O(1); мьютекс держится только на
 map-операцию, никогда через I/O/JS) живёт per-context
-(`Arc<BlobUrlStore>` в `RegisteredSpecs` и в `FileApiHandle`): два
-контекста никогда не делят store/shutdown. Entry — `Arc<BlobData>` +
+(`Arc<BlobUrlStore>` в `RegisteredSpecs`; хэндл его не возвращает —
+только count-only `blob_url_count()`/`blob_urls_empty()`; guard запрещает
+`pub fn url_store`/`environment_key` и store/key в любой `pub fn`
+сигнатуре/`pub use`): два контекста никогда не делят store/shutdown. Entry — `Arc<BlobData>` +
 `EnvironmentKey` owner + `seq`. Shutdown трекает closer
 `store.clear()` во флаге (как fs-closers): все сильные ссылки падают в
 момент shutdown, повторный shutdown — no-op, новых JS callbacks нет.
-`revoke` — idempotentный silent no-op для malformed/foreign (не oracle);
+`revoke` — после M6-rework R2: required-arg + центральный `webidl::dom_string`
+(missing arg — `TypeError` до store, abrupt конверсия propagates), затем
+idempotentный silent no-op для malformed/unknown/revoked/foreign (не oracle);
 уже выданный `Arc` читается до конца (`materialize` после revoke доказан
 тестом). `ResolvedBlob` — только `Arc<BlobData>` + `media_type`/`size`
 (нет path/capability/handle/partition key/URL token). Resolver —
@@ -666,7 +672,11 @@ IDB-формат не внедряется. Body — le-длины + байты 
 `MAX_CLONE_FILES` (100k): malformed/truncated/overflow/unknown-version/
 unknown-tag/трейлинг — `CloneError::{Malformed, UnsupportedVersion,
 LimitExceeded}` без panic и без partial output (same-version fixture в
-core-тестах). Encode — из уже материализованных bytes через
+core-тестах). После M6-rework R3 границы симметричны: `serialized_blob`
+тоже проверяет string ceiling, а `encode()` прогоняет публичные поля
+через `validate_payload` (bytes/strings/count/total, checked) до
+первого байта — прямые конструкции без хелперов видят те же границы,
+что и decode; принятое всегда декодируется текущим декодером. Encode — из уже материализованных bytes через
 существующий checked path (`max_materialize_bytes`;
 snapshot/permission/short-read — `SourceFailed` без partial payload);
 `File` хранит sanitized `name` (`/` → `:` идемпотентно при decode) и

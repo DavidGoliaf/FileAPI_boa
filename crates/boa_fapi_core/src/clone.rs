@@ -153,9 +153,14 @@ pub enum CloneError {
 ///
 /// Normalizes the media type with the M1 MIME rules; returns
 /// [`CloneError::LimitExceeded`] when `bytes` exceeds
-/// [`MAX_CLONE_BYTES`].
+/// [`MAX_CLONE_BYTES`] or the media type exceeds
+/// [`MAX_CLONE_STRING_BYTES`] (symmetric with the decode bound and with
+/// [`serialized_file`]).
 pub fn serialized_blob(bytes: Bytes, media_type: &str) -> Result<SerializedBlob, CloneError> {
     if bytes.len() > MAX_CLONE_BYTES {
+        return Err(CloneError::LimitExceeded);
+    }
+    if media_type.len() > MAX_CLONE_STRING_BYTES {
         return Err(CloneError::LimitExceeded);
     }
     Ok(SerializedBlob {
@@ -192,6 +197,10 @@ pub fn serialized_file(
 }
 
 fn encode_payload(payload: &FileApiClonePayload) -> Result<Vec<u8>, CloneError> {
+    // Symmetric with decode: validate the public fields before emitting a
+    // single byte, so directly constructed payloads (built without the
+    // `serialized_*` helpers) face the same ceilings the decoder enforces.
+    validate_payload(payload)?;
     match payload {
         FileApiClonePayload::Blob(blob) => {
             let mut out = Vec::new();
@@ -206,20 +215,6 @@ fn encode_payload(payload: &FileApiClonePayload) -> Result<Vec<u8>, CloneError> 
             Ok(out)
         }
         FileApiClonePayload::FileList(files) => {
-            if files.len() > MAX_ENCODE_FILES {
-                return Err(CloneError::LimitExceeded);
-            }
-            // Bound the total before allocating: 16 bytes of framing per
-            // file plus every file's own checked total.
-            let mut total = 12_usize;
-            for file in files {
-                total = total
-                    .checked_add(file_body_len(file)?)
-                    .ok_or(CloneError::LimitExceeded)?;
-                if total > MAX_CLONE_BYTES {
-                    return Err(CloneError::LimitExceeded);
-                }
-            }
             let mut out = Vec::new();
             push_header(&mut out, SCF_FILE_LIST_TAG)?;
             push_u32(&mut out, files.len() as u32)?;
@@ -229,6 +224,88 @@ fn encode_payload(payload: &FileApiClonePayload) -> Result<Vec<u8>, CloneError> 
             Ok(out)
         }
     }
+}
+
+/// Validates every public payload field against the decode ceilings.
+///
+/// Runs before any byte is emitted: byte lengths, string lengths, the
+/// file count and the total encoded size use checked arithmetic against
+/// `MAX_CLONE_BYTES` / `MAX_CLONE_STRING_BYTES` / `MAX_ENCODE_FILES`.
+/// Accepted values always decode with the current decoder; rejected ones
+/// yield `LimitExceeded` without partial output.
+fn validate_payload(payload: &FileApiClonePayload) -> Result<(), CloneError> {
+    match payload {
+        FileApiClonePayload::Blob(blob) => {
+            validate_bytes_len(blob.bytes.len())?;
+            validate_string_len(&blob.media_type)?;
+            checked_total(12, blob_body_len(&blob.bytes, &blob.media_type)?)?;
+            Ok(())
+        }
+        FileApiClonePayload::File(file) => {
+            validate_file_fields(file)?;
+            checked_total(12, file_body_len(file)?)?;
+            Ok(())
+        }
+        FileApiClonePayload::FileList(files) => {
+            if files.len() > MAX_ENCODE_FILES {
+                return Err(CloneError::LimitExceeded);
+            }
+            let mut total = 12_usize;
+            for file in files {
+                validate_file_fields(file)?;
+                total = total
+                    .checked_add(file_body_len(file)?)
+                    .ok_or(CloneError::LimitExceeded)?;
+                if total > MAX_CLONE_BYTES {
+                    return Err(CloneError::LimitExceeded);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Rejects byte lengths above the payload ceiling.
+fn validate_bytes_len(len: usize) -> Result<(), CloneError> {
+    if len > MAX_CLONE_BYTES {
+        return Err(CloneError::LimitExceeded);
+    }
+    Ok(())
+}
+
+/// Rejects strings above the string ceiling (decode-symmetric).
+fn validate_string_len(text: &str) -> Result<(), CloneError> {
+    if text.len() > MAX_CLONE_STRING_BYTES {
+        return Err(CloneError::LimitExceeded);
+    }
+    Ok(())
+}
+
+/// Validates one file entry's fields (bytes + both strings).
+fn validate_file_fields(file: &SerializedFile) -> Result<(), CloneError> {
+    validate_bytes_len(file.bytes.len())?;
+    validate_string_len(&file.media_type)?;
+    validate_string_len(&file.name)?;
+    Ok(())
+}
+
+/// Checked `base + extra` against the payload ceiling.
+fn checked_total(base: usize, extra: usize) -> Result<usize, CloneError> {
+    let total = base.checked_add(extra).ok_or(CloneError::LimitExceeded)?;
+    if total > MAX_CLONE_BYTES {
+        return Err(CloneError::LimitExceeded);
+    }
+    Ok(total)
+}
+
+/// Checked body length of one blob entry (framing excluded).
+fn blob_body_len(bytes: &[u8], media_type: &str) -> Result<usize, CloneError> {
+    bytes
+        .len()
+        .checked_add(4)
+        .and_then(|total| total.checked_add(media_type.len()))
+        .and_then(|total| total.checked_add(4))
+        .ok_or(CloneError::LimitExceeded)
 }
 
 /// Layout: `b"FCL1"` magic, u32 LE version, u32 LE SCF tag.

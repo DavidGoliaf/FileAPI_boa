@@ -627,13 +627,28 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
     // filesystem location): `file_from_resource` is the only allowed
     // production mention of the resource trait in `extension.rs`. M6 adds
     // the opaque URL/clone entry points (`create_blob_url`,
-    // `resolve_blob_url`, `revoke_blob_url`, `clone_*`, `url_store`) plus
-    // the `UrlEntropySource`/`CloneAdapter` host traits — still no paths,
+    // `resolve_blob_url`, `revoke_blob_url`, `clone_*`,
+    // `blob_url_count`/`blob_urls_empty`) plus the
+    // `UrlEntropySource`/`CloneAdapter` host traits — still no paths,
     // handles, partition keys or `BlobData` internals in the public types.
+    // The live store and the environment key are never returned: no public
+    // method may hand out the store or the key (`SharedUrlStore` itself is
+    // `pub(crate)`-only; checked as a declaration, not a substring, so the
+    // private alias definition does not trip the guard).
     let extension = read(&workspace_root().join("crates/boa_fapi/src/extension.rs"));
     assert!(!extension.contains("pub(crate) struct BlobNative"));
     assert!(!extension.contains("pub struct BlobNative"));
-    for forbidden in ["PathBuf", "std::fs", "std::path", "boa-idb", "boa_idb"] {
+    for forbidden in [
+        "PathBuf",
+        "std::fs",
+        "std::path",
+        "boa-idb",
+        "boa_idb",
+        "pub fn url_store",
+        "pub fn environment_key",
+        "-> EnvironmentKey",
+        "pub type SharedUrlStore",
+    ] {
         let mut hits = 0;
         for line in extension.lines() {
             let trimmed = line.trim();
@@ -646,6 +661,23 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         }
         assert_eq!(hits, 0, "extension.rs must not contain {forbidden}");
     }
+    // The store/key types themselves must never appear in a public
+    // signature. `extension.rs` keeps them `pub(crate)`-internal: assert
+    // no `pub fn` returns them and no `pub use` re-exports them.
+    for line in extension.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("pub fn ") {
+            assert!(
+                !trimmed.contains("SharedUrlStore")
+                    && !trimmed.contains("BlobUrlStore")
+                    && !trimmed.contains("EnvironmentKey"),
+                "no public method may return the store or key: {trimmed}"
+            );
+        }
+    }
     let lib = read(&workspace_root().join("crates/boa_fapi/src/lib.rs"));
     for forbidden in [
         "BlobNative",
@@ -653,12 +685,20 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         "FileListNative",
         "PathBuf",
         "std::fs",
+        "SharedUrlStore",
+        "BlobUrlStore",
+        "EnvironmentKey",
     ] {
         assert!(
             !lib.contains(forbidden),
             "lib.rs public surface must not expose {forbidden}"
         );
     }
+    // The `pub(crate)` store alias itself must never become public.
+    assert!(
+        !extension.contains("pub type SharedUrlStore"),
+        "SharedUrlStore alias must stay pub(crate)"
+    );
     // `boa-idb` must never become a dependency: docs may name it as the
     // explicitly-absent integration, but no manifest and no `use` may.
     for source in ["extension.rs", "lib.rs", "clone_bridge.rs", "url_shim.rs"] {
@@ -697,6 +737,8 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         "resolve_blob_url",
         "revoke_blob_url",
         "clone_blob",
+        "blob_url_count",
+        "blob_urls_empty",
         "UrlEntropySource",
         "CloneAdapter",
     ] {

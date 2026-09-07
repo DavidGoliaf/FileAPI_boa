@@ -1041,19 +1041,21 @@ impl FileApiHandle {
         Ok(())
     }
 
-    /// Returns the context-local Blob URL store.
-    pub fn url_store(&self) -> SharedUrlStore {
-        Arc::clone(&self.specs.url_store)
+    /// Returns `true` when the context-local Blob URL store holds no entry.
+    ///
+    /// Observable-safe replacement for direct store inspection: proves
+    /// shutdown release without exposing the live store, raw insertion or
+    /// environment identity.
+    pub fn blob_urls_empty(&self) -> bool {
+        self.specs.url_store.is_empty()
     }
 
-    /// Returns the environment key of this context for `resolve_blob_url`.
+    /// Returns the number of live Blob URL entries of this context.
     ///
-    /// The key covers origin, storage partition and the per-global nonce;
-    /// it is never serialized into a URL and never exposed to JavaScript.
-    /// Fails only when the registered origin is not a valid serialized
-    /// origin (impossible after successful registration).
-    pub fn environment_key(&self) -> Result<EnvironmentKey, BlobUrlError> {
-        self.specs.environment_descriptor().map(|d| d.key())
+    /// Count only — no entry, key or token is revealed. Intended for host
+    /// diagnostics and tests; it cannot insert, resolve or mutate.
+    pub fn blob_url_count(&self) -> usize {
+        self.specs.url_store.len()
     }
 }
 
@@ -1280,7 +1282,11 @@ impl FileApiHandle {
         &self,
         url: &str,
     ) -> Result<boa_fapi_core::blob_url::ResolvedBlob, BlobUrlError> {
-        let key = self.environment_key()?;
+        let key = self
+            .specs
+            .environment_descriptor()
+            .map(|d| d.key())
+            .map_err(|_| BlobUrlError::Malformed)?;
         self.specs.url_store.resolve(url, &key)
     }
 

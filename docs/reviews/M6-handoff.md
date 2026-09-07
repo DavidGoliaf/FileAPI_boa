@@ -1,8 +1,9 @@
 # M6 Handoff — Blob URL, environment isolation, structured-clone bridge
 
 Branch: `task/m6`, base `e23e0721e885561deda52c211075ed389dfd3cca`.
-Status: implementation complete, local validation green on Windows;
-external CI (Ubuntu + Windows) NOT RUN YET at handoff time.
+Status: `REWORK REQUIRED` — independent review `docs/reviews/M6-rework.md`
+(R1–R4, commit `9e6d47b`) is being worked on this branch; re-submission
+after fixes + full validation + CI on the final commit.
 
 ## Implemented
 

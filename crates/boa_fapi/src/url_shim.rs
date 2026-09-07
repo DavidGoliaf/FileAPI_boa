@@ -91,23 +91,23 @@ fn create_object_url(this: &JsValue, args: &[JsValue], context: &mut Context) ->
     Ok(JsValue::from(js_string!(url.as_str())))
 }
 
-/// `URL.revokeObjectURL(url)`: idempotent, oracle-free, always `undefined`.
+/// `URL.revokeObjectURL(url)`: required DOMString arg, then silent revoke.
 ///
-/// Ownership-blind by specified `revokeObjectURL` semantics: any
-/// well-formed URL removes its entry regardless of who asks (revoke is
-/// not a gated read). Malformed input and unknown URLs are silent
-/// no-ops. Either way nothing is reported, so revoke can never reveal
-/// whether an entry exists. Like creation, this never enqueues a Boa job.
+/// Web IDL order: the missing-argument check runs first (`TypeError`
+/// before any store access — `undefined` is not coerced to a string),
+/// then the central [`crate::webidl::dom_string`] conversion. An abrupt
+/// conversion (a throwing `toString`, a `Symbol`) propagates the original
+/// JS exception. Only after a successful conversion does the specified
+/// silent behavior apply: malformed, unknown, revoked and foreign URLs
+/// return `undefined` without revealing existence. Like creation, this
+/// never enqueues a Boa job.
 fn revoke_object_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     require_url(this)?;
     let specs = crate::extension::snapshot(context)?;
     let Some(first) = args.first() else {
-        return Ok(JsValue::undefined());
+        return Err(type_error("URL.revokeObjectURL requires a URL argument"));
     };
-    let Ok(url) = first.to_string(context) else {
-        return Ok(JsValue::undefined());
-    };
-    let url = url.to_std_string_lossy();
+    let url = crate::webidl::dom_string(first, context)?;
     specs.url_store().revoke(&url);
     Ok(JsValue::undefined())
 }

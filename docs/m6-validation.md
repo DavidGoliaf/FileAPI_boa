@@ -1,4 +1,4 @@
-# M6 validation
+# M6 validation (incl. M6-rework R1–R4)
 
 Date: 2026-09-08. Branch `task/m6`, base `e23e0721e885561deda52c211075ed389dfd3cca`.
 Local platform: Windows (weak-identity target — live-handle tests are Unix-only by construction).
@@ -9,7 +9,7 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 |---|---|---|---|
 | 1 | `cargo fmt --all -- --check` | 0 | PASS |
 | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 | PASS |
-| 3 | `cargo test --workspace --all-features` | 0 | PASS (42 boa_fapi unit, 13 guards, 51 M2, 28 M3-B, 16 M3-A, 33 M4-A, 21 M4-B, 15 M5-JS, 10 M6-URL-JS, 5 M6-clone-JS, 58+12+25+8+20+16+19 core incl. 12 M6-core, 9 fs, 1 doc) |
+| 3 | `cargo test --workspace --all-features` | 0 | PASS (42 boa_fapi unit, 13 guards, 51 M2, 28 M3-B, 16 M3-A, 33 M4-A, 21 M4-B, 15 M5-JS, 11 M6-URL-JS, 6 M6-clone-JS, 58+14+25+8+20+16+19 core incl. 14 M6-core, 9 fs, 1 doc) |
 | 4 | `cargo test --package boa_fapi_fs --all-features -- --nocapture` | 0 | PASS (9 on Windows; Unix live tests `#[cfg(unix)]`, run in Linux CI) |
 | 5 | `cargo test --package boa_fapi --test m2_blob_file_filelist -- --nocapture` | 0 | PASS (51) |
 | 6 | `cargo test --package boa_fapi --test m3_promise_blob_reads -- --nocapture` | 0 | PASS (16) |
@@ -17,9 +17,9 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 | 8 | `cargo test --package boa_fapi --test m4_filereader_async -- --nocapture` | 0 | PASS (33) |
 | 9 | `cargo test --package boa_fapi --test m4_filereader_sync -- --nocapture` | 0 | PASS (21) |
 | 10 | `cargo test --package boa_fapi --test m5_file_fs -- --nocapture` | 0 | PASS (15 on Windows; Unix live tests `#[cfg(unix)]`, run in Linux CI) |
-| 11 | `cargo test --package boa_fapi_core --test blob_url -- --nocapture` | 0 | PASS (12: 8 URL + 4 clone) |
-| 12 | `cargo test --package boa_fapi --test m6_blob_url -- --nocapture` | 0 | PASS (10) |
-| 13 | `cargo test --package boa_fapi --test m6_structured_clone -- --nocapture` | 0 | PASS (5; Unix fs-safety test `#[cfg(unix)]`, runs in Linux CI) |
+| 11 | `cargo test --package boa_fapi_core --test blob_url -- --nocapture` | 0 | PASS (14: 9 URL + 5 clone) |
+| 12 | `cargo test --package boa_fapi --test m6_blob_url -- --nocapture` | 0 | PASS (11) |
+| 13 | `cargo test --package boa_fapi --test m6_structured_clone -- --nocapture` | 0 | PASS (6; Unix fs-safety test `#[cfg(unix)]`, runs in Linux CI) |
 | 14 | `cargo test --workspace --no-default-features` | — | MIXED (pre-existing M5 baseline behavior: unit suites requiring shims fail with `StreamsShimDisabled`/`DomShimDisabled` without default features — verified identical on the M5 base via `git stash`; all feature-gated integration suites compile and run) |
 | 15 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (17/17 incl. `fs`/`url-shim`/`structured-clone` on/off) |
 | 16 | `cargo doc --workspace --no-deps` (`RUSTDOCFLAGS=-Dwarnings`) | 0 | PASS |
@@ -32,7 +32,7 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 
 | Configuration | Result |
 |---|---|
-| `--all-features` | PASS (full workspace incl. 25 M6 tests) |
+| `--all-features` | PASS (full workspace incl. 31 M6 tests) |
 | `--no-default-features` | MIXED, pre-existing: same 15 unit failures as the M5 base (shim-required suites); powerset `cargo hack` green proves every combination compiles |
 | `url-shim = false` (`url_shim(false)`) | PASS (`url_environment_gating` feature-off case: no `URL` global, M1–M5 intact) |
 | `structured-clone = false` | PASS (`clone_feature_off_keeps_m1_m5`: no `structuredClone` global, M1–M5 intact) |
@@ -47,16 +47,24 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 
 ## Leak/shutdown evidence
 
-- `url_descriptor_debug_redacts_partition`, `url_failures_share_one_opaque_class`, `same_origin_partitions_isolate` (partition + nonce, foreign === missing).
-- `url_revoke_keeps_live_reads_and_clear_releases` + `url_shutdown_lifetime` (revoke keeps handed-out `Arc`; `clear()` at shutdown releases all strong refs; repeated shutdown idempotent; no late jobs).
-- `url_revoke_is_ownership_blind` + `create_revoke_semantics` (specified `revokeObjectURL` semantics: silent, ownership-blind, never an oracle).
+- `url_descriptor_debug_redacts_partition`, `url_key_debug_redacts_partition_and_nonce`, `url_failures_share_one_opaque_class`, `same_origin_partitions_isolate` (partition + nonce, foreign === missing; both `Debug` impls redacted).
+- `url_revoke_keeps_live_reads_and_clear_releases` + `url_shutdown_lifetime` (revoke keeps handed-out `Arc`; `clear()` at shutdown releases all strong refs — proved via count-only `blob_url_count`/`blob_urls_empty`, no store escape; repeated shutdown idempotent; no late jobs).
+- `url_revoke_is_ownership_blind` + `create_revoke_semantics` + `revoke_webidl_conversion` (specified `revokeObjectURL` semantics: required-arg `TypeError`, central `dom_string` conversion with abrupt propagation, converted strings revoke silently, never an oracle).
 - `zero_entropy_fails_without_minting` (entropy failure → opaque error, zero UUID never minted, no store write).
 - `clone_filesystem_safety_unix` (cfg unix): changed source → `SourceFailed`, no partial payload, no path/capability in the error.
-- Guards: `no_out_of_scope_surface` (bounded URL methods only in `url_shim.rs`/`extension.rs`, no `structuredClone` global, no `MediaSource`/`boa-idb`), `public_api_exposes_no_paths_or_mutable_bytes` (no `boa-idb` dep in any manifest, no `use boa_idb`).
+- `clone_encode_bounds_are_symmetric` + `clone_host_path_enforces_blob_media_type_bound` (R3: encode bounds symmetric with decode, `MAX` accepted / `MAX + 1` rejected, incl. direct public-field construction and the host path).
+- Guards: `no_out_of_scope_surface` (bounded URL methods only in `url_shim.rs`/`extension.rs`, no `structuredClone` global, no `MediaSource`/`boa-idb`), `public_api_exposes_no_paths_or_mutable_bytes` (no `boa-idb` dep in any manifest, no `use boa_idb`, no store/key escape: no `pub fn url_store`/`environment_key`, no store/key in any `pub fn` signature or `pub use`).
 
 ## Trace rows
 
-See `docs/spec-matrix.md` M6-URL-01..06, M6-CLONE-01..05, M6-REG-01 with exact `file:symbol`, test names, and commands.
+See `docs/spec-matrix.md` M6-URL-01..06, M6-CLONE-01..05, M6-REG-01 and M6-RW-R1..R4 with exact `file:symbol`, test names, and commands.
+
+## Rework R1–R4 (review `docs/reviews/M6-rework.md`, commit under review `9e6d47b`)
+
+- R1 (P1, store escape closed): removed `FileApiHandle::url_store()` and `FileApiHandle::environment_key()`; added count-only `blob_url_count()`/`blob_urls_empty()`; `resolve_blob_url` builds the key internally; `BlobUrlStore::insert_capped` documented as unit-test-only (no handle/adapter forwards to it); creation stays in the single `create_url_for_specs` path (shutdown + ServiceWorker + quota + entropy + retry + owner key together).
+- R2 (P1, revoke Web IDL): missing arg throws `TypeError` before store access; conversion via central `webidl::dom_string`; throwing `toString`/`Symbol` propagate; converted strings revoke silently (`undefined`, no job, no oracle).
+- R3 (P1, symmetric clone bounds): `serialized_blob` enforces `MAX_CLONE_STRING_BYTES`; `encode()` runs `validate_payload` (bytes/strings/count/total, checked) before any byte — direct public-field construction faces decode-identical ceilings; `FCL1`/v1/tags unchanged; `MAX` accepted / `MAX + 1` rejected (core + host path).
+- R4 (P2, key identity): manual redacted `Debug` for `EnvironmentKey` (origin visible; partition/nonce `<redacted>`); `Eq`/`Hash` unchanged; public `environment_key()` removed with R1.
 
 ## Coverage
 

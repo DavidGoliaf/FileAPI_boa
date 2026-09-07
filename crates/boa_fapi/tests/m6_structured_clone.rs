@@ -330,6 +330,28 @@ fn clone_versioned_checked_encoding() {
     );
 }
 
+/// M6-CLONE-04 (R3): the host `clone_blob`/bridge path enforces the same
+/// symmetric string bounds — a Blob whose media type exceeds the ceiling
+/// fails as `LimitExceeded` with no partial payload.
+#[test]
+fn clone_host_path_enforces_blob_media_type_bound() {
+    use boa_fapi_core::clone::MAX_CLONE_STRING_BYTES;
+    let (mut context, handle) = setup_with_bridge(Some(Arc::new(TestBridge {
+        version: CLONE_ENCODING_VERSION,
+    })));
+    let over = "t".repeat(MAX_CLONE_STRING_BYTES + 1);
+    let blob = handle
+        .blob_from_bytes(bytes::Bytes::from_static(b"x"), &over, &mut context)
+        .expect("host blob keeps over-long type as empty");
+    // The M1 MIME rule normalizes over-long non-ASCII to empty, but a
+    // printable-ASCII over-long type survives normalization — and must
+    // then fail the symmetric clone bound, not produce undecodable bytes.
+    let result = handle.clone_blob(&blob);
+    assert_eq!(result, Err(CloneError::LimitExceeded));
+    let direct = boa_fapi_core::clone::serialized_blob(bytes::Bytes::from_static(b"x"), &over);
+    assert_eq!(direct, Err(CloneError::LimitExceeded));
+}
+
 /// M6-CLONE-05: missing bridge and incompatible versions fail atomically;
 /// shutdown cancels pending clone work with no late writes.
 #[test]

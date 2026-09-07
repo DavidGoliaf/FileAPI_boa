@@ -162,11 +162,23 @@ fn validate_origin(origin: &str) -> Result<(), BlobUrlError> {
 /// Never serialized into a URL and never exposed to JavaScript. Equality
 /// covers the serialized origin, the opaque storage partition and the
 /// per-global nonce: one matching origin alone is never sufficient.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// The `Debug` rendering is redacted: partition and nonce are host
+/// identity values and never appear in debug output, tracing or tests.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct EnvironmentKey {
     origin: String,
     partition: u64,
     nonce: u64,
+}
+
+impl std::fmt::Debug for EnvironmentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvironmentKey")
+            .field("origin", &self.origin)
+            .field("partition", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Typed Rust error for Blob URL operations.
@@ -282,6 +294,11 @@ impl BlobUrlStore {
     /// so concurrent creators cannot overshoot `cap`. A taken URL yields
     /// [`BlobUrlError::Collision`] and the live entry is left untouched:
     /// silent overwrites never happen. `cap == 0` always fails.
+    ///
+    /// `pub` for engine-independent unit tests only: it cannot affect a
+    /// `FileApiHandle` store (the bindings crate exposes no handle or
+    /// adapter that forwards to it — creation flows through the single
+    /// internal `create_url_for_specs` path).
     pub fn insert_capped(
         &self,
         url: String,

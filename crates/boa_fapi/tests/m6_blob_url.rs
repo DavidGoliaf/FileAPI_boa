@@ -151,7 +151,7 @@ fn zero_entropy_fails_without_minting() {
     let (mut context, handle) =
         setup_with_entropy(Arc::new(FailingEntropy), FileApiEnvironment::Window);
     assert_eval_type_error(&mut context, "URL.createObjectURL(new Blob(['x']))");
-    assert_eq!(handle.url_store().len(), 0);
+    assert_eq!(handle.blob_url_count(), 0);
     // The zero UUID was never minted: the store has no such entry.
     assert!(
         handle
@@ -232,9 +232,11 @@ fn create_revoke_semantics() {
         "URL.revokeObjectURL(globalThis.u1); \
          URL.revokeObjectURL(globalThis.u1); \
          URL.revokeObjectURL('blob:https://localhost/00000000-0000-4000-8000-000000000000'); \
-         URL.revokeObjectURL('not-a-url'); \
-         URL.revokeObjectURL() === undefined",
+         URL.revokeObjectURL('not-a-url') === undefined",
     );
+    // Required-argument Web IDL behavior: a missing argument throws
+    // `TypeError` before any store access (no `undefined`-as-string).
+    assert_eval_type_error(&mut context, "URL.revokeObjectURL()");
     let url = eval_string(&mut context, "globalThis.u1");
     assert!(handle.resolve_blob_url(&url).is_err());
     // `revokeObjectURL` on a foreign-partition URL is a silent no-op that
@@ -263,6 +265,45 @@ fn create_revoke_semantics() {
         )
         .expect("Arc read after revoke");
     assert_eq!(&bytes[..], b"host");
+}
+
+/// M6-URL-03 (R2): `revokeObjectURL` follows required-argument/DOMString
+/// Web IDL semantics — missing arg and conversion failures throw, abrupt
+/// `toString` propagates, converted strings revoke silently.
+#[test]
+fn revoke_webidl_conversion() {
+    let (mut context, handle) = setup();
+    // Missing argument throws before any store access.
+    assert_eval_type_error(&mut context, "URL.revokeObjectURL()");
+    // `Symbol` cannot convert to DOMString: conversion `TypeError`.
+    assert_eval_type_error(&mut context, "URL.revokeObjectURL(Symbol('u'))");
+    // A throwing `toString` propagates the original exception, not a
+    // silent no-op and not a wrapped `TypeError`.
+    let result = context.eval(Source::from_bytes(
+        "(() => { 'use strict'; return URL.revokeObjectURL({ toString() { throw new RangeError('boom'); } }); })()",
+    ));
+    let error = result.expect_err("throwing toString must propagate");
+    assert!(
+        format!("{error}").contains("RangeError"),
+        "expected RangeError propagation, got: {error}"
+    );
+    // Ordinary valid revoke and repeated revoke stay silent `undefined`.
+    assert_eval(
+        &mut context,
+        "globalThis.u = URL.createObjectURL(new Blob(['r'])); \
+         URL.revokeObjectURL(globalThis.u) === undefined && \
+         URL.revokeObjectURL(globalThis.u) === undefined",
+    );
+    let url = eval_string(&mut context, "globalThis.u");
+    assert!(handle.resolve_blob_url(&url).is_err());
+    // Malformed/unknown converted strings: silent `undefined`, no oracle.
+    assert_eval(
+        &mut context,
+        "URL.revokeObjectURL('not-a-url') === undefined && \
+         URL.revokeObjectURL('blob:https://localhost/00000000-0000-4000-8000-000000000000') === undefined",
+    );
+    // Numeric input converts via DOMString (no throw, silent).
+    assert_eval(&mut context, "URL.revokeObjectURL(42) === undefined");
 }
 
 /// M6-URL-03: the URL surface has exact descriptors and illegal-invocation
@@ -420,10 +461,11 @@ fn url_shutdown_lifetime() {
         "globalThis.u = URL.createObjectURL(new Blob(['doomed']))",
     );
     let url = eval_string(&mut context, "globalThis.u");
-    assert_eq!(handle.url_store().len(), 1);
+    assert_eq!(handle.blob_url_count(), 1);
     handle.shutdown(&mut context).expect("shutdown");
     handle.shutdown(&mut context).expect("repeated shutdown");
-    assert!(handle.url_store().is_empty());
+    assert!(handle.blob_urls_empty());
+    assert_eq!(handle.blob_url_count(), 0);
     assert!(handle.resolve_blob_url(&url).is_err());
     // Late creation fails; late JS creation fails too.
     let blob = eval_string(&mut context, "typeof URL.createObjectURL");
