@@ -22,9 +22,14 @@
 //! M4-A adds the minimal self-contained `dom-shim` (`EventTarget`, `Event`,
 //! `ProgressEvent`, `DOMException`) and the asynchronous `FileReader` for
 //! memory-backed `Blob`/`File`. Every read enqueues FileReading jobs
-//! delivered through the ordinary `Context::run_jobs()` cycle; no
-//! `FileReaderSync`, workers, filesystem sources, blob URLs, clone, or WPT
-//! harness are included.
+//! delivered through the ordinary `Context::run_jobs()` cycle.
+//!
+//! M4-B adds the worker-only synchronous `FileReaderSync` for
+//! memory-backed `Blob`/`File`, selected explicitly with
+//! [`FileApiEnvironment`]. Sync methods run fully on the calling stack
+//! with no jobs or events and package through the same helpers as the
+//! async reader. Filesystem sources, blob URLs, clone, full DOM/Workers
+//! runtime, and the WPT harness are not included.
 //!
 //! The engine-independent data model and algorithms live in `boa_fapi_core`.
 //!
@@ -66,6 +71,10 @@ mod file;
 mod file_list;
 #[cfg(feature = "dom-shim")]
 mod filereader;
+#[cfg(feature = "dom-shim")]
+mod filereader_sync;
+#[cfg(feature = "dom-shim")]
+mod package;
 mod promise_read;
 #[cfg(feature = "streams-shim")]
 mod streams;
@@ -75,4 +84,6 @@ mod tests;
 
 pub use clock::{Clock, SystemClock};
 pub use error::RegisterError;
-pub use extension::{FileApiExtension, FileApiExtensionBuilder, FileApiHandle, HostFileOptions};
+pub use extension::{
+    FileApiEnvironment, FileApiExtension, FileApiExtensionBuilder, FileApiHandle, HostFileOptions,
+};
