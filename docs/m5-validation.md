@@ -51,7 +51,8 @@ M2/M3/M4-A/M4-B regression suites green (memory behavior unchanged).
 
 ## CI
 
-Pushed so GitHub Actions runs Ubuntu + Windows on the final commit SHA; the run
-link and result are recorded in `docs/reviews/M5-handoff.md` after CI finishes.
-Unix-only tests (`#[cfg(unix)]` live-handle/snapshot tests) execute in the
-Ubuntu job; Windows executes the refusal + copy-fallback tests.
+- Final code commit: `11c8675743d37b77c3520fa3d91731afc7fa341d`.
+- CI run: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34125651525
+  — **success** on Ubuntu + Windows (full order §9 sequence on the final SHA).
+- Unix-only tests (`#[cfg(unix)]` live-handle/snapshot tests) executed in the
+  Ubuntu job; Windows executed the refusal + copy-fallback tests.
