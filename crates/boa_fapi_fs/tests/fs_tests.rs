@@ -351,6 +351,7 @@ fn registry_policy_accepts_live_and_rejects_changed() {
         .expect("read");
     // Mutate: the next authorize_read must fail.
     {
+        use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
