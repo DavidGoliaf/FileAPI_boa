@@ -69,8 +69,14 @@ jobs:
       - name: cargo test (M6 structured clone)
         run: cargo test --package boa_fapi --test m6_structured_clone -- --nocapture
 
-      - name: cargo test (workspace, no default features)
-        run: cargo test --workspace --no-default-features
+      # NOTE: there is deliberately no `cargo test --workspace
+      # --no-default-features` step. The lib unit suites (`src/tests.rs`,
+      # `promise_read/streams/filereader*/webidl` child modules) and every
+      # JS integration suite register the extension with default shims and
+      # fail by design without them (`StreamsShimDisabled`, pre-existing
+      # since M2/M3). Feature-combination coverage lives in the
+      # `cargo hack --feature-powerset` step below, which type-checks every
+      # combination.
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps

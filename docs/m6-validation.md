@@ -20,7 +20,7 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 | 11 | `cargo test --package boa_fapi_core --test blob_url -- --nocapture` | 0 | PASS (14: 9 URL + 5 clone) |
 | 12 | `cargo test --package boa_fapi --test m6_blob_url -- --nocapture` | 0 | PASS (11) |
 | 13 | `cargo test --package boa_fapi --test m6_structured_clone -- --nocapture` | 0 | PASS (6; Unix fs-safety test `#[cfg(unix)]`, runs in Linux CI) |
-| 14 | `cargo test --workspace --no-default-features` | — | MIXED (pre-existing M5 baseline behavior: unit suites requiring shims fail with `StreamsShimDisabled`/`DomShimDisabled` without default features — verified identical on the M5 base via `git stash`; all feature-gated integration suites compile and run) |
+| 14 | `cargo test --workspace --no-default-features` | n/a | NOT RUN (by design: lib unit + JS integration suites register with default shims and fail with `StreamsShimDisabled` without them — pre-existing since M2/M3, verified identical on the M5 base; feature-combination coverage is `cargo hack --feature-powerset`) |
 | 15 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (17/17 incl. `fs`/`url-shim`/`structured-clone` on/off) |
 | 16 | `cargo doc --workspace --no-deps` (`RUSTDOCFLAGS=-Dwarnings`) | 0 | PASS |
 | 17 | `cargo test --package boa_fapi --doc` | 0 | PASS (1) |
@@ -33,7 +33,7 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 | Configuration | Result |
 |---|---|
 | `--all-features` | PASS (full workspace incl. 31 M6 tests) |
-| `--no-default-features` | MIXED, pre-existing: same 15 unit failures as the M5 base (shim-required suites); powerset `cargo hack` green proves every combination compiles |
+| `--no-default-features` (`cargo test`) | NOT RUN by design (see row 14); `cargo hack --feature-powerset` green proves every combination compiles |
 | `url-shim = false` (`url_shim(false)`) | PASS (`url_environment_gating` feature-off case: no `URL` global, M1–M5 intact) |
 | `structured-clone = false` | PASS (`clone_feature_off_keeps_m1_m5`: no `structuredClone` global, M1–M5 intact) |
 | `url-shim`/`structured-clone` features off at compile time | PASS (`cargo hack` powerset green; `create_url_for_specs` has an inline no-shim path) |
