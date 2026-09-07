@@ -96,6 +96,25 @@ tests), platform test truthfulness (Unix-only live tests `#[cfg(unix)]`;
  weak-platform tests assert refusal + copy semantics — never a silent
 pass). No unresolved items.
 
+## Post-review fixes R4–R5 (second review round, fixed before final commit)
+
+- **R4 — copy leaked the handle on failure paths.** `open_copy_on_import`
+  closed the slot only on success; `max_bytes` refusal, allocation
+  failure, and read errors returned early with the slot still live until
+  registry destruction. Fix: split into `open_copy_inner` (pure copy
+  logic) + an outer wrapper that unconditionally `close`s the consumed
+  registration on every exit (idempotent, so the success-path close is
+  covered too). Documented consume semantics: one copy per registration.
+- **R5 — the +1 test never exercised the limit.** The second
+  `open_copy_on_import` call reused the already-consumed slot, so it
+  observed `NotFound` instead of `ResourceLimit`. Fix: all three copy
+  boundary tests re-register a fresh slot before the `+1` probe and
+  assert `Err(ResourceLimit(_))` plus `live_slot_count() == 0`
+  afterwards (`copy_bounds_and_content_everywhere`,
+  `copy_on_import_bounds_and_content`,
+  `failed_copy_releases_handle_on_every_path` — the last also pins the
+  R4 release-on-refusal behavior). ✅
+
 ## Traceability
 
 `docs/spec-matrix.md` M5-FS-01..M5-FS-10 (R1–R3 rows updated with the

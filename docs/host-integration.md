@@ -50,8 +50,10 @@ let file = handle
 ```
 
 Windows / other non-Unix targets (no strong identity) — enforced
-`copy_on_import` fallback (immutable memory bytes, live handle closed
-eagerly, no replacement race possible):
+`copy_on_import` fallback (immutable memory bytes; one copy consumes its
+registration, and the live handle closes on every exit — success, limit
+refusal, allocation failure, or read error; re-register for another
+copy):
 
 ```rust,no_run
 use boa_engine::Context;

@@ -285,13 +285,27 @@ fn short_read_never_returns_partial() {
 fn copy_bounds_and_content_everywhere() {
     // `copy_on_import` is the mandated fallback: available on every
     // platform, with == ok / +1 rejected before allocation completes.
+    // Each copy consumes its registration (the live handle closes on every
+    // exit), so every case re-registers a fresh resource: the +1 refusal
+    // must surface `ResourceLimit`, never `NotFound` from a stale slot.
     let registry = FsRegistry::new();
     let (path, resource) = register_bytes(&registry, b"12345678");
     let bytes = boa_fapi_fs::open_copy_on_import(&registry, &resource, 8).expect("copy");
     assert_eq!(&bytes[..], b"12345678");
-    assert!(boa_fapi_fs::open_copy_on_import(&registry, &resource, 7).is_err());
     // The live handle is closed by the copy: no OS handle is retained for
     // a weak-platform copy.
+    assert_eq!(registry.live_slot_count(), 0);
+    // +1 refusal on a fresh registration: proves the limit check, and the
+    // failed copy also releases its handle.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("reopen");
+    let resource2 = registry.register(file).expect("register2");
+    assert!(matches!(
+        boa_fapi_fs::open_copy_on_import(&registry, &resource2, 7),
+        Err(FileApiError::ResourceLimit(_))
+    ));
     assert_eq!(registry.live_slot_count(), 0);
     std::fs::remove_file(&path).ok();
 }
@@ -418,8 +432,46 @@ fn copy_on_import_bounds_and_content() {
     let (path, resource) = register_bytes(&registry, b"copy-me");
     let bytes = boa_fapi_fs::open_copy_on_import(&registry, &resource, 7).expect("copy");
     assert_eq!(&bytes[..], b"copy-me");
-    // == boundary ok, +1 rejected.
-    assert!(boa_fapi_fs::open_copy_on_import(&registry, &resource, 6).is_err());
+    assert_eq!(registry.live_slot_count(), 0);
+    // == boundary ok, +1 rejected as `ResourceLimit` on a fresh slot (each
+    // copy consumes its registration, so re-register first).
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("reopen");
+    let resource2 = registry.register(file).expect("register2");
+    assert!(matches!(
+        boa_fapi_fs::open_copy_on_import(&registry, &resource2, 6),
+        Err(FileApiError::ResourceLimit(_))
+    ));
+    assert_eq!(registry.live_slot_count(), 0);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn failed_copy_releases_handle_on_every_path() {
+    // Limit refusal, allocation failure surface, and read errors must all
+    // release the handle — never retain it until registry destruction.
+    let registry = FsRegistry::new();
+    // 1. Limit refusal (`+1` over budget) on a fresh slot.
+    let (path, resource) = register_bytes(&registry, b"12345678");
+    assert_eq!(registry.live_slot_count(), 1);
+    assert!(matches!(
+        boa_fapi_fs::open_copy_on_import(&registry, &resource, 7),
+        Err(FileApiError::ResourceLimit(_))
+    ));
+    assert_eq!(registry.live_slot_count(), 0);
+    // 2. Same for the exact-fit boundary probed twice: second registration
+    // still behaves identically (no cross-test slot leakage).
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("reopen");
+    let resource2 = registry.register(file).expect("register2");
+    assert_eq!(registry.live_slot_count(), 1);
+    let bytes = boa_fapi_fs::open_copy_on_import(&registry, &resource2, 8).expect("copy");
+    assert_eq!(&bytes[..], b"12345678");
+    assert_eq!(registry.live_slot_count(), 0);
     std::fs::remove_file(&path).ok();
 }
 

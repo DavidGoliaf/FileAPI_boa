@@ -463,8 +463,10 @@ cfg!(unix)`; на всех остальных платформах (Windows вк
 не являются safe-гарантией на зафиксированном тулчейне.
 `open_copy_on_import` — обязательный fallback: доступен везде (через
 `new_for_copy` мимо gate), материализует точечный снимок под
-`max_bytes` и сразу закрывает live handle, так что weak-платформа не
-удерживает OS handle ради копии. `BlobData` вычисляет blob-level
+`max_bytes`, закрывает live handle **на каждом выходе** (успех, отказ по
+лимиту, ошибка аллокации, ошибка чтения — внешняя обёртка безусловно
+`close`ит потреблённую регистрацию поверх `open_copy_inner`);
+одна копия потребляет одну регистрацию (для следующей — перерегистрация). `BlobData` вычисляет blob-level
 snapshot через `snapshot_for_segments` (первый `Filesystem` в порядке
 сегментов; информативен — границей является per-source проверка в
 `read_range`). `FileSource::read_range` и `ArcResourceSource::read_range`:

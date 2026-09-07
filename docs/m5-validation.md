@@ -9,8 +9,8 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 |---|---|---|---|
 | 1 | `cargo fmt --all -- --check` | 0 | PASS |
 | 2 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 | PASS |
-| 3 | `cargo test --workspace --all-features` | 0 | PASS (42 boa_fapi unit, 13 guards, 51 M2, 28 M3-B, 16 M3-A, 33 M4-A, 21 M4-B, 15 M5-JS, 58+25+8+20+16+19 core, 8 fs, 1 doc) |
-| 4 | `cargo test --package boa_fapi_fs --all-features -- --nocapture` | 0 | PASS (8 on Windows: refusal + copy + close/closer + deny tests; Unix live tests `#[cfg(unix)]`, run in Linux CI) |
+| 3 | `cargo test --workspace --all-features` | 0 | PASS (42 boa_fapi unit, 13 guards, 51 M2, 28 M3-B, 16 M3-A, 33 M4-A, 21 M4-B, 15 M5-JS, 58+25+8+20+16+19 core, 9 fs, 1 doc) |
+| 4 | `cargo test --package boa_fapi_fs --all-features -- --nocapture` | 0 | PASS (9 on Windows: refusal + copy (consume semantics, `ResourceLimit` on fresh slot) + close/closer + deny tests; Unix live tests `#[cfg(unix)]`, run in Linux CI) |
 | 5 | `cargo test --package boa_fapi --test m2_blob_file_filelist -- --nocapture` | 0 | PASS (51) |
 | 6 | `cargo test --package boa_fapi --test m3_promise_blob_reads -- --nocapture` | 0 | PASS (16) |
 | 7 | `cargo test --package boa_fapi --test m3_blob_streams -- --nocapture` | 0 | PASS (28) |
@@ -45,9 +45,21 @@ See `docs/spec-matrix.md` M5-FS-01..M5-FS-10 with exact `file:symbol`, test name
 ## Coverage
 
 `cargo llvm-cov --package boa_fapi --all-features` TOTAL 85.29% lines (threshold 85%).
-`boa_fapi_fs` units: 8 tests on Windows (Unix live tests run in Linux CI);
+`boa_fapi_fs` units: 9 tests on Windows (Unix live tests run in Linux CI);
 `boa_fapi` M5-JS integration: 15 tests on Windows (Unix live tests run in Linux CI).
 M2/M3/M4-A/M4-B regression suites green (memory behavior unchanged).
+
+## Post-review fixes R4–R5
+
+- R4 (copy handle lifecycle): `open_copy_on_import` closes the live handle
+  on **every** exit (success, `max_bytes` refusal, allocation failure,
+  read error) via the `open_copy_inner` + unconditional `close` wrapper;
+  each copy consumes its registration (re-register for another copy).
+- R5 (+1 test honesty): `copy_bounds_and_content_everywhere`,
+  `copy_on_import_bounds_and_content`, and
+  `failed_copy_releases_handle_on_every_path` re-register a fresh slot
+  before the `+1` probe and assert `Err(ResourceLimit(_))` plus
+  `live_slot_count() == 0` — the old second-call-`NotFound` shape is gone.
 
 ## CI
 

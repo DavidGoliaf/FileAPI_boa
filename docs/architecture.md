@@ -166,8 +166,10 @@ packaging shared with the async reader:
   registered slot, Unix-only (`PermissionDenied` elsewhere): cancel →
   checked arithmetic → live-vs-import snapshot → policy hook →
   positional read → exact-length check → post-read confirm;
-  `open_copy_on_import` (every platform; closes the live handle eagerly)
-  is the enforced fallback for weak platforms and untrusted JS.
+  `open_copy_on_import` (every platform; closes the consumed registration
+  on success, limit refusal, allocation failure, and read error — one
+  copy per registration) is the enforced fallback for weak platforms and
+  untrusted JS.
 - `boa_fapi_fs::policy` — `DenyRawPathPolicy` (default deny),
   `RegistryPolicy` (live-slot approval + per-read revalidation; refuses
   `authorize_open` off-Unix), `RootConfinedPolicy` (open-handle identity

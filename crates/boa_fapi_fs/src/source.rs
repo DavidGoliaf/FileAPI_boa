@@ -292,7 +292,28 @@ impl FileResource for HostFileSource {
 /// leak old bytes as new reads. Available on every platform. The returned
 /// bytes are the complete resource content bounded by `max_bytes` (`==`
 /// ok, `+1` rejected before allocation completes).
+///
+/// The live handle is closed on **every** exit — success, limit refusal,
+/// allocation failure, or read error — so a failed copy never retains an
+/// OS handle until registry destruction. The copy consumes the
+/// registration: callers needing another copy must re-register.
 pub fn open_copy_on_import(
+    registry: &FsRegistry,
+    resource: &crate::capability::RegisteredResource,
+    max_bytes: u64,
+) -> Result<Bytes, FileApiError> {
+    let id = resource.id();
+    let owned = registry.clone();
+    let result = open_copy_inner(registry, resource, max_bytes);
+    // Always runs, even when the inner copy failed: limit refusal,
+    // allocation failure, and read errors must not leak the handle.
+    // Idempotent (`close` removes the slot), so a double-close is harmless.
+    owned.close(id);
+    result
+}
+
+/// Inner copy logic; the handle lifecycle is owned by [`open_copy_on_import`].
+fn open_copy_inner(
     registry: &FsRegistry,
     resource: &crate::capability::RegisteredResource,
     max_bytes: u64,
@@ -318,9 +339,8 @@ pub fn open_copy_on_import(
         return Err(FileApiError::InvalidRange);
     }
     out.extend_from_slice(&bytes);
-    // The live handle is no longer needed: the immutable copy is the only
-    // thing that escapes. Close eagerly so a weak-platform copy never
-    // retains an OS handle.
-    source.close();
+    // The immutable copy is the only thing that escapes. The live handle
+    // is closed by the outer wrapper on every exit, so no per-path close
+    // is needed here.
     Ok(Bytes::from(out))
 }
