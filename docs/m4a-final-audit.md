@@ -1,10 +1,11 @@
-# M4-A Final Audit (bug-find pass)
+# M4-A Final Audit (bug-find pass + rework re-audit)
 
 Performed after the first complete green local run, before the
-retrospective and commit. Each requirement cites exact `file:symbol`,
-evidence (normal/error/boundary/race), and verdict. Findings were fixed,
-affected validation repeated, and evidence updated until no unresolved
-item remained.
+retrospective and commit, and repeated after the rework fixes in
+`docs/reviews/M4A-rework.md` (findings R1–R6 below). Each requirement
+cites exact `file:symbol`, evidence (normal/error/boundary/race), and
+verdict. Findings were fixed, affected validation repeated, and evidence
+updated until no unresolved item remained.
 
 ## A. `M4-DOM-*` rows
 
@@ -68,30 +69,46 @@ item remained.
   `::multichunk_sequence_has_final_progress_before_load` (final progress
   `loaded=total` precedes `load`),
   `::progress_throttle_uses_injected_clock` (frozen clock → 1
-  intermediate + final; single-chunk slow-chunk exception). Verdict: PASS.
+  intermediate + final; single-chunk slow-chunk exception). One pump uses
+  exactly one clock sample (`finish_at_eof` takes the pump tick; rework
+  finding 4). Verdict: PASS.
 - **M4-FR-07** — `filereader.rs:start_read`, `run_dispatch`.
   Evidence: `::second_read_while_loading_throws_invalid_state`
   (same-realm `InvalidStateError`, first read intact),
   `::reentrant_load_starts_new_read_and_suppresses_old_loadend` (exact
-  8-event log; old `loadend` suppressed, new operation intact).
-  Verdict: PASS.
+  8-event log; old `loadend` suppressed, new operation intact),
+  `::reentrant_error_handler_starts_new_read` (reentrant `error` case),
+  `::abort_handler_restart_after_mid_chunk_abort` (reentrant `abort`
+  case). Verdict: PASS.
 - **M4-FR-08** — `filereader.rs:abort`, generation guards, `QueueHolder`.
   Evidence: `::abort_before_first_job_emits_only_abort_loadend`,
   `::abort_between_chunks_suppresses_stale_events`,
   `::abort_in_empty_or_done_state_is_silent` (EMPTY + DONE),
   `::stale_completion_after_new_operation_is_noop` (abort→new read: stale
   jobs emit nothing, new result intact),
-  `::gc_survives_queued_filereader_jobs` (`force_collect()` before jobs).
+  `::gc_survives_queued_filereader_jobs` (`force_collect()` before jobs),
+  plus `filereader::tests::loadstart_abort_performs_no_source_read`
+  (zero post-abort source reads),
+  `::loadstart_abort_then_restart_emits_only_new_operation`,
+  `::progress_abort_freezes_source_reads` (reads frozen at one chunk).
   Verdict: PASS.
 - **M4-FR-09** — `filereader.rs:fail_operation`, `fail_fast`,
   `release_slot`.
   Evidence: quota test `::concurrent_read_quota_recovers_after_success_error_abort`
   (64 ok, 65th `SecurityError` via normal path, recovery),
-  `::data_url_quota_boundary`. Verdict: PASS.
+  `::data_url_quota_boundary`, plus
+  `filereader::tests::short_source_response_fails_as_not_readable_error`,
+  `::long_source_response_fails_as_not_readable_error`,
+  `::failing_source_fails_as_not_readable_error` (each: DONE, null
+  result, `NotReadableError`, exactly `error` then `loadend`, quota
+  recovery under single-slot limits) and
+  `::error_handler_restart_suppresses_old_loadend` (reentrant error).
+  Verdict: PASS.
 - **M4-FR-10** — `promise_read.rs:reject_with`,
   `streams.rs:stream_error_reason`, guards.
   Evidence: `::m3_promise_rejections_are_dom_exceptions_with_fixed_mapping`,
-  `::bounded_operation_sequences_match_pure_model`,
+  `::bounded_operation_sequences_match_pure_model` (162-scenario
+  enumerated corpus vs pure model, real JS per scenario),
   `::excluded_m4b_apis_are_absent`;
   `guards::filereader_and_dom_surface_is_bounded`,
   `::no_filereader_sync_or_out_of_scope_surface`. Verdict: PASS.
@@ -130,7 +147,8 @@ item remained.
 
 ## E. Test quality
 
-- Mutation spot-checks (mental + debug probes during development):
+- Mutation spot-checks (verified by temporarily breaking the
+  implementation and re-running the suites):
   - `decode_to_string` with zero-capacity output produced empty text —
     caught by the first text test, fixed with `with_capacity`.
   - Generic-job queue dropped `loadstart`/`progress` at the LOADING gate
@@ -138,9 +156,18 @@ item remained.
     synchronous in-job dispatch for non-terminal events.
   - `timeStamp` clock reads perturbed the throttle — caught by the step
     clock, fixed by reusing the pump tick.
+  - Removing the LOADING guard fails
+    `bounded_operation_sequences_match_pure_model` on the missing
+    `throw:InvalidStateError` comparison — the corpus is not vacuous.
+  - Removing the `loadstart` generation recheck fails
+    `filereader::tests::loadstart_abort_performs_no_source_read` and
+    `::loadstart_abort_then_restart_emits_only_new_operation` on the
+    source-read counter — the stale-race tests are not vacuous.
   - Each fix re-ran the affected suites green.
 - No test inspects private state or calls implementation helpers: all
-  assertions read JS-visible objects/events after real `run_jobs()`. —
+  assertions read JS-visible objects/events after real `run_jobs()`
+  (the counting sources observe only how many times the implementation
+  calls the public `ByteSource::read_range` contract). —
   PASS.
 
 ## F. Out-of-scope / forbidden / stale-claim sweep
@@ -157,8 +184,10 @@ item remained.
   old test names (`*_with_range_error`, `*_plain_error_*`) renamed to the
   mapped assertions. — PASS.
 - False evidence: validation/audit/handoff state only actual final data
-  (commands + exit codes above; coverage 88.26% lines); CI is `awaiting
-  customer verification`; no TODO/FIXME added. — PASS.
+  (commands + exit codes above; coverage 89.79% lines); `cargo deny
+  check` is BLOCKED (independent run exit 1, advisory-DB fetch failure;
+  the local exit 0 is not claimed as acceptance evidence); CI is
+  `awaiting customer verification`; no TODO/FIXME added. — PASS.
 
 ## G. Findings and fixes (all resolved)
 
@@ -173,10 +202,57 @@ item remained.
    `for_label_no_replacement` + manual single UTF-8 BOM strip; label
    tests green.
 5. `cargo deny` rejected `BSD-3-Clause` — fixed by allow-listing it
-   (+ ADR-0020 note); deny green.
+   (+ ADR-0020 note); local deny green, acceptance classification
+   BLOCKED (see §F).
 6. `cargo hack` powerset failed without `dom-shim` — fixed with
    `cfg`-gated pre-M4 fallbacks in `promise_read.rs`/`streams.rs`;
    powerset green.
 7. Docs build linked a private module — fixed doc wording; rustdoc green.
+
+## H. Rework findings R1–R6 (`docs/reviews/M4A-rework.md`, all resolved)
+
+1. Truthful validation evidence — `docs/m4a-validation.md`,
+   `docs/m4a-final-audit.md` (§F, this section), and
+   `docs/reviews/M4A-handoff.md` record `cargo deny check` as BLOCKED
+   with the exact independent-run reason (exit 1, advisory-DB fetch
+   failure); no claim that all commands exited 0, no invented advisory
+   result, CI run, URL, or run ID.
+2. README updated — installed M4-A surface, explicit
+   `context.run_jobs()` contract with examples, memory-backed-only
+   boundary, `dom-shim` capability, and explicitly omitted M4-B
+   features; no full-DOM/filesystem/`FileReaderSync`/blob-URL/clone/WPT
+   claims (also removed a duplicated M1–M3-A bullet block).
+3. Stale-generation read race closed — `filereader.rs:run_pump`
+   rechecks the generation after `loadstart` and `progress` dispatches
+   and before source reads, successor enqueue, packaging, slot release,
+   and event emission; `finish_at_eof` rechecks after the final-progress
+   dispatch. Covered by `filereader::tests::loadstart_abort_performs_no_source_read`
+   (zero post-abort source reads),
+   `::loadstart_abort_then_restart_emits_only_new_operation`,
+   `::progress_abort_freezes_source_reads`,
+   `::error_handler_restart_suppresses_old_loadend`, plus the
+   integration reentrant `error`/`abort` tests.
+4. Extra Clock read removed — `finish_at_eof` takes the pump's `now`
+   tick; one pump uses exactly one clock sample. The throttle tests
+   guard the contract (a second sample would shift the step-clock
+   schedule and fail the exact progress counts).
+5. Source-failure coverage added — `filereader::tests` proves
+   JS-visible `DONE`/`null`/`NotReadableError`, exactly
+   `error`-then-`loadend`, no partial result, and quota recovery for
+   short, long, and failing sources (unreachable via public
+   constructors, hence the child-module pattern already used by
+   `promise_read::tests`/`streams::tests`; no production hook), plus
+   reentrant `error`/`abort` cases; the integration suite adds
+   `reentrant_error_handler_starts_new_read` and
+   `abort_handler_restart_after_mid_chunk_abort` through public
+   triggers.
+6. Real property/model test —
+   `m4_filereader_async.rs::bounded_operation_sequences_match_pure_model`
+   now runs a 162-scenario enumerated corpus (9 sync prefixes × 3
+   follow-ups × 6 handler modes) with real JS per scenario against a
+   pure generation/terminal model; every comparison is exact, and the
+   corpus provably covers all terminal kinds, sync throws, replacement,
+   and stale completions. Mutation probes above confirm the assertions
+   fail on divergence.
 
 No unresolved items remain.

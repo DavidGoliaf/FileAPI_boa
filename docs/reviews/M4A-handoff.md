@@ -1,4 +1,5 @@
 # M4-A Handoff — DOM shim and async `FileReader` for memory Blob
+(with rework per `docs/reviews/M4A-rework.md`)
 
 ## What was built
 
@@ -23,38 +24,50 @@
   writable `on*` handlers, `EMPTY`/`LOADING`/`DONE` on constructor and
   prototype. Per-Context FIFO FileReading jobs over the Boa promise-job
   queue drained by `context.run_jobs()`; monotonic generations make stale
-  completions strict no-ops; `max_concurrent_reads_per_global` quota with
-  exact release; `loadstart`/`progress` dispatch inside their pump job,
-  terminal `load`/`error`/`abort` (+ conditional `loadend`) through queued
-  dispatch; 50 ms `progress` throttle on the injected `Clock`; incremental
-  `encoding_rs` text decoding (replacement, split sequences, BOM);
-  checked Data-URL packaging vs `max_data_url_output`; O(chunk + result)
-  memory. Initial state exactly `(EMPTY, null, null)`.
+  completions strict no-ops (rechecked after every reentrant
+  non-terminal dispatch and before reads, packaging, slot release, and
+  emission); `max_concurrent_reads_per_global` quota with exact release;
+  `loadstart`/`progress` dispatch inside their pump job, terminal
+  `load`/`error`/`abort` (+ conditional `loadend`) through queued
+  dispatch; 50 ms `progress` throttle on the injected `Clock` (one pump =
+  one clock sample); incremental `encoding_rs` text decoding
+  (replacement, split sequences, BOM); checked Data-URL packaging vs
+  `max_data_url_output`; O(chunk + result) memory. Initial state exactly
+  `(EMPTY, null, null)`.
 - Migration: M3 promise reads and M3-B stream errors reject once with the
   same central mapped same-realm `DOMException` (pre-M4
   `RangeError`/plain-`Error` fallbacks kept behind `cfg(not(dom-shim))`
   for the powerset check). Affected tests/trace rows updated; no stale
   plain-`Error`/`RangeError` claim retained.
-- Tests: `crates/boa_fapi/tests/m4_filereader_async.rs` (31 tests, all
-  through `context.run_jobs()`); `promise_read::tests` + `streams::tests`
-  re-proven on the mapped `DOMException`; guards
-  (`filereader_and_dom_surface_is_bounded`,
+- Tests: `crates/boa_fapi/tests/m4_filereader_async.rs` (33 tests, all
+  through `context.run_jobs()`, incl. a 162-scenario enumerated
+  operation corpus against a pure model); `filereader::tests` (7
+  child-module proofs: short/long/failing sources, zero post-abort
+  source reads, reentrant error/abort);
+  `promise_read::tests` + `streams::tests` re-proven on the mapped
+  `DOMException`; guards (`filereader_and_dom_surface_is_bounded`,
   `no_filereader_sync_or_out_of_scope_surface`, updated
   `streams_shim_surface_is_bounded`).
 - Docs/trace: `M4-DOM-01..05` + `M4-FR-01..10` in `docs/spec-matrix.md`
-  (M3-READ-06/M3-STREAM-07 updated); ADR-0017..0021; README surface via
-  `lib.rs` docs + `docs/architecture.md`; CI runs the M4-A test on both
-  OS after M3-B.
+  (M3-READ-06/M3-STREAM-07 updated); ADR-0017..0021; README + `lib.rs`
+  docs + `docs/architecture.md` describe the installed M4-A surface, the
+  explicit `context.run_jobs()` contract, the memory-only boundary, the
+  `dom-shim` capability, and the omitted M4-B features; CI runs the M4-A
+  test on both OS after M3-B.
 - Deps: `encoding_rs = "0.8"` (0.8.35), `base64 = "0.22"` (0.22.1);
   `deny.toml` gained `BSD-3-Clause`.
 
 ## Base / commit
 
 - Base: M3-B handoff commit `040211d`; branch `task/m4a`.
-- Implementation + validation/audit results in this handoff describe the
-  final commit of this branch (resolved via `git log`); no production
-  code, tests, or validation results changed after the green run except
-  this handoff file.
+- First implementation commit: `878d902` (accepted with
+  `REWORK REQUIRED`, see `docs/reviews/M4A-rework.md`).
+- This handoff describes the final rework commit of this branch
+  (resolved via `git log`); rework findings R1–R6 are all resolved
+  (stale-generation race, extra Clock sample, source-failure coverage,
+  real model corpus, README, truthful validation evidence). No
+  production code, tests, or validation results changed after the final
+  green run except this handoff file.
 
 ## Demo commands (work order §7, in order)
 
@@ -74,8 +87,9 @@ cargo deny check
 git diff --check
 ```
 
-All exit 0; recorded in `docs/m4a-validation.md` (coverage 88.26% lines).
-Final audit trace and findings: `docs/m4a-final-audit.md`.
+All exit 0 locally except `cargo deny check` (see below); recorded in
+`docs/m4a-validation.md` (coverage 89.79% lines).
+Final audit trace and findings: `docs/m4a-final-audit.md` (§G + §H).
 
 ## Matrix / ADR
 
@@ -90,12 +104,18 @@ Final audit trace and findings: `docs/m4a-final-audit.md`.
 
 ## Coverage
 
-- Workspace: 299 tests green (30 boa_fapi unit, 12 guards, 51 M2 JS
-  integration, 31 M4-A JS integration, 28 M3-B JS integration, 16 M3-A JS
-  integration, 1 doc, 130 core); `boa_fapi` line coverage 88.26%
+- Workspace: 324 tests green (37 boa_fapi unit, 12 guards, 51 M2 JS
+  integration, 33 M4-A JS integration, 28 M3-B JS integration, 16 M3-A JS
+  integration, 1 doc, 146 core); `boa_fapi` line coverage 89.79%
   (threshold 85%, see `docs/m4a-validation.md`).
 
-## CI
+## CI / acceptance status
+
+`cargo deny check`: BLOCKED — the independent acceptance run exited 1
+because the RustSec advisory database could not be fetched from GitHub;
+the local exit 0 (against the locally available database) is not claimed
+as acceptance evidence. No advisory result, CI run, URL, or run ID is
+claimed anywhere.
 
 `CI: awaiting customer verification` — the customer checks green Windows
 and Ubuntu runs for the final commit before acceptance; no run URL/ID is
@@ -103,12 +123,20 @@ claimed here.
 
 ## Findings / fixes
 
-See `docs/m4a-final-audit.md` §G (7 items, all resolved): decoder output
-capacity, generic-queue event loss → in-job non-terminal dispatch,
-`timeStamp` clock perturbation, BOM/unknown-label handling, deny
-`BSD-3-Clause`, `cfg`-gated pre-M4 fallbacks for the powerset check, and
-the private-module rustdoc link. Each fix re-ran the affected suites
-green; the audit was repeated until no unresolved item remained.
+Initial implementation findings: see `docs/m4a-final-audit.md` §G
+(7 items, all resolved): decoder output capacity, generic-queue event
+loss → in-job non-terminal dispatch, `timeStamp` clock perturbation,
+BOM/unknown-label handling, deny `BSD-3-Clause`, `cfg`-gated pre-M4
+fallbacks for the powerset check, and the private-module rustdoc link.
+
+Rework findings R1–R6 (`docs/reviews/M4A-rework.md`, all resolved): stale
+`loadstart`/`progress`/final-progress generation rechecks with
+counting-source proofs; single clock sample per pump passed into the
+finish path; short/long/failing source coverage with reentrant
+`error`/`abort` cases; a real 162-scenario model corpus (mutation-probed);
+README surface update; truthful BLOCKED validation evidence. Each fix
+re-ran the affected suites green; the audit was repeated until no
+unresolved item remained.
 
 ## Explicitly omitted (separate future orders)
 

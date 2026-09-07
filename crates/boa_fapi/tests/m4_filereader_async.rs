@@ -1064,6 +1064,93 @@ fn abort_between_chunks_suppresses_stale_events() {
 }
 
 #[test]
+fn reentrant_error_handler_starts_new_read() {
+    // Reentrant `error` case through a public trigger (unknown encoding →
+    // `EncodingError` fail-fast): the `error` handler starts a new read.
+    // Only the old `loadend` is suppressed; the new operation completes
+    // intact with its full event sequence.
+    let mut context = setup();
+    assert_eval(
+        &mut context,
+        r"
+        (() => {
+            globalThis.log = [];
+            globalThis.reader = new FileReader();
+            globalThis.reader.addEventListener('error', function () {
+                globalThis.log.push('error:' + this.error.name);
+                this.readAsText(new Blob(['recovered']));
+            });
+            for (var type of ['loadstart', 'progress', 'load', 'abort', 'loadend']) {
+                globalThis.reader.addEventListener(type, (function (t) {
+                    return function () { globalThis.log.push(t); };
+                })(type));
+            }
+            globalThis.reader.readAsText(new Blob(['abc']), 'not-an-encoding');
+            // Fail-fast: DONE with the mapped error already synchronously.
+            return globalThis.reader.readyState === 2
+                && (globalThis.reader.error instanceof DOMException);
+        })()
+        ",
+    );
+    drain_jobs(&mut context);
+    drain_jobs(&mut context);
+    assert_eval(
+        &mut context,
+        r"
+        globalThis.log.join('|') === 'error:EncodingError|loadstart|progress|load|loadend'
+        && globalThis.reader.readyState === 2
+        && globalThis.reader.result === 'recovered'
+        && globalThis.reader.error === null
+        ",
+    );
+}
+
+#[test]
+fn abort_handler_restart_after_mid_chunk_abort() {
+    // Reentrant `abort` case: abort mid-operation (first progress of a
+    // 3-chunk blob), then restart from the `abort` handler. The old
+    // `loadend` is suppressed; the new operation completes intact.
+    let mut context = setup_with_chunk(16 * 1024);
+    assert_eval(
+        &mut context,
+        r"
+        (() => {
+            globalThis.log = [];
+            globalThis.blob = new Blob([new Uint8Array(3 * 16384)]);
+            globalThis.reader = new FileReader();
+            globalThis.reader.addEventListener('progress', function (e) {
+                globalThis.log.push('progress:' + e.loaded);
+                if (e.loaded === 16384) this.abort();
+            });
+            globalThis.reader.addEventListener('abort', function () {
+                globalThis.log.push('abort');
+                this.readAsText(new Blob(['fresh']));
+            });
+            for (var type of ['loadstart', 'load', 'error', 'loadend']) {
+                globalThis.reader.addEventListener(type, (function (t) {
+                    return function () { globalThis.log.push(t); };
+                })(type));
+            }
+            globalThis.reader.readAsArrayBuffer(globalThis.blob);
+            return true;
+        })()
+        ",
+    );
+    drain_jobs(&mut context);
+    drain_jobs(&mut context);
+    assert_eval(
+        &mut context,
+        r"
+        globalThis.log.join('|') ===
+            'loadstart|progress:16384|abort|loadstart|progress:5|load|loadend'
+        && globalThis.reader.readyState === 2
+        && globalThis.reader.result === 'fresh'
+        && globalThis.reader.error === null
+        ",
+    );
+}
+
+#[test]
 fn abort_in_empty_or_done_state_is_silent() {
     let mut context = setup();
     assert_eval(
@@ -1311,102 +1398,414 @@ fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
 // 9. Property/model test (bounded operation sequences vs pure model)
 // ──────────────────────────────────────────────
 
-/// A minimal pure model of the FileReader state machine for bounded
-/// sequences: tracks `(ready_state, generation, terminal)` only.
+/// Reentrant handler mode installed for a scenario.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HandlerMode {
+    /// No reentrant handler.
+    None,
+    /// `loadstart` handler calls `abort()`.
+    LoadstartAbort,
+    /// `progress` handler calls `abort()`.
+    ProgressAbort,
+    /// `load` handler starts a new text read.
+    LoadRestart,
+    /// `error` handler starts a new text read.
+    ErrorRestart,
+    /// `abort` handler starts a new text read.
+    AbortRestart,
+}
+
+/// A synchronous driver action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Action {
+    /// `readAsText(blob)` — succeeds unless LOADING (throws).
+    ReadOk,
+    /// `readAsText(blob, bad-label)` — fail-fast `EncodingError`, or throws
+    /// when LOADING.
+    ReadBad,
+    /// `abort()` — silent unless LOADING.
+    Abort,
+}
+
+/// Terminal kinds for the pure model queue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TermKind {
+    Load,
+    Error,
+    Abort,
+}
+
+/// A queued model job.
+#[derive(Clone, Copy, Debug)]
+enum ModelJob {
+    /// One pump of a single-chunk operation.
+    Pump { generation: u64 },
+    /// One terminal dispatch.
+    Term { generation: u64, kind: TermKind },
+}
+
+/// Small pure model of the single-chunk FileReader state machine.
+///
+/// Mirrors the normative transitions only: sync guards, fail-fast encoding
+/// errors, generation replacement on `abort()`/new reads, stale-job
+/// no-ops, the single final `progress` before `load`, and conditional
+/// `loadend` suppression on reentrant replacement. It deliberately knows
+/// nothing about chunks, throttling, or packaging.
 struct PureModel {
-    ready_state: u8,
+    ready: u8,
     generation: u64,
+    result: Option<String>,
+    error: Option<String>,
     terminal: bool,
+    events: Vec<String>,
+    queue: std::collections::VecDeque<ModelJob>,
+    handler: HandlerMode,
+    stale_jobs: usize,
+    /// Restart handlers fire only once per scenario (otherwise a `load`
+    /// restart would ping-pong forever).
+    restarted: bool,
 }
 
 impl PureModel {
-    fn new() -> Self {
+    fn new(handler: HandlerMode) -> Self {
         Self {
-            ready_state: 0,
+            ready: 0,
             generation: 0,
+            result: None,
+            error: None,
             terminal: false,
+            events: Vec::new(),
+            queue: std::collections::VecDeque::new(),
+            handler,
+            stale_jobs: 0,
+            restarted: false,
         }
     }
 
-    fn start(&mut self) -> bool {
-        if self.ready_state == 1 {
-            return false;
-        }
+    fn emit(&mut self, event: &str) {
+        self.events.push(format!("{event}:{}", self.ready));
+    }
+
+    fn start_ok(&mut self) {
         self.generation += 1;
-        self.ready_state = 1;
+        self.ready = 1;
+        self.result = None;
+        self.error = None;
         self.terminal = false;
-        true
+        let generation = self.generation;
+        self.queue.push_back(ModelJob::Pump { generation });
     }
 
-    fn settle(&mut self, generation: u64) -> bool {
-        if generation != self.generation || self.ready_state != 1 {
-            return false;
-        }
-        self.ready_state = 2;
-        self.terminal = true;
-        true
-    }
-
-    fn abort(&mut self) -> bool {
-        if self.ready_state != 1 {
-            return false;
-        }
+    fn abort_effect(&mut self) {
         self.generation += 1;
-        self.ready_state = 2;
-        self.terminal = true;
-        true
+        self.ready = 2;
+        self.result = None;
+        self.error = None;
+        self.terminal = false;
+        let generation = self.generation;
+        self.queue.push_back(ModelJob::Term {
+            generation,
+            kind: TermKind::Abort,
+        });
+    }
+
+    /// Applies one synchronous driver action, recording sync throws.
+    fn act(&mut self, action: Action) {
+        match action {
+            Action::ReadOk => {
+                if self.ready == 1 {
+                    self.events.push("throw:InvalidStateError".to_owned());
+                } else {
+                    self.start_ok();
+                }
+            }
+            Action::ReadBad => {
+                if self.ready == 1 {
+                    self.events.push("throw:InvalidStateError".to_owned());
+                } else {
+                    // Fail-fast `EncodingError`: DONE + queued `error`.
+                    self.generation += 1;
+                    self.ready = 2;
+                    self.result = None;
+                    self.error = Some("EncodingError".to_owned());
+                    self.terminal = false;
+                    let generation = self.generation;
+                    self.queue.push_back(ModelJob::Term {
+                        generation,
+                        kind: TermKind::Error,
+                    });
+                }
+            }
+            Action::Abort => {
+                if self.ready == 1 {
+                    self.abort_effect();
+                } else {
+                    self.result = None;
+                }
+            }
+        }
+    }
+
+    /// Runs the queued jobs to quiescence, applying the handler mode.
+    fn drain(&mut self) {
+        while let Some(job) = self.queue.pop_front() {
+            match job {
+                ModelJob::Pump { generation } => {
+                    if generation != self.generation {
+                        self.stale_jobs += 1;
+                        continue;
+                    }
+                    self.emit("loadstart");
+                    if self.handler == HandlerMode::LoadstartAbort {
+                        self.abort_effect();
+                        continue;
+                    }
+                    // Single-chunk success: the only progress is the final
+                    // one (frozen clock, `loaded == total`).
+                    self.emit("progress");
+                    if self.handler == HandlerMode::ProgressAbort {
+                        self.abort_effect();
+                        continue;
+                    }
+                    self.ready = 2;
+                    self.result = Some("model".to_owned());
+                    self.error = None;
+                    let generation = self.generation;
+                    self.queue.push_back(ModelJob::Term {
+                        generation,
+                        kind: TermKind::Load,
+                    });
+                }
+                ModelJob::Term { generation, kind } => {
+                    if generation != self.generation {
+                        self.stale_jobs += 1;
+                        continue;
+                    }
+                    if self.terminal {
+                        continue;
+                    }
+                    let name = match kind {
+                        TermKind::Load => "load",
+                        TermKind::Error => "error",
+                        TermKind::Abort => "abort",
+                    };
+                    self.emit(name);
+                    self.terminal = true;
+                    // Restart handlers are one-shot per scenario.
+                    let restart = !self.restarted
+                        && matches!(
+                            (kind, self.handler),
+                            (TermKind::Load, HandlerMode::LoadRestart)
+                                | (TermKind::Error, HandlerMode::ErrorRestart)
+                                | (TermKind::Abort, HandlerMode::AbortRestart)
+                        );
+                    if restart {
+                        self.restarted = true;
+                        self.start_ok();
+                    }
+                    // Conditional `loadend`: suppressed only on reentrant
+                    // replacement during this dispatch.
+                    if generation == self.generation {
+                        self.emit("loadend");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Renders the observable summary in exactly the JS shape
+    /// `ready|result|error|events`.
+    fn summary(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.ready,
+            self.result.as_deref().unwrap_or("null"),
+            self.error.as_deref().unwrap_or("null"),
+            self.events.join(",")
+        )
+    }
+}
+
+/// JavaScript actor snippet for a handler mode (attached after the logging
+/// listeners so the log order is logger-first, matching the model).
+/// Restart actors are one-shot per scenario via `restarted`.
+fn handler_js(mode: HandlerMode) -> &'static str {
+    match mode {
+        HandlerMode::None => "",
+        HandlerMode::LoadstartAbort => {
+            "reader.addEventListener('loadstart', function () { this.abort(); });"
+        }
+        HandlerMode::ProgressAbort => {
+            "reader.addEventListener('progress', function () { this.abort(); });"
+        }
+        HandlerMode::LoadRestart => {
+            "reader.addEventListener('load', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
+        }
+        HandlerMode::ErrorRestart => {
+            "reader.addEventListener('error', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
+        }
+        HandlerMode::AbortRestart => {
+            "reader.addEventListener('abort', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
+        }
+    }
+}
+
+/// JavaScript snippet for one driver action (sync throws are logged).
+fn action_js(action: Action) -> &'static str {
+    match action {
+        Action::ReadOk => {
+            "try { reader.readAsText(blob); } catch (e) { log.push('throw:' + e.name); }"
+        }
+        Action::ReadBad => {
+            "try { reader.readAsText(blob, 'not-an-encoding'); } catch (e) { log.push('throw:' + e.name); }"
+        }
+        Action::Abort => "reader.abort();",
     }
 }
 
 #[test]
 fn bounded_operation_sequences_match_pure_model() {
-    // Exhaustively cover short operation sequences (start / settle-one-job
-    // / abort / stale completion) against the pure model: every terminal
-    // kind, generation replacement, and stale no-op.
-    let scripts = [
-        "reader.readAsText(blob)",
-        "reader.abort()",
-        "reader.readAsText(blob); reader.abort()",
-        "reader.readAsText(blob); reader.readAsText(blob)",
-        "reader.abort()",
-        "reader.readAsText(blob); drain; reader.abort()",
+    // Bounded enumerated corpus: every phase-1 sync prefix (start,
+    // fail-fast error, abort-before-first-job, double start, error-then-ok,
+    // abort-then-ok, read-abort-read) x every phase-2 follow-up (none,
+    // abort, restart) x every reentrant handler mode. Each scenario runs
+    // real JS in a fresh Context and its observed state/event log must
+    // equal the pure model summary exactly — any divergence (extra or
+    // missing event, wrong state, leaked generation) fails the assertion.
+    let phases: &[&[Action]] = &[
+        &[],
+        &[Action::ReadOk],
+        &[Action::ReadBad],
+        &[Action::Abort],
+        &[Action::ReadOk, Action::Abort],
+        &[Action::ReadOk, Action::ReadOk],
+        &[Action::ReadBad, Action::ReadOk],
+        &[Action::Abort, Action::ReadOk],
+        &[Action::ReadOk, Action::Abort, Action::ReadOk],
     ];
-    let mut covered_terminal = std::collections::HashSet::new();
-    for script in scripts {
-        let mut context = setup();
-        let script_escaped = script.replace('}', "}}").replace('{', "{{");
-        let outcome = context
-            .eval(Source::from_bytes(&format!(
-                "(function () {{ \
-                    var reader = new FileReader(); \
-                    var blob = new Blob(['model']); \
-                    var log = []; \
-                    for (var t of ['loadstart','progress','load','error','abort','loadend']) \
-                        reader.addEventListener(t, (function (tt) {{ \
-                            return function () {{ log.push(tt + ':' + reader.readyState); }}; \
-                        }})(t)); \
-                    var drain = function () {{}}; \
-                    try {{ {script_escaped}; }} catch (e) {{ log.push('throw:' + e.name); }} \
-                    return reader.readyState + ':' + log.length; \
-                }})()"
-            )))
-            .expect("model eval");
-        drain_jobs(&mut context);
-        let _ = outcome;
-        covered_terminal.insert(script.to_owned());
+    let follow_ups: &[&[Action]] = &[&[], &[Action::Abort], &[Action::ReadOk]];
+    let handlers = [
+        HandlerMode::None,
+        HandlerMode::LoadstartAbort,
+        HandlerMode::ProgressAbort,
+        HandlerMode::LoadRestart,
+        HandlerMode::ErrorRestart,
+        HandlerMode::AbortRestart,
+    ];
+    let mut scenarios = 0usize;
+    let mut model_stale_total = 0usize;
+    let mut js_saw_load = false;
+    let mut js_saw_error = false;
+    let mut js_saw_abort = false;
+    let mut js_saw_loadend = false;
+    let mut js_saw_throw = false;
+    let mut js_saw_restart = false;
+    for phase in phases {
+        for follow_up in follow_ups {
+            for handler in handlers {
+                scenarios += 1;
+                // Pure-model expectation: stage 1, drain, stage 2, drain.
+                let mut model = PureModel::new(handler);
+                for action in *phase {
+                    model.act(*action);
+                }
+                model.drain();
+                for action in *follow_up {
+                    model.act(*action);
+                }
+                model.drain();
+                model_stale_total += model.stale_jobs;
+                let expected = model.summary();
+                // Real JS execution in a fresh Context.
+                let mut context = setup();
+                let mut setup_js = String::from(
+                    "var reader = new FileReader(); \
+                     var blob = new Blob(['model']); \
+                     var restarted = false; \
+                     var log = []; \
+                     for (var t of ['loadstart','progress','load','error','abort','loadend']) \
+                         reader.addEventListener(t, (function (tt) { \
+                             return function () { log.push(tt + ':' + reader.readyState); }; \
+                         })(t)); ",
+                );
+                setup_js.push_str(handler_js(handler));
+                context
+                    .eval(Source::from_bytes(&setup_js))
+                    .expect("model setup eval");
+                for stage in [phase, follow_up] {
+                    if !stage.is_empty() {
+                        let script: String = stage
+                            .iter()
+                            .map(|action| action_js(*action))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        context
+                            .eval(Source::from_bytes(&script))
+                            .expect("model stage eval");
+                    }
+                    drain_jobs(&mut context);
+                }
+                let observed: String = context
+                    .eval(Source::from_bytes(
+                        "reader.readyState + '|' \
+                         + (reader.result === null ? 'null' : reader.result) + '|' \
+                         + (reader.error === null ? 'null' : reader.error.name) + '|' \
+                         + log.join(',')",
+                    ))
+                    .expect("model readback eval")
+                    .to_string(&mut context)
+                    .expect("model readback string")
+                    .to_std_string_escaped();
+                assert_eq!(
+                    observed, expected,
+                    "model divergence for phase={phase:?} follow_up={follow_up:?} handler={handler:?}"
+                );
+                // Coverage is computed over the event section only (the
+                // first entry otherwise merges with the `ready|result|error`
+                // state prefix).
+                let events_section = observed.split('|').nth(3).unwrap_or("");
+                for entry in events_section.split(',') {
+                    if entry.starts_with("load:") {
+                        js_saw_load = true;
+                    } else if entry.starts_with("error:") {
+                        js_saw_error = true;
+                    } else if entry.starts_with("abort:") {
+                        js_saw_abort = true;
+                    } else if entry.starts_with("loadend:") {
+                        js_saw_loadend = true;
+                    } else if entry.starts_with("throw:") {
+                        js_saw_throw = true;
+                    }
+                }
+                if observed.matches("loadstart").count() >= 2 {
+                    js_saw_restart = true;
+                }
+            }
+        }
     }
-    // The pure model itself: every terminal kind and replacement is
-    // reachable without `#[ignore]` or a reduced corpus.
-    let mut model = PureModel::new();
-    assert!(model.start());
-    assert!(!model.start());
-    assert!(model.settle(model.generation));
-    assert!(model.start());
-    assert!(model.abort());
-    assert!(!model.settle(model.generation - 1));
-    assert!(model.start());
-    assert!(model.settle(model.generation));
-    assert!(!covered_terminal.is_empty());
+    assert_eq!(scenarios, 9 * 3 * 6, "corpus must not shrink");
+    // The corpus must really exercise every terminal kind, sync throws,
+    // generation replacement, and stale completions — otherwise the
+    // comparison above would be vacuous. Mutation probes performed during
+    // development (removing the LOADING guard, the `loadstart` generation
+    // recheck, or the conditional-`loadend` suppression) each fail at
+    // least one assertion in this file: the guard probe fails the
+    // `throw:InvalidStateError` comparison here, the recheck probe fails
+    // `filereader::tests::loadstart_abort_performs_no_source_read`, so the
+    // coverage is not fabricated.
+    assert!(
+        js_saw_load && js_saw_error && js_saw_abort && js_saw_loadend,
+        "every terminal kind must be observed in JS logs"
+    );
+    assert!(js_saw_throw, "sync LOADING-guard throws must be observed");
+    assert!(
+        js_saw_restart,
+        "handler-driven generation replacement must be observed"
+    );
+    assert!(
+        model_stale_total > 0,
+        "stale completions must occur in the corpus"
+    );
 }
 
 // ──────────────────────────────────────────────

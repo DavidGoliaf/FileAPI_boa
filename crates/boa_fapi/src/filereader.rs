@@ -791,12 +791,19 @@ fn generation_current(reader: &JsObject, generation: u64) -> bool {
 /// Pumps exactly one chunk of a read operation.
 ///
 /// The first successful pump (including immediate EOF of an empty blob)
-/// queues `loadstart`. Each chunk queues a throttled `progress`. At EOF the
-/// job packages the result and dispatches `load` (+ conditional `loadend`)
-/// through the terminal path. A source failure dispatches `error` (+
-/// conditional `loadend`) with the mapped `DOMException` and no partial
+/// dispatches `loadstart`. Each chunk dispatches a throttled `progress`. At
+/// EOF the job packages the result and enqueues `load` (+ conditional
+/// `loadend`) through the terminal path. A source failure enqueues `error`
+/// (+ conditional `loadend`) with the mapped `DOMException` and no partial
 /// result. Every terminal path releases exactly one quota slot; stale jobs
 /// release none.
+///
+/// Reentrancy: `loadstart`, `progress`, and final-progress handlers run
+/// synchronously inside this job and may call `abort()` or start a new
+/// read. The generation is rechecked after every such dispatch and before
+/// the source read, the successor enqueue, packaging, slot release, and
+/// event emission — a stale job becomes a strict no-op at the first
+/// divergence point.
 fn run_pump(
     reader: &JsObject,
     generation: u64,
@@ -827,10 +834,17 @@ fn run_pump(
             now as f64,
             context,
         )?;
+        // A `loadstart` handler runs reentrantly here: it may call
+        // `abort()` or start a new read (after aborting), replacing the
+        // generation. The old job must then become a strict no-op before
+        // it reads from the source or mutates anything.
+        if !generation_current(reader, generation) {
+            return Ok(JsValue::undefined());
+        }
     }
     match state.reader_core.read_next() {
         Err(error) => fail_operation(reader, generation, state.total, &error, context),
-        Ok(None) => finish_at_eof(reader, generation, state, context),
+        Ok(None) => finish_at_eof(reader, generation, state, now, context),
         Ok(Some(chunk)) => {
             state.loaded = state
                 .loaded
@@ -867,9 +881,16 @@ fn run_pump(
                 dispatch_event_now(
                     reader, generation, "progress", loaded, total, now as f64, context,
                 )?;
+                // A `progress` handler runs reentrantly here with the same
+                // consequences as `loadstart` above: on generation
+                // replacement the old job emits nothing further, releases
+                // no slot, and enqueues no successor.
+                if !generation_current(reader, generation) {
+                    return Ok(JsValue::undefined());
+                }
             }
             if state.loaded >= state.total {
-                return finish_at_eof(reader, generation, state, context);
+                return finish_at_eof(reader, generation, state, now, context);
             }
             // Enqueue the next pump for the same operation.
             enqueue_reading_job(
@@ -887,15 +908,20 @@ fn run_pump(
 
 /// Finishes an operation at EOF: final progress, then terminal dispatch.
 ///
-/// Queues the final `progress(loaded = total)` (unless already sent), sets
-/// `DONE` with the packaged result, releases the quota slot once, and
-/// dispatches `load` (the conditional `loadend` follows from the dispatch
+/// Dispatches the final `progress(loaded = total)` (unless already sent)
+/// with the pump's clock tick — one pump uses exactly one clock sample —
+/// then sets `DONE` with the packaged result, releases the quota slot once,
+/// and enqueues `load` (the conditional `loadend` follows from the dispatch
 /// step). Memory stays O(chunk + final result): no whole-blob copy exists
-/// outside the packaged output.
+/// outside the packaged output. A reentrant final-progress handler that
+/// replaces the generation turns the rest of this path into a strict
+/// no-op: no packaging is published, no slot is released, no event is
+/// enqueued.
 fn finish_at_eof(
     reader: &JsObject,
     generation: u64,
     state: PumpState,
+    now: i64,
     context: &mut Context,
 ) -> JsResult<JsValue> {
     if !generation_current(reader, generation) {
@@ -916,15 +942,19 @@ fn finish_at_eof(
     // The final `progress(loaded = total)` precedes `load`; never after a
     // terminal state and never twice for one generation. Dispatched
     // synchronously inside this job (same ordering rationale as `loadstart`
-    // in `run_pump`); the time stamp reuses the pump's clock tick.
+    // in `run_pump`); the time stamp is the pump's own clock tick, never a
+    // second clock read.
     if !final_progress_sent {
-        let time_stamp = crate::extension::snapshot(context)?
-            .config
-            .clock
-            .now_unix_millis() as f64;
         dispatch_event_now(
-            reader, generation, "progress", total, total, time_stamp, context,
+            reader, generation, "progress", total, total, now as f64, context,
         )?;
+        // A final-progress handler runs reentrantly here with the same
+        // consequences as `loadstart`/`progress` in `run_pump`: on
+        // generation replacement nothing below may publish packaging,
+        // release the old slot, or emit events.
+        if !generation_current(reader, generation) {
+            return Ok(JsValue::undefined());
+        }
     }
     // Package the result (the Data-URL length was preflighted at read
     // start; re-check before allocation anyway).
@@ -1459,4 +1489,496 @@ fn init_filereader_constants(specs: &StandardConstructor, context: &mut Context)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    //! Child-module proof of the source-failure and stale-generation paths
+    //! through the real `run_pump` → `Context::run_jobs()` machinery with
+    //! controlled `ByteSource`s.
+    //!
+    //! Memory-backed JS blobs can never fail a source read (ranges are
+    //! validated up front), so short/long/failing sources are unreachable
+    //! via public constructors. These source types exist only in this test
+    //! module: no production hook, no public arbitrary-source API. Each
+    //! test wraps the failing payload in a real branded JS `Blob`, reads it
+    //! with a real branded JS `FileReader`, and asserts only JS-observable
+    //! state and events after `run_jobs()`.
+    //!
+    //! Prototype identity cannot be proven from Rust alone, so every test
+    //! attaches JavaScript handlers in the same `Context` and reads back
+    //! the observable log afterwards.
+
+    use super::*;
+    use boa_engine::{Source, js_string};
+    use boa_fapi_core::cancellation::CancellationToken;
+    use boa_fapi_core::limits::FileApiLimits;
+    use boa_fapi_core::snapshot::SnapshotState;
+    use boa_fapi_core::source::ByteSource;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A source that counts `read_range` calls and serves exact bytes.
+    struct CountingSource {
+        data: bytes::Bytes,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl ByteSource for CountingSource {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn snapshot(&self) -> SnapshotState {
+            SnapshotState::Memory
+        }
+        fn read_range(
+            &self,
+            range: std::ops::Range<u64>,
+            _cancel: &CancellationToken,
+        ) -> Result<bytes::Bytes, FileApiError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let start = usize::try_from(range.start).map_err(|_| FileApiError::InvalidRange)?;
+            let end = usize::try_from(range.end).map_err(|_| FileApiError::InvalidRange)?;
+            self.data
+                .get(start..end)
+                .map(bytes::Bytes::copy_from_slice)
+                .ok_or(FileApiError::InvalidRange)
+        }
+    }
+
+    /// A source that fails every read with `FileLocked`
+    /// (→ `NotReadableError`).
+    struct FailSource {
+        len: u64,
+    }
+
+    impl ByteSource for FailSource {
+        fn len(&self) -> u64 {
+            self.len
+        }
+        fn snapshot(&self) -> SnapshotState {
+            SnapshotState::Memory
+        }
+        fn read_range(
+            &self,
+            _range: std::ops::Range<u64>,
+            _cancel: &CancellationToken,
+        ) -> Result<bytes::Bytes, FileApiError> {
+            Err(FileApiError::FileLocked)
+        }
+    }
+
+    /// A source declaring 5 bytes but returning 4 (short response →
+    /// `InvalidRange` → `NotReadableError`).
+    struct ShortSource;
+
+    impl ByteSource for ShortSource {
+        fn len(&self) -> u64 {
+            5
+        }
+        fn snapshot(&self) -> SnapshotState {
+            SnapshotState::Memory
+        }
+        fn read_range(
+            &self,
+            _range: std::ops::Range<u64>,
+            _cancel: &CancellationToken,
+        ) -> Result<bytes::Bytes, FileApiError> {
+            Ok(bytes::Bytes::copy_from_slice(b"shor"))
+        }
+    }
+
+    /// A source declaring 5 bytes but returning 6 (long response →
+    /// `InvalidRange` → `NotReadableError`).
+    struct LongSource;
+
+    impl ByteSource for LongSource {
+        fn len(&self) -> u64 {
+            5
+        }
+        fn snapshot(&self) -> SnapshotState {
+            SnapshotState::Memory
+        }
+        fn read_range(
+            &self,
+            _range: std::ops::Range<u64>,
+            _cancel: &CancellationToken,
+        ) -> Result<bytes::Bytes, FileApiError> {
+            Ok(bytes::Bytes::copy_from_slice(b"toolong!"))
+        }
+    }
+
+    /// Deterministic clock for tests.
+    #[derive(Debug)]
+    struct TestClock {
+        millis: i64,
+    }
+
+    impl crate::clock::Clock for TestClock {
+        fn now_unix_millis(&self) -> i64 {
+            self.millis
+        }
+    }
+
+    const TEST_TIME: i64 = 1_700_000_000_000;
+
+    /// Registers the extension with the given limits.
+    fn setup_with_limits(limits: FileApiLimits) -> Context {
+        let mut context = Context::default();
+        crate::extension::FileApiExtension::builder()
+            .clock(Arc::new(TestClock { millis: TEST_TIME }))
+            .limits(limits)
+            .build()
+            .register(&mut context)
+            .expect("registration failed");
+        context
+    }
+
+    /// Single-slot limits: any quota leak blocks the very next read, so a
+    /// follow-up success proves exact slot release.
+    fn quota_one_limits() -> FileApiLimits {
+        FileApiLimits {
+            max_concurrent_reads_per_global: 1,
+            ..FileApiLimits::default()
+        }
+    }
+
+    /// Wraps `data` in a real branded JS `Blob` reachable as `srcBlob`.
+    fn publish_blob(context: &mut Context, data: Arc<BlobData>) {
+        let specs = crate::extension::snapshot(context).expect("registered");
+        let blob =
+            crate::blob::create_instance(crate::blob::BlobNative::new(data), specs.blob_proto());
+        context
+            .register_global_property(
+                js_string!("srcBlob"),
+                blob,
+                boa_engine::property::Attribute::all(),
+            )
+            .expect("publish blob");
+    }
+
+    /// Creates a real branded JS `FileReader` reachable as `reader`.
+    fn publish_reader(context: &mut Context) {
+        let specs = crate::extension::snapshot(context).expect("registered");
+        let reader =
+            JsObject::from_proto_and_data(specs.filereader_proto(), FileReaderNative::fresh());
+        context
+            .register_global_property(
+                js_string!("reader"),
+                reader,
+                boa_engine::property::Attribute::all(),
+            )
+            .expect("publish reader");
+    }
+
+    /// Attaches logging listeners for all six event types and starts
+    /// `readAsArrayBuffer(srcBlob)`. Each entry records
+    /// `type:readyState:resultKind:errorName`.
+    fn start_logged_read(context: &mut Context) {
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; \
+                 for (var t of ['loadstart','progress','load','error','abort','loadend']) \
+                     reader.addEventListener(t, (function (tt) { \
+                         return function () { \
+                             globalThis.log.push(tt + ':' + this.readyState + ':' \
+                                 + (this.result === null ? 'null' : typeof this.result) + ':' \
+                                 + (this.error === null ? 'null' : this.error.name)); \
+                         }; \
+                     })(t)); \
+                 reader.readAsArrayBuffer(srcBlob);",
+            ))
+            .expect("start read");
+    }
+
+    /// Reads back the JS event log.
+    fn js_log(context: &mut Context) -> String {
+        context
+            .eval(Source::from_bytes("globalThis.log.join('|')"))
+            .expect("read log")
+            .as_string()
+            .expect("log string")
+            .to_std_string_escaped()
+    }
+
+    /// Reads back `readyState:resultKind:errorName`.
+    fn js_state(context: &mut Context) -> String {
+        context
+            .eval(Source::from_bytes(
+                "reader.readyState + ':' \
+                 + (reader.result === null ? 'null' : typeof reader.result) + ':' \
+                 + (reader.error === null ? 'null' : reader.error.name)",
+            ))
+            .expect("read state")
+            .to_string(context)
+            .expect("state string")
+            .to_std_string_escaped()
+    }
+
+    /// Drives jobs to quiescence.
+    fn drain(context: &mut Context) {
+        context.run_jobs().expect("run_jobs");
+        context.run_jobs().expect("run_jobs");
+    }
+
+    /// Builds a `BlobData` over `source` with the default limits.
+    fn blob_over(source: Arc<dyn ByteSource>, len: u64) -> Arc<BlobData> {
+        Arc::new(
+            BlobData::from_segments(
+                vec![boa_fapi_core::blob::BlobSegment {
+                    source,
+                    offset: 0,
+                    len,
+                }],
+                "",
+                &FileApiLimits::default(),
+            )
+            .expect("valid segments"),
+        )
+    }
+
+    /// A follow-up successful read proves the failed operation released its
+    /// single quota slot (with quota-one limits any leak blocks it).
+    fn assert_quota_recovered(context: &mut Context) {
+        context
+            .eval(Source::from_bytes(
+                "globalThis.after = null; \
+                 var r2 = new FileReader(); \
+                 r2.onload = function () { globalThis.after = this.result; }; \
+                 r2.onerror = function () { globalThis.after = 'unexpected-error'; }; \
+                 r2.readAsText(new Blob(['ok']));",
+            ))
+            .expect("follow-up read");
+        drain(context);
+        let verdict = context
+            .eval(Source::from_bytes("globalThis.after"))
+            .expect("aftermath")
+            .as_string()
+            .expect("aftermath string")
+            .to_std_string_escaped();
+        assert_eq!(verdict, "ok", "quota slot must be released after failure");
+    }
+
+    #[test]
+    fn short_source_response_fails_as_not_readable_error() {
+        let context = &mut setup_with_limits(quota_one_limits());
+        publish_blob(context, blob_over(Arc::new(ShortSource), 5));
+        publish_reader(context);
+        start_logged_read(context);
+        drain(context);
+        assert_eq!(
+            js_log(context),
+            "loadstart:1:null:null|error:2:null:NotReadableError|loadend:2:null:NotReadableError"
+        );
+        assert_eq!(js_state(context), "2:null:NotReadableError");
+        assert_quota_recovered(context);
+    }
+
+    #[test]
+    fn long_source_response_fails_as_not_readable_error() {
+        let context = &mut setup_with_limits(quota_one_limits());
+        publish_blob(context, blob_over(Arc::new(LongSource), 5));
+        publish_reader(context);
+        start_logged_read(context);
+        drain(context);
+        assert_eq!(
+            js_log(context),
+            "loadstart:1:null:null|error:2:null:NotReadableError|loadend:2:null:NotReadableError"
+        );
+        assert_eq!(js_state(context), "2:null:NotReadableError");
+        assert_quota_recovered(context);
+    }
+
+    #[test]
+    fn failing_source_fails_as_not_readable_error() {
+        let context = &mut setup_with_limits(quota_one_limits());
+        publish_blob(context, blob_over(Arc::new(FailSource { len: 3 }), 3));
+        publish_reader(context);
+        start_logged_read(context);
+        drain(context);
+        assert_eq!(
+            js_log(context),
+            "loadstart:1:null:null|error:2:null:NotReadableError|loadend:2:null:NotReadableError"
+        );
+        assert_eq!(js_state(context), "2:null:NotReadableError");
+        assert_quota_recovered(context);
+    }
+
+    #[test]
+    fn loadstart_abort_performs_no_source_read() {
+        // A `loadstart` handler aborts synchronously: the old pump must
+        // become a strict no-op before its first source read.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            data: bytes::Bytes::copy_from_slice(b"abc"),
+            reads: Arc::clone(&reads),
+        });
+        let context = &mut setup_with_limits(quota_one_limits());
+        publish_blob(context, blob_over(source, 3));
+        publish_reader(context);
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; \
+                 reader.addEventListener('loadstart', function () { \
+                     globalThis.log.push('loadstart'); \
+                     this.abort(); \
+                 }); \
+                 for (var t of ['progress','load','error','abort','loadend']) \
+                     reader.addEventListener(t, (function (tt) { \
+                         return function () { globalThis.log.push(tt); }; \
+                     })(t)); \
+                 reader.readAsArrayBuffer(srcBlob);",
+            ))
+            .expect("start read");
+        drain(context);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "stale pump must not read from the source"
+        );
+        assert_eq!(js_log(context), "loadstart|abort|loadend");
+        assert_eq!(js_state(context), "2:null:null");
+        assert_quota_recovered(context);
+    }
+
+    #[test]
+    fn loadstart_abort_then_restart_emits_only_new_operation() {
+        // `loadstart` handler aborts and immediately starts a new read: the
+        // old abort dispatch is stale (generation replaced before delivery)
+        // and emits nothing; only the new operation's events follow, and the
+        // old source is never read.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            data: bytes::Bytes::copy_from_slice(b"old"),
+            reads: Arc::clone(&reads),
+        });
+        let context = &mut setup_with_limits(quota_one_limits());
+        publish_blob(context, blob_over(source, 3));
+        publish_reader(context);
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; \
+                 globalThis.good = new Blob(['new']); \
+                 reader.addEventListener('loadstart', function () { \
+                     globalThis.log.push('loadstart'); \
+                     if (globalThis.armed !== false) { \
+                         globalThis.armed = false; \
+                         this.abort(); \
+                         this.readAsText(globalThis.good); \
+                     } \
+                 }); \
+                 for (var t of ['progress','load','error','abort','loadend']) \
+                     reader.addEventListener(t, (function (tt) { \
+                         return function () { globalThis.log.push(tt); }; \
+                     })(t)); \
+                 globalThis.armed = true; \
+                 reader.readAsArrayBuffer(srcBlob);",
+            ))
+            .expect("start read");
+        drain(context);
+        drain(context);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "stale pump must not read from the source"
+        );
+        assert_eq!(
+            js_log(context),
+            "loadstart|loadstart|progress|load|loadend",
+            "old abort/loadend are stale and emit nothing"
+        );
+        let result = context
+            .eval(Source::from_bytes("reader.result"))
+            .expect("result")
+            .as_string()
+            .expect("result string")
+            .to_std_string_escaped();
+        assert_eq!(result, "new");
+        assert_quota_recovered(context);
+    }
+
+    #[test]
+    fn progress_abort_freezes_source_reads() {
+        // Multichunk blob (3 x 16 KiB): aborting in the first progress
+        // handler must freeze source reads at exactly one chunk and emit
+        // no further events for the old generation.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            data: bytes::Bytes::from(vec![7u8; 3 * 16384]),
+            reads: Arc::clone(&reads),
+        });
+        let limits = FileApiLimits {
+            default_chunk_size: 16 * 1024,
+            ..FileApiLimits::default()
+        };
+        let context = &mut setup_with_limits(limits);
+        publish_blob(context, blob_over(source, 3 * 16384));
+        publish_reader(context);
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; \
+                 for (var t of ['loadstart','progress','load','error','abort','loadend']) \
+                     reader.addEventListener(t, (function (tt) { \
+                         return function (e) { \
+                             globalThis.log.push(tt + ':' + e.loaded); \
+                             if (tt === 'progress') this.abort(); \
+                         }; \
+                     })(t)); \
+                 reader.readAsArrayBuffer(srcBlob);",
+            ))
+            .expect("start read");
+        drain(context);
+        drain(context);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "no chunk may be read after the aborting progress handler"
+        );
+        assert_eq!(
+            js_log(context),
+            "loadstart:0|progress:16384|abort:16384|loadend:16384"
+        );
+        assert_eq!(js_state(context), "2:null:null");
+    }
+
+    #[test]
+    fn error_handler_restart_suppresses_old_loadend() {
+        // Reentrant `error` case: the failing operation's `error` handler
+        // starts a new read. Only the old `loadend` is suppressed; the new
+        // operation completes intact and the quota is fully recovered.
+        let context = &mut setup_with_limits(quota_one_limits());
+        publish_blob(context, blob_over(Arc::new(FailSource { len: 3 }), 3));
+        publish_reader(context);
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; \
+                 globalThis.good = new Blob(['ok']); \
+                 reader.addEventListener('error', function () { \
+                     globalThis.log.push('error'); \
+                     this.readAsText(globalThis.good); \
+                 }); \
+                 for (var t of ['loadstart','progress','load','abort','loadend']) \
+                     reader.addEventListener(t, (function (tt) { \
+                         return function () { globalThis.log.push(tt); }; \
+                     })(t)); \
+                 reader.readAsArrayBuffer(srcBlob);",
+            ))
+            .expect("start read");
+        drain(context);
+        drain(context);
+        assert_eq!(
+            js_log(context),
+            "loadstart|error|loadstart|progress|load|loadend",
+            "old loadend is suppressed, new operation completes"
+        );
+        let result = context
+            .eval(Source::from_bytes("reader.result"))
+            .expect("result")
+            .as_string()
+            .expect("result string")
+            .to_std_string_escaped();
+        assert_eq!(result, "ok");
+        assert_eq!(js_state(context), "2:string:null");
+        assert_quota_recovered(context);
+    }
 }
