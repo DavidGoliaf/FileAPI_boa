@@ -156,24 +156,35 @@ packaging shared with the async reader:
   snapshot wins; the per-source check is the security boundary).
 - `boa_fapi_fs::FsRegistry` — owns already-open read-only handles by
   opaque id; captures the import snapshot with safe `Metadata` APIs;
-  positional reads release the lock before I/O.
+  the `Mutex` guards only the slot map and is never held across I/O
+  (handles are cloned via `try_clone` under a short lock; metadata and
+  positional reads run on the clone after the lock drops). `close`
+  removes the slot (handle drops immediately), `close_all` drops every
+  slot, `on_shutdown`/`run_closers` fire one-shot closers outside the
+  lock.
 - `boa_fapi_fs::FileSource` / `HostFileSource` — `ByteSource` over a
-  registered slot: cancel → checked arithmetic → live-vs-import snapshot
-  → policy hook → positional read → exact-length check → post-read
-  confirm; `open_copy_on_import` for strict platforms/untrusted JS.
+  registered slot, Unix-only (`PermissionDenied` elsewhere): cancel →
+  checked arithmetic → live-vs-import snapshot → policy hook →
+  positional read → exact-length check → post-read confirm;
+  `open_copy_on_import` (every platform; closes the live handle eagerly)
+  is the enforced fallback for weak platforms and untrusted JS.
 - `boa_fapi_fs::policy` — `DenyRawPathPolicy` (default deny),
-  `RegistryPolicy` (live-slot approval + per-read revalidation),
-  `RootConfinedPolicy` (open-handle identity only, never string prefix).
-- `boa_fapi::FileApiHandle::file_from_resource(Arc<dyn FileResource>,
-  display_name, options, context)` — validates live==import before any
-  JS object, preflights `max_blob_size`, wraps in `ArcResourceSource`
-  (shutdown-aware, per-read snapshot checks), attaches only the display
-  name (`/` → `:`, no basename). Signature adaptation (`Arc` vs target
-  `&dyn`) recorded in ADR-0024.
-- `boa_fapi::lifecycle` — `ShutdownFlag` in `RegisteredSpecs`/handle/
-  every fs import; `FileApiHandle::shutdown` (idempotent, atomic vs new
-  host ops, cancels pending work, late jobs settle nothing). Blob URL
-  store and structured-clone lifetime stay M6 extension points.
+  `RegistryPolicy` (live-slot approval + per-read revalidation; refuses
+  `authorize_open` off-Unix), `RootConfinedPolicy` (open-handle identity
+  only, never string prefix).
+- `boa_fapi::FileApiHandle::file_from_resource(registry, Arc<dyn
+  FileResource>, display_name, options, context)` — validates live==
+  import plus the weak-platform gate before any JS object, preflights
+  `max_blob_size`, tracks the registry for shutdown `close_all`, wraps in
+  `ArcResourceSource` (shutdown-aware, per-read snapshot checks),
+  attaches only the display name (`/` → `:`, no basename). Signature
+  adaptation (`registry` + `Arc` vs target `&dyn`) recorded in ADR-0024.
+- `boa_fapi::lifecycle` — `ShutdownFlag` (closed bit + cancellation +
+  tracked closers) in `RegisteredSpecs`/handle/every fs import;
+  `FileApiHandle::shutdown` runs all closers exactly once (`close_all`
+  per tracked registry → OS handles drop **at shutdown**), cancels
+  pending work, and makes late jobs settle nothing. Blob URL store and
+  structured-clone lifetime stay M6 extension points.
 - No JS path API exists: no raw-path import, no directory enumeration,
   no location/identity in JS errors, tracing, blob URLs, or artifacts.
 

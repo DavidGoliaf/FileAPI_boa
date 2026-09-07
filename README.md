@@ -97,19 +97,24 @@ context.run_jobs().expect("jobs failed");
 - **M5 (`boa_fapi_fs` + `boa_fapi` `fs` feature)**: capability-based
   filesystem `File`. The host opens a read-only resource before any JS
   exists, registers it with `boa_fapi_fs::FsRegistry` (opaque id only —
-  no path crosses the boundary), and imports it with
-  `FileApiHandle::file_from_resource(resource, display_name, options,
-  context)`. JS observes only content and the explicit display name.
-  Every `read_range` validates cancellation, checked arithmetic, and the
-  live opaque snapshot (identity + size + mtime) against the import
-  snapshot before reading, verifies exact bytes afterwards, and fails
-  with `SnapshotChanged`/`NotFound`/`FileLocked`/`PermissionDenied`/
-  `InvalidRange` (JS: `NotReadableError`, no path detail, no partial
-  bytes). Host-controlled `FileApiHandle::shutdown` cancels pending
-  filesystem work, rejects new operations, and lets late jobs settle
-  nothing after context destruction. Disable with `--no-default-features`
-  (memory API and registration keep working; no partial filesystem
-  surface).
+  no location crosses the boundary), and imports it with
+  `FileApiHandle::file_from_resource(registry, resource, display_name,
+  options, context)` (Unix live-handle path; Windows / non-Unix hosts
+  use enforced `open_copy_on_import` + `file_from_bytes` because no
+  strong handle identity exists there). JS observes only content and the
+  explicit display name. Every Unix `read_range` validates cancellation,
+  checked arithmetic, and the live opaque snapshot (identity + size +
+  mtime) against the import snapshot before reading (the registry mutex
+  guards only the slot map and is never held across I/O — handles are
+  cloned via `try_clone` first), verifies exact bytes afterwards, and
+  fails with `SnapshotChanged`/`NotFound`/`FileLocked`/
+  `PermissionDenied`/`InvalidRange` (JS: `NotReadableError`, no location
+  detail, no partial bytes). Host-controlled `FileApiHandle::shutdown`
+  runs every tracked registry's `close_all` (OS handles drop
+  immediately), cancels pending filesystem work, rejects new operations,
+  and lets late jobs settle nothing after context destruction. Disable
+  with `--no-default-features` (memory API and registration keep
+  working; no partial filesystem surface).
 
 Not yet implemented (M6–M7): worker environments beyond the descriptor,
 blob URLs, structured clone, full DOM/HTML,

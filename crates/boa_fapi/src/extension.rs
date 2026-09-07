@@ -714,7 +714,7 @@ impl FileApiHandle {
     /// The host passes an opaque [`FileResource`](boa_fapi_core::policy::FileResource)
     /// handle (already open, read-only, capability-checked) plus the only
     /// name JS observes, `display_name` (no basename is computed from any
-    /// secret host path; `/` becomes `:` like the JS constructor). The
+    /// secret host location; `/` becomes `:` like the JS constructor). The
     /// resource is validated (live snapshot matches the import snapshot,
     /// plus a preflight size check against `max_blob_size`) before any
     /// JS-visible object exists, so a denial leaves no partial state. Name
@@ -722,15 +722,23 @@ impl FileApiHandle {
     /// Cargo feature this method does not exist; the memory API and
     /// registration keep working unchanged.
     ///
-    /// Signature adaptation (recorded in the ADR): the target shape takes
-    /// `&dyn FileResource`, but `ByteSource: 'static` cannot borrow it, so
-    /// this method takes `Arc<dyn FileResource>` ownership instead. The
-    /// backing `ArcResourceSource` revalidates the live snapshot before
-    /// every read and verifies exact bytes afterwards, with no partial
-    /// result and no location/identity disclosure.
+    /// Two enforced boundaries (recorded in the ADR):
+    ///
+    /// - signature adaptation: the target shape takes `&dyn FileResource`,
+    ///   but `ByteSource: 'static` cannot borrow it, so this method takes
+    ///   `Arc<dyn FileResource>` ownership instead. The backing
+    ///   `ArcResourceSource` revalidates the live snapshot before every
+    ///   read and verifies exact bytes afterwards, with no partial result
+    ///   and no location/identity disclosure.
+    /// - shutdown handle release: the caller additionally passes the
+    ///   `FsRegistry` that owns the resource, so the import can register a
+    ///   shutdown closer (`close_all`) with it. [`FileApiHandle::shutdown`]
+    ///   then drops OS handles immediately instead of deferring release to
+    ///   registry destruction.
     #[cfg(feature = "fs")]
     pub fn file_from_resource(
         &self,
+        registry: &boa_fapi_fs::FsRegistry,
         resource: std::sync::Arc<dyn boa_fapi_core::policy::FileResource>,
         display_name: &str,
         options: HostFileOptions,
@@ -755,6 +763,35 @@ impl FileApiHandle {
                 boa_fapi_core::file_api_error::FileApiError::SnapshotChanged,
             ));
         }
+        // Enforced (not advisory): live-handle imports exist only on
+        // platforms with a strong open-handle identity. On Unix the
+        // live-vs-import comparison detects replacement; elsewhere a
+        // filesystem-backed resource is refused outright — hosts must use
+        // `copy_on_import` (immutable memory bytes via `file_from_bytes`)
+        // or deny the import. Memory snapshots are always valid.
+        //
+        // The check runs only when the platform reports a weak identity so
+        // that `platform_has_strong_identity` stays mockable in unit tests
+        // without changing production behavior.
+        #[cfg(not(unix))]
+        if matches!(
+            grant.snapshot,
+            boa_fapi_core::snapshot::SnapshotState::Filesystem(_)
+        ) && !boa_fapi_fs::platform_has_strong_identity()
+        {
+            return Err(crate::error::js_from_core(
+                boa_fapi_core::file_api_error::FileApiError::PermissionDenied,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let _ = &grant;
+        }
+        // Track the registry for handle release at shutdown: `close_all`
+        // is idempotent, so tracking once per import is harmless even when
+        // several imports share one registry.
+        let tracked = registry.clone();
+        self.shutdown.track(move || tracked.close_all());
         let adapter: Arc<dyn boa_fapi_core::source::ByteSource> =
             Arc::new(ArcResourceSource::new(resource, self.shutdown.clone()));
         let data = blob::data_from_fs_source(adapter, &options.media_type, self.specs.limits())
@@ -797,10 +834,12 @@ impl FileApiHandle {
     /// Idempotent: repeated calls neither panic nor enqueue callbacks.
     /// Atomic with respect to new host-created `File`/resource operations
     /// (they are rejected once closed). Pending filesystem reads observe
-    /// the shared cancellation; new reads, materializations, stream pulls,
-    /// and FileReader jobs after shutdown settle nothing against a
-    /// destroyed context. Releases file handles/capabilities without
-    /// leaving paths or identities in queues, errors, or JS objects.
+    /// the shared cancellation; every tracked registry runs `close_all`,
+    /// so OS handles are dropped immediately (not deferred to registry
+    /// destruction); new reads, materializations, stream pulls, and
+    /// FileReader jobs after shutdown settle nothing against a destroyed
+    /// context. No locations or identities leak into queues, errors, or JS
+    /// objects.
     #[cfg(feature = "fs")]
     pub fn shutdown(&self, context: &mut Context) -> Result<(), RegisterError> {
         crate::lifecycle::shutdown_runtime(&self.shutdown, context)

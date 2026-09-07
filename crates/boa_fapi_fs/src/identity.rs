@@ -1,16 +1,30 @@
 //! Opaque platform identity captured with safe Rust APIs.
 //!
-//! The identity hash mixes the platform-provided file identity (Unix
-//! `dev`/`ino`, Windows `file_index`/`volume_serial`, where the platform
-//! exposes them through safe `Metadata` APIs) with the size and
-//! modification time. It never encodes a path, handle value, or secret
-//! name. When the platform cannot provide a stable identity, callers must
-//! use `copy_on_import` (see [`crate::source::open_copy_on_import`]) or
-//! refuse the import; the fallback is recorded in the ADR.
+//! Only Unix provides a strong open-handle identity through stable safe
+//! APIs (`dev`/`ino`): the identity hash mixes it with size and
+//! modification time, and it never encodes a location, handle value, or
+//! secret name. On every other platform (Windows included) the OS does not
+//! expose a stable file identity through safe Rust on the pinned toolchain,
+//! so direct handle imports are refused and hosts must use
+//! `copy_on_import` (see [`crate::source::open_copy_on_import`]) or deny
+//! the import. This enforcement (not a documented fallback) is recorded in
+//! the ADR and gated by [`platform_has_strong_identity`].
 
 use std::time::SystemTime;
 
 use boa_fapi_core::snapshot::FileSnapshot;
+
+/// Returns `true` only where the OS exposes a strong file identity
+/// through stable safe Rust APIs.
+///
+/// Unix (`dev` + `ino` via `MetadataExt`) is the only such platform on
+/// the pinned toolchain. Windows (`file_index` / `volume_serial_number`)
+/// requires the unstable `windows_by_handle` feature and is therefore
+/// **not** strong here: Windows imports must go through `copy_on_import`
+/// or be denied — never through a weak attributes/mtime fallback.
+pub fn platform_has_strong_identity() -> bool {
+    cfg!(unix)
+}
 
 /// Captures the opaque identity of an already-open file.
 ///
@@ -76,11 +90,12 @@ fn identity_hash(
 
 /// Feeds platform-provided file identity fields into `mix`.
 ///
-/// Unix: `dev` + `ino` via `MetadataExt`. Windows: `file_index` +
-/// `volume_serial_number` via `MetadataExt`. Other platforms: no stable
-/// identity is available through safe APIs, so only size/mtime feed the
-/// hash — callers on such platforms must prefer `copy_on_import` or
-/// refuse the import (documented in the ADR).
+/// Unix: `dev` + `ino` via `MetadataExt` (strong identity). Non-Unix:
+/// contributes no identity fields — only size/mtime feed the hash from the
+/// caller — because no stable identity is available through safe APIs.
+/// Non-Unix callers must not treat the resulting snapshot as
+/// replacement-proof: direct imports are refused at the policy/source
+/// boundary (see [`platform_has_strong_identity`]).
 #[cfg(unix)]
 fn platform_identity(metadata: &std::fs::Metadata, mix: &mut dyn FnMut(u64)) {
     use std::os::unix::fs::MetadataExt;
@@ -88,16 +103,5 @@ fn platform_identity(metadata: &std::fs::Metadata, mix: &mut dyn FnMut(u64)) {
     mix(metadata.ino());
 }
 
-#[cfg(windows)]
-fn platform_identity(metadata: &std::fs::Metadata, mix: &mut dyn FnMut(u64)) {
-    use std::os::windows::fs::MetadataExt;
-    // Stable on 1.91 without `windows_by_handle`: fall back to the always
-    // available attributes plus size/mtime (mixed by the caller). Windows
-    // hosts needing strict replacement detection should use
-    // `copy_on_import` (documented in the ADR).
-    mix(u64::from(metadata.file_attributes()));
-    mix(metadata.creation_time());
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn platform_identity(_metadata: &std::fs::Metadata, _mix: &mut dyn FnMut(u64)) {}

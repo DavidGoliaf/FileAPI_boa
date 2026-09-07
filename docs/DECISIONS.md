@@ -413,52 +413,74 @@ partial result невозможен.
 
 Решение: `boa_fapi_core::policy` (Boa-free) владеет типами
 `HostResourceId(u64)` (opaque слот), `FileOpenRequest { resource,
-display_name, max_bytes }` (без пути), `FileGrant { resource, snapshot }`
-(opaque capability), `trait FileResource` (positional `read_at` +
-`current_snapshot`/`import_snapshot`, без пути), `trait
+display_name, max_bytes }` (без локации), `FileGrant { resource,
+snapshot }` (opaque capability), `trait FileResource` (positional
+`read_at` + `current_snapshot`/`import_snapshot`, без локации), `trait
 FileResourceOpener` (host callback, возвращающий только id),
 `trait FileAccessPolicy` целевой формы ТЗ (`authorize_open`/
 `authorize_read`) и `DenyAllPolicy` (default deny). `boa_fapi_fs`
 владеет `FsRegistry` (map id → открытый `std::fs::File` + import
-snapshot, короткие блокировки, positional reads без общего курсора) и
-`RegisteredResource` (только id + клон registry). `file_from_resource`
-принимает `Arc<dyn FileResource>` вместо целевого `&dyn` (иначе
-`ByteSource: 'static` нельзя построить без lifetime в публичном типе);
-backing `ArcResourceSource` хранит только id/снапшот/shutdown и
-делегирует каждое чтение ресурсу с pre/post snapshot-проверкой.
+snapshot + pending `on_shutdown` closers; Mutex охраняет только карту и
+никогда не удерживается во время I/O — операции клонируют handle через
+`try_clone` под короткой блокировкой и читают метаданные/байты после
+снятия блокировки) и `RegisteredResource` (только id + клон registry).
+`FsRegistry::close` удаляет слот (OS handle дропается немедленно, не
+откладывается до уничтожения registry); `close_all` дропает все слоты;
+`on_shutdown`/`run_closers` выполняют one-shot closers ровно один раз
+вне блокировки. `file_from_resource` принимает `(registry, Arc<dyn
+FileResource>)` вместо целевого `&dyn` (иначе `ByteSource: 'static`
+нельзя построить без lifetime в публичном типе, а registry нужен для
+трекинга shutdown closer'а); backing `ArcResourceSource` хранит только
+id/снапшот/shutdown и делегирует каждое чтение ресурсу с pre/post
+snapshot-проверкой.
 
-Последствия: путь не пересекает границу ни в одном публичном типе,
+Последствия: локация не пересекает границу ни в одном публичном типе,
 методе или ошибке (guards `public_api_no_path_types`,
 `public_api_exposes_no_paths_or_mutable_bytes` расширены); закрытие
-идемпотентно; чтения после закрытия — `NotFound`.
+удаляет слот немедленно и идемпотентно; чтения после закрытия —
+`NotFound`.
 
-## ADR-0025 (M5): snapshot identity и fallback `copy_on_import`
+## ADR-0025 (M5): snapshot identity и enforced `copy_on_import`-or-deny
 
 Контекст: ТЗ §4.1 требует opaque identity + size + modification marker,
 детект replacement (не только mtime/size), без `mtime + size` как
 «полноценной защиты»; если платформа не гарантирует identity —
-`copy_on_import` либо отказ, никогда string-prefix пути.
+`copy_on_import` либо отказ, никогда string-prefix локации. Заказ §3.1
+прямо: «если платформа не может гарантировать безопасную
+identity-проверку на открытом handle, реализация обязана выбрать
+`copy_on_import` либо отказать в импорте».
 
 Решение: `FileSnapshot { identity: u64, size, mtime_secs, mtime_nanos }`
-(FNV-1a hash; Unix: `dev`+`ino` через `MetadataExt`, Windows: stable
-`file_attributes`+`creation_time` + size/mtime — NTFS file id недоступен
-в safe Rust 1.91 без `windows_by_handle`, что задокументировано как
-ограничение). `BlobData` вычисляет blob-level snapshot через
-`snapshot_for_segments` (первый `Filesystem` в порядке сегментов;
-информативен — границей является per-source проверка в `read_range`).
-`FileSource::read_range` и `ArcResourceSource::read_range`: cancel →
-shutdown → checked arithmetic → live snapshot == import → policy hook →
-positional read → exact-length check → post-read snapshot confirm.
-Несовпадение — `SnapshotChanged` (JS: `NotReadableError`), без partial
-bytes. `open_copy_on_import` материализует точечный снимок под
-`max_bytes` для недоверенного JS/строгих платформ. `RootConfinedPolicy`
-сверяет только opaque identity открытого handle; `starts_with(root)`
-запрещён guards по построению (пути нет вообще).
+(FNV-1a hash; Unix: `dev`+`ino` через `MetadataExt` — единственная
+сильная identity в safe Rust 1.91). `platform_has_strong_identity() ==
+cfg!(unix)`; на всех остальных платформах (Windows включительно)
+прямые live-handle импорты **принудительно запрещены**, а не покрыты
+слабым fallback'ом: `FileSource::new` возвращает `PermissionDenied`,
+`RegistryPolicy::authorize_open` возвращает `PermissionDenied`, а
+`file_from_resource` (non-Unix) отказывает `Filesystem` grants с
+`PermissionDenied` до создания JS-объекта. NTFS `file_index`/`volume`
+не используются: они требуют нестабильный `windows_by_handle` и потому
+не являются safe-гарантией на зафиксированном тулчейне.
+`open_copy_on_import` — обязательный fallback: доступен везде (через
+`new_for_copy` мимо gate), материализует точечный снимок под
+`max_bytes` и сразу закрывает live handle, так что weak-платформа не
+удерживает OS handle ради копии. `BlobData` вычисляет blob-level
+snapshot через `snapshot_for_segments` (первый `Filesystem` в порядке
+сегментов; информативен — границей является per-source проверка в
+`read_range`). `FileSource::read_range` и `ArcResourceSource::read_range`:
+cancel → shutdown → checked arithmetic → live snapshot == import →
+policy hook → positional read → exact-length check → post-read snapshot
+confirm. Несовпадение — `SnapshotChanged` (JS: `NotReadableError`), без
+partial bytes. `RootConfinedPolicy` сверяет только opaque identity
+открытого handle; `starts_with(root)` запрещён по построению (локации
+нет вообще).
 
-Последствия: truncate/replacement/delete/rename детектятся до нового
-chunk; short read — `InvalidRange`; mtime+size одни никогда не
-объявляются достаточными (identity hash обязателен, fallback
-задокументирован).
+Последствия: на Unix truncate/replacement/delete/rename детектятся до
+нового chunk; short read — `InvalidRange`; mtime+size одни никогда не
+объявляются достаточными. На Windows/прочих — только
+`copy_on_import`-or-deny (тесты `weak_platform_direct_import_is_refused`,
+`weak_platform_copy_reports_no_location_detail`); живых handle-чтений и
+мутационных race-тестов там нет по построению, а не silent-skip.
 
 ## ADR-0026 (M5): lifecycle API — `FileApiHandle::shutdown`
 
@@ -468,20 +490,25 @@ chunk; short read — `InvalidRange`; mtime+size одни никогда не
 Решение: выбрана форма `FileApiHandle::shutdown(&self, context) ->
 Result<(), RegisterError>` (mapping зафиксирован здесь): эквивалентные
 гарантии целевой форме без разрыва существующего `register → handle`
-контракта. `ShutdownFlag { closed: Arc<AtomicBool>, cancel:
-CancellationToken }` живёт в `RegisteredSpecs` и клонируется в handle и
-в каждый fs-import. Shutdown идемпотентен, атомарен относительно новых
-host-операций (reject до мутации `globalThis`), отменяет pending fs-work
-через существующий cancellation protocol (без abort unsafe-кодом),
-освобождает handles (close registry), а late Boa jobs (promise reads,
-FileReader pump/dispatch, stream `pump_one`) находят closed state и не
-посылают jobs/callbacks в уничтоженный context. Blob URL store и
-structured-clone lifetime — M6 scope: extension points зарезервированы в
-`lifecycle.rs` без реализации.
+контракта. `ShutdownFlag` (closed bit + shared `CancellationToken` +
+`Mutex<Vec<ShutdownCloser>>`, за `Arc`) живёт в `RegisteredSpecs` и
+клонируется в handle и в каждый fs-import. Каждый `file_from_resource`
+трекает свой registry (`track(move || registry.close_all())`); shutdown
+идемпотентен (closers выполняются ровно один раз, повторный shutdown —
+no-op), атомарен относительно новых host-операций (reject до мутации
+`globalThis`), выполняет все трекнутые closers (каждый `close_all`
+удаляет слоты и дропает OS handles **немедленно**, не откладывая до
+уничтожения registry), затем отменяет pending fs-work через
+существующий cancellation protocol (без abort unsafe-кодом). Late Boa
+jobs (promise reads, FileReader pump/dispatch, stream `pump_one`)
+находят closed state и не посылают jobs/callbacks в уничтоженный
+context. Blob URL store и structured-clone lifetime — M6 scope:
+extension points зарезервированы в `lifecycle.rs` без реализации.
 
-Последствия: повторный shutdown не паникует и не ставит callbacks; новые
-reads/materialize/stream/FileReader после shutdown запрещены; M2–M4
-regression зелёная.
+Последствия: повторный shutdown не паникует и не ставит callbacks; OS
+handles освобождаются в момент shutdown (доказано `live_slot_count`
+тестами, а не уничтожением registry); новые reads/materialize/stream/
+FileReader после shutdown запрещены; M2–M4 regression зелёная.
 
 ## ADR-0027 (M5): новая Cargo feature `fs` без новых dependencies
 

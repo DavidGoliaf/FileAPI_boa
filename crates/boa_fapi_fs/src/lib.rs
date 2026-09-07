@@ -19,8 +19,15 @@
 //!   (JS sees only `NotReadableError` via the central mapping);
 //! - `read_range` returns exactly the requested bytes or fails with no
 //!   partial result;
-//! - after [`FileSource::close`]/registry [`FsRegistry::close`] or process
-//!   shutdown, reads fail and no callback touches a destroyed context.
+//! - after [`FileSource::close`]/registry [`FsRegistry::close`]/
+//!   [`FsRegistry::close_all`] or runtime shutdown (via closers registered
+//!   with [`FsRegistry::on_shutdown`] and fired by
+//!   [`FsRegistry::run_closers`]), OS handles are dropped immediately and
+//!   reads fail; no callback touches a destroyed context.
+//!
+//! On platforms without a strong open-handle identity (Windows and other
+//! non-Unix targets) direct imports are refused: hosts must use
+//! [`open_copy_on_import`] (see [`platform_has_strong_identity`]).
 #![deny(unsafe_code)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
@@ -32,5 +39,6 @@ mod policy;
 mod source;
 
 pub use capability::{FsRegistry, RegisteredResource};
+pub use identity::platform_has_strong_identity;
 pub use policy::{DenyRawPathPolicy, RegistryPolicy, RootConfinedPolicy};
 pub use source::{FileSource, HostFileSource, open_copy_on_import};

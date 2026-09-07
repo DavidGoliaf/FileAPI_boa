@@ -2,7 +2,8 @@
 
 - Base: `f5404de6a105c52dc128e686e18d92b376603bd4` (accepted M4-B final).
 - Branch: `task/m5`.
-- Status: acceptance requested. No M6 started.
+- Status: acceptance requested (second submission, after R1–R3 rework).
+  No M6 started.
 
 ## What was built
 
@@ -13,29 +14,58 @@ and lifecycle shutdown (order `M5-FS-FILE-SECURITY`):
   module (`HostResourceId`, `FileOpenRequest`, `FileGrant`,
   `FileResource`, `FileResourceOpener`, `FileAccessPolicy`,
   `DenyAllPolicy`); `BlobData` blob-level snapshot derivation.
-- `boa_fapi_fs`: `FsRegistry`/`RegisteredResource` (opaque id only),
-  `identity` (safe `Metadata` capture; Unix dev+ino, Windows
-  attributes+creation-time, documented fallback), `FileSource`/
-  `HostFileSource` (cancel → arithmetic → snapshot → policy → positional
-  read → exact-length → post-read confirm), `DenyRawPathPolicy`/
-  `RegistryPolicy`/`RootConfinedPolicy`, `open_copy_on_import`.
+- `boa_fapi_fs`: `FsRegistry`/`RegisteredResource` (opaque id only;
+  `close` removes the slot, `close_all` drops all handles,
+  `on_shutdown`/`run_closers` one-shot closers, `live_slot_count`
+  proofs; mutex guards only the map, I/O runs on `try_clone`d handles
+  after unlock), `identity` (`platform_has_strong_identity() ==
+  cfg!(unix)`; Unix dev+ino; no weak fallback), `FileSource` (Unix-only;
+  `new_for_copy` backs the universal `open_copy_on_import`, which closes
+  the live handle eagerly) / `HostFileSource`, `DenyRawPathPolicy` /
+  `RegistryPolicy` (refuses `authorize_open` off-Unix) /
+  `RootConfinedPolicy`, `open_copy_on_import`.
 - `boa_fapi` (`fs` feature, default on): `blob::data_from_fs_source`
   (preflight `max_blob_size`), `file::native_from_data` (display name
-  only), `FileApiHandle::file_from_resource(Arc<dyn FileResource>, ...)`
-  (validates live==import before any JS object; `Arc` adaptation of the
-  target `&dyn` shape recorded in ADR-0024), `FileApiHandle::shutdown`
-  (form chosen over `FileApiExtension::shutdown`, ADR-0026),
-  `lifecycle::ShutdownFlag` shared by specs/handle/every import, closed-
-  state checks in promise settlement, FileReader pump/dispatch, stream
-  pumps, and the fs adapter; handle entry-point rejects after shutdown.
-- Tests: 17 `boa_fapi_fs` units (`fs_tests`), 15 `boa_fapi` JS
-  integration (`m5_file_fs`); guards extended minimally (M5 shutdown
+  only), `FileApiHandle::file_from_resource(registry, Arc<dyn
+  FileResource>, ...)` (validates live==import plus the weak-platform
+  gate before any JS object; tracks the registry for shutdown; `Arc`
+  adaptation of the target `&dyn` shape recorded in ADR-0024),
+  `FileApiHandle::shutdown` (form chosen over
+  `FileApiExtension::shutdown`, ADR-0026), `lifecycle::ShutdownFlag`
+  (closed bit + cancellation + tracked closers, exactly-once) shared by
+  specs/handle/every import, closed-state checks in promise settlement,
+  FileReader pump/dispatch, stream pumps, and the fs adapter; handle
+  entry-point rejects after shutdown.
+- Tests: `boa_fapi_fs` units (`fs_tests`: Unix-only live tests
+  `#[cfg(unix)]`, universal refusal/copy tests everywhere), `boa_fapi`
+  JS integration (`m5_file_fs`: platform-mandated host path —
+  live-handle on Unix, `copy_on_import` elsewhere; per-platform
+  shutdown-handle proofs); guards extended minimally (M5 shutdown
   exception documented inline).
 - Docs: `README.md`, `docs/architecture.md`, `docs/security.md` (new),
-  `docs/host-integration.md` (new), `docs/DECISIONS.md` (ADR-0024–0027),
-  `docs/spec-matrix.md` (M5-FS-01..10), `docs/m5-validation.md`,
-  `docs/m5-final-audit.md`; CI (`.github/workflows/ci.yml`) gains the
-  `boa_fapi_fs` and M5 host-integration jobs on Ubuntu + Windows.
+  `docs/host-integration.md` (new, both host paths),
+  `docs/DECISIONS.md` (ADR-0024–0027, R1–R3 corrections),
+  `docs/spec-matrix.md` (M5-FS-01..10, R1–R3 rows), `docs/m5-validation.md`,
+  `docs/m5-final-audit.md` (R1–R3 section); CI
+  (`.github/workflows/ci.yml`) gains the `boa_fapi_fs` and M5
+  host-integration jobs on Ubuntu + Windows.
+
+## Post-handoff review blockers R1–R3 (fixed in this submission)
+
+- **R1 — shutdown now drops OS handles immediately.** `close` removes the
+  slot, `close_all` drops all slots, shutdown drains tracked closers
+  exactly once before cancelling work. The old "close flips a flag"
+  behavior and the handoff claim are replaced by `live_slot_count`
+  proofs.
+- **R2 — enforced `copy_on_import`-or-deny off-Unix.** The Windows
+  attributes/mtime fallback is gone (it could not detect same-metadata
+  replacement). `FileSource::new`, `RegistryPolicy::authorize_open`, and
+  `file_from_resource` refuse filesystem-backed live imports off-Unix;
+  hosts use `open_copy_on_import` (live handle closed eagerly).
+- **R3 — no global lock across I/O.** `live_snapshot`/`read_at` clone via
+  `try_clone` under a short lock; all metadata/byte I/O runs after
+  unlock (Unix positional reads on the clone; independent cursor
+  elsewhere).
 
 ## Omitted (M6+ scope, untouched)
 
@@ -69,17 +99,23 @@ All green locally (see `docs/m5-validation.md` for the exact counts;
 ## Deviations
 
 None from the order's normative requirements. Signature adaptation
-(`Arc<dyn FileResource>` vs target `&dyn`) and lifecycle form
-(`FileApiHandle::shutdown` vs target `FileApiExtension::shutdown`) are
-allowed adaptations recorded in ADR-0024/ADR-0026.
+(`(registry, Arc<dyn FileResource>)` vs target `&dyn`) and lifecycle
+form (`FileApiHandle::shutdown` vs target `FileApiExtension::shutdown`)
+are allowed adaptations recorded in ADR-0024/ADR-0026. Platform gating
+(`cfg!(unix)` strong identity; enforced copy-or-deny elsewhere) is the
+order §3.1-mandated behavior, recorded in ADR-0025.
 
 ## Audit findings
 
-See `docs/m5-final-audit.md` (9 findings, all fixed and re-validated;
-no unresolved items).
+See `docs/m5-final-audit.md` (initial findings + R1–R3 section, all
+fixed and re-validated; no unresolved items).
 
 ## Honest CI status
 
-Local: all commands exit 0 on this branch. CI (Ubuntu + Windows) must be
-run on the final code-commit SHA after push; this handoff does not claim
-CI results before that run.
+Local: all commands exit 0 on this branch. CI (Ubuntu + Windows) is
+triggered by the push of the final code commit; the run link and result
+are recorded below after CI finishes — this handoff does not claim CI
+results before that run.
+
+- Final code commit SHA: _filled at push time_
+- CI run: _link + result_

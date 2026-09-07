@@ -1,14 +1,26 @@
 //! M5 filesystem-backed unit tests (no Boa): capability, snapshot, policy.
+//!
+//! Direct handle tests are Unix-only (strong identity). Non-Unix targets
+//! run only the enforced-refusal tests plus `copy_on_import`, which is the
+//! mandated fallback there — never a silent pass.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(unix)]
 use boa_fapi_core::cancellation::CancellationToken;
 use boa_fapi_core::file_api_error::FileApiError;
-use boa_fapi_core::policy::{DenyAllPolicy, FileAccessPolicy, FileOpenRequest, FileResource};
+#[cfg(unix)]
+use boa_fapi_core::policy::FileResource;
+use boa_fapi_core::policy::{DenyAllPolicy, FileAccessPolicy, FileOpenRequest};
+#[cfg(unix)]
 use boa_fapi_core::snapshot::SnapshotState;
+#[cfg(unix)]
 use boa_fapi_core::source::ByteSource;
-use boa_fapi_fs::{DenyRawPathPolicy, FileSource, FsRegistry, RegistryPolicy, RootConfinedPolicy};
+#[cfg(unix)]
+use boa_fapi_fs::RootConfinedPolicy;
+use boa_fapi_fs::{
+    DenyRawPathPolicy, FileSource, FsRegistry, RegistryPolicy, platform_has_strong_identity,
+};
 
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Creates a uniquely-named temp file with `content` (cleaned up by the caller).
@@ -33,18 +45,32 @@ fn register_bytes(
     content: &[u8],
 ) -> (std::path::PathBuf, boa_fapi_fs::RegisteredResource) {
     let path = temp_file(content);
+    // Windows CI checkouts can leave read-only temp files behind; ensure a
+    // fresh writable file for every registration.
+    let _ = std::fs::remove_file(&path);
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(&path)
         .expect("open temp");
-    let resource = registry.register(file).expect("register");
+    file.set_len(0).expect("truncate temp");
+    std::fs::write(&path, content).expect("write temp file");
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("reopen temp");
+    let resource = registry.register(handle).expect("register");
     (path, resource)
 }
 
+#[cfg(unix)]
 fn source_of(registry: &FsRegistry, resource: &boa_fapi_fs::RegisteredResource) -> FileSource {
     FileSource::new(registry, resource, None).expect("source")
 }
 
+#[cfg(unix)]
 #[test]
 fn empty_file_exact_and_boundary_ranges() {
     let registry = FsRegistry::new();
@@ -58,13 +84,11 @@ fn empty_file_exact_and_boundary_ranges() {
         source.read_range(0..1, &cancel),
         Err(FileApiError::InvalidRange)
     ));
-    assert!(
-        matches!(source.snapshot(), SnapshotState::Memory)
-            || matches!(source.snapshot(), SnapshotState::Filesystem(_))
-    );
+    assert!(matches!(source.snapshot(), SnapshotState::Filesystem(_)));
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_ranges_and_checked_arithmetic() {
     let registry = FsRegistry::new();
@@ -97,6 +121,7 @@ fn exact_ranges_and_checked_arithmetic() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn cancellation_before_io() {
     let registry = FsRegistry::new();
@@ -111,6 +136,7 @@ fn cancellation_before_io() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn truncate_is_detected_before_new_chunk() {
     let registry = FsRegistry::new();
@@ -137,6 +163,7 @@ fn truncate_is_detected_before_new_chunk() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn replacement_is_detected() {
     let registry = FsRegistry::new();
@@ -157,6 +184,7 @@ fn replacement_is_detected() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn delete_is_detected() {
     let registry = FsRegistry::new();
@@ -165,13 +193,10 @@ fn delete_is_detected() {
     let cancel = CancellationToken::new();
     assert_eq!(source.read_range(0..5, &cancel).unwrap().len(), 5);
     std::fs::remove_file(&path).expect("delete");
-    // On Unix the open handle stays readable but the identity check runs on
-    // live metadata; on Windows deletion of an open file fails. Either way
-    // the source must not leak stale bytes as success-after-change: accept
-    // SnapshotChanged/NotFound, or (Unix, still-readable handle) the exact
-    // old bytes for the still-valid snapshot. The key invariant is no
-    // partial/mixed result. Here we assert the read either fails typed or
-    // returns exactly the requested bytes — never a mix.
+    // The open handle stays readable but the identity check runs on live
+    // metadata; the source must not leak stale bytes as success-after-
+    // change: accept SnapshotChanged/NotFound, or the exact old bytes for
+    // the still-valid snapshot — never a mix.
     let result = source.read_range(5..11, &cancel);
     match result {
         Err(_) => {}
@@ -180,21 +205,67 @@ fn delete_is_detected() {
 }
 
 #[test]
-fn closed_resource_fails() {
+fn close_removes_slot_and_drops_handle() {
     let registry = FsRegistry::new();
     let (path, resource) = register_bytes(&registry, b"hello");
-    let source = source_of(&registry, &resource);
+    assert_eq!(registry.live_slot_count(), 1);
+    #[cfg(unix)]
+    {
+        let source = source_of(&registry, &resource);
+        let cancel = CancellationToken::new();
+        assert_eq!(&source.read_range(0..5, &cancel).unwrap()[..], b"hello");
+    }
     resource.close();
-    let cancel = CancellationToken::new();
-    assert!(matches!(
-        source.read_range(0..5, &cancel),
-        Err(FileApiError::NotFound)
-    ));
-    // Idempotent close.
+    assert_eq!(registry.live_slot_count(), 0);
+    // Reads fail after close, and close is idempotent.
+    assert_eq!(registry.live_slot_count(), 0);
     resource.close();
+    assert!(registry.import_snapshot(resource.id()).is_err());
+    assert!(registry.live_snapshot(resource.id()).is_err());
     std::fs::remove_file(&path).ok();
 }
 
+#[test]
+fn close_all_drops_every_handle() {
+    let registry = FsRegistry::new();
+    let (path_a, resource_a) = register_bytes(&registry, b"aaa");
+    let (path_b, _resource_b) = register_bytes(&registry, b"bbb");
+    assert_eq!(registry.live_slot_count(), 2);
+    registry.close_all();
+    assert_eq!(registry.live_slot_count(), 0);
+    assert!(registry.import_snapshot(resource_a.id()).is_err());
+    // Idempotent.
+    registry.close_all();
+    assert_eq!(registry.live_slot_count(), 0);
+    std::fs::remove_file(&path_a).ok();
+    std::fs::remove_file(&path_b).ok();
+}
+
+#[test]
+fn shutdown_closers_run_once_outside_lock() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let registry = FsRegistry::new();
+    let (path, _resource) = register_bytes(&registry, b"closer");
+    let fires = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::clone(&fires);
+    // A closer that itself closes the registry must not deadlock: closers
+    // run outside the map lock.
+    let tracked = registry.clone();
+    registry.on_shutdown(move || {
+        probe.fetch_add(1, Ordering::SeqCst);
+        tracked.close_all();
+    });
+    registry.run_closers();
+    assert_eq!(fires.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.live_slot_count(), 0);
+    // Exactly-once: a second run finds nothing left.
+    registry.run_closers();
+    assert_eq!(fires.load(Ordering::SeqCst), 1);
+    std::fs::remove_file(&path).ok();
+}
+
+#[cfg(unix)]
 #[test]
 fn short_read_never_returns_partial() {
     // A resource whose live length shrinks below the requested end fails
@@ -211,21 +282,21 @@ fn short_read_never_returns_partial() {
 }
 
 #[test]
-fn blob_size_preflight_boundary() {
-    // Exact == / +1 boundary on the fs layer: == ok, +1 rejected before
-    // any output allocation.
+fn copy_bounds_and_content_everywhere() {
+    // `copy_on_import` is the mandated fallback: available on every
+    // platform, with == ok / +1 rejected before allocation completes.
     let registry = FsRegistry::new();
     let (path, resource) = register_bytes(&registry, b"12345678");
-    let source = source_of(&registry, &resource);
-    assert_eq!(source.len(), 8);
-    let adapter = boa_fapi_fs::HostFileSource::new(&registry, &resource, None).expect("adapter");
-    let _ = adapter;
-    // copy_on_import with max == len ok, max == len-1 rejected.
-    assert!(boa_fapi_fs::open_copy_on_import(&registry, &resource, 8).is_ok());
+    let bytes = boa_fapi_fs::open_copy_on_import(&registry, &resource, 8).expect("copy");
+    assert_eq!(&bytes[..], b"12345678");
     assert!(boa_fapi_fs::open_copy_on_import(&registry, &resource, 7).is_err());
+    // The live handle is closed by the copy: no OS handle is retained for
+    // a weak-platform copy.
+    assert_eq!(registry.live_slot_count(), 0);
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn oversized_range_rejected() {
     let registry = FsRegistry::new();
@@ -254,10 +325,8 @@ fn deny_policies_reject_open_and_read() {
         fs_deny.authorize_open(&request),
         Err(FileApiError::PermissionDenied)
     ));
-    let grant = boa_fapi_core::policy::FileGrant::new(
-        resource.id(),
-        resource_snapshot(&registry, &resource),
-    );
+    let snapshot = registry.import_snapshot(resource.id()).expect("snapshot");
+    let grant = boa_fapi_core::policy::FileGrant::new(resource.id(), snapshot);
     assert!(matches!(
         deny.authorize_read(&grant, &grant.snapshot),
         Err(FileApiError::PermissionDenied)
@@ -269,16 +338,7 @@ fn deny_policies_reject_open_and_read() {
     std::fs::remove_file(&_path).ok();
 }
 
-fn resource_snapshot(
-    registry: &FsRegistry,
-    resource: &boa_fapi_fs::RegisteredResource,
-) -> SnapshotState {
-    FileSource::new(registry, resource, None)
-        .expect("source")
-        .import_snapshot()
-        .clone()
-}
-
+#[cfg(unix)]
 #[test]
 fn registry_policy_accepts_live_and_rejects_changed() {
     let registry = FsRegistry::new();
@@ -316,6 +376,7 @@ fn registry_policy_accepts_live_and_rejects_changed() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn root_confined_policy_never_uses_string_prefix() {
     let registry = FsRegistry::new();
@@ -336,6 +397,7 @@ fn root_confined_policy_never_uses_string_prefix() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn file_resource_adapter_roundtrip() {
     let registry = FsRegistry::new();
@@ -361,7 +423,7 @@ fn copy_on_import_bounds_and_content() {
 }
 
 #[test]
-fn no_path_in_public_types_or_errors() {
+fn no_location_in_public_types_or_errors() {
     // Compile-time + message-surface guard: error messages carry no
     // location detail.
     for error in [
@@ -381,6 +443,32 @@ fn no_path_in_public_types_or_errors() {
     }
 }
 
+#[test]
+fn weak_platform_direct_import_is_refused() {
+    // Enforced on non-Unix: direct `FileSource` construction and
+    // `RegistryPolicy::authorize_open` refuse; `copy_on_import` stays the
+    // mandated fallback. On Unix this test labels the strong platform.
+    if platform_has_strong_identity() {
+        assert!(platform_has_strong_identity());
+        return;
+    }
+    let registry = FsRegistry::new();
+    let (path, resource) = register_bytes(&registry, b"weak-bytes!");
+    assert!(matches!(
+        FileSource::new(&registry, &resource, None),
+        Err(FileApiError::PermissionDenied)
+    ));
+    let policy = RegistryPolicy::new(registry.clone());
+    let request = FileOpenRequest::new(resource.id(), "display.txt", None);
+    assert!(matches!(
+        policy.authorize_open(&request),
+        Err(FileApiError::PermissionDenied)
+    ));
+    let bytes = boa_fapi_fs::open_copy_on_import(&registry, &resource, 64).expect("copy");
+    assert_eq!(&bytes[..], b"weak-bytes!");
+    std::fs::remove_file(&path).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_permissions_and_symlink_escape() {
@@ -394,7 +482,7 @@ fn unix_permissions_and_symlink_escape() {
     let request = FileOpenRequest::new(resource.id(), "display.txt", None);
     assert!(policy.authorize_open(&request).is_ok());
     // Symlink escape: a symlink pointing elsewhere, opened by the host and
-    // registered, yields the *target's* identity — there is no path input
+    // registered, yields the *target's* identity — there is no location input
     // to escape through. Registering the link target directly must give a
     // stable snapshot identical to opening the target.
     let mut link_path = std::env::temp_dir();
@@ -417,38 +505,8 @@ fn unix_permissions_and_symlink_escape() {
     let a = FileSource::new(&registry, &linked, None).expect("source a");
     let b = FileSource::new(&registry, &direct, None).expect("source b");
     assert_eq!(a.import_snapshot(), b.import_snapshot());
-    // chmod the target: identity must remain comparable (no path involved).
+    // chmod the target: identity must remain comparable (no location involved).
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
     std::fs::remove_file(&link_path).ok();
-    std::fs::remove_file(&path).ok();
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_identity_limitations_are_labelled() {
-    // Windows stable identity documents its limitation: the hash mixes
-    // attributes + size + mtime, not the NTFS file id (unstable API on
-    // 1.91 without `windows_by_handle`). Replacement with identical size
-    // and second-granularity mtime could theoretically collide, so the
-    // documented fallback is `copy_on_import` for strict cases.
-    let registry = FsRegistry::new();
-    let (path, resource) = register_bytes(&registry, b"windows-bytes!");
-    let source = source_of(&registry, &resource);
-    let cancel = CancellationToken::new();
-    assert_eq!(&source.read_range(0..8, &cancel).unwrap()[..], b"windows-");
-    let _fallback = boa_fapi_fs::open_copy_on_import(&registry, &resource, 64).expect("copy");
-    std::fs::remove_file(&path).ok();
-}
-
-#[cfg(not(any(unix, windows)))]
-#[test]
-fn unsupported_os_identity_is_labelled() {
-    // Non-Unix/Windows platforms have no stable identity via safe APIs:
-    // this test labels the limitation instead of silently passing.
-    let registry = FsRegistry::new();
-    let (path, resource) = register_bytes(&registry, b"portable");
-    let source = source_of(&registry, &resource);
-    let cancel = CancellationToken::new();
-    assert_eq!(&source.read_range(0..8, &cancel).unwrap()[..], b"portable");
     std::fs::remove_file(&path).ok();
 }

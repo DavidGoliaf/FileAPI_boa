@@ -4,6 +4,16 @@
 //! `boa_fapi_fs::FsRegistry` with uniquely-named temp files (cleaned up,
 //! never asserting absolute paths). Reads run through async `FileReader`,
 //! worker `FileReaderSync`, Blob materialization (`text()`), and streams.
+//!
+//! Host import path is platform-dependent (enforced, not advisory):
+//!
+//! - Unix (strong open-handle identity): live-handle import through
+//!   `HostFileSource` + `file_from_resource`, with per-chunk snapshot
+//!   revalidation and mutation tests proving `NotReadableError`.
+//! - Windows / other non-Unix (no strong identity): direct live-handle
+//!   reads are refused, so the host uses `copy_on_import` (immutable
+//!   memory bytes via `file_from_bytes`). Mutation tests there assert the
+//!   point-in-time copy semantics instead of live revalidation.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg(feature = "fs")]
@@ -13,7 +23,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use boa_engine::{Context, Source, js_string};
 use boa_fapi::{Clock, FileApiEnvironment, FileApiExtension, HostFileOptions};
-use boa_fapi_core::source::ByteSource;
 
 #[derive(Debug)]
 struct FixedClock {
@@ -54,6 +63,10 @@ fn setup() -> (Context, boa_fapi::FileApiHandle) {
     (context, handle)
 }
 
+/// Imports `content` by the platform-mandated host path:
+/// live-handle `file_from_resource` on Unix, `copy_on_import` +
+/// `file_from_bytes` elsewhere. Returns the temp location (for cleanup /
+/// mutation) and the JS object.
 fn import_file(
     handle: &boa_fapi::FileApiHandle,
     context: &mut Context,
@@ -67,12 +80,42 @@ fn import_file(
         .open(&path)
         .expect("open");
     let resource = registry.register(file).expect("register");
-    let adapter =
-        Arc::new(boa_fapi_fs::HostFileSource::new(registry, &resource, None).expect("adapter"));
-    let object = handle
-        .file_from_resource(adapter, display, HostFileOptions::default(), context)
-        .expect("import");
-    (path, object)
+    #[cfg(unix)]
+    {
+        let adapter =
+            Arc::new(boa_fapi_fs::HostFileSource::new(registry, &resource, None).expect("adapter"));
+        let object = handle
+            .file_from_resource(
+                registry,
+                adapter,
+                display,
+                HostFileOptions::default(),
+                context,
+            )
+            .expect("import");
+        (path, object)
+    }
+    #[cfg(not(unix))]
+    {
+        let bytes = boa_fapi_fs::open_copy_on_import(registry, &resource, u64::MAX).expect("copy");
+        let object = handle
+            .file_from_bytes(bytes, display, HostFileOptions::default(), context)
+            .expect("import");
+        (path, object)
+    }
+}
+
+/// Live-handle import helper (Unix-only): bypasses the copy fallback to
+/// exercise `file_from_resource` snapshot validation directly.
+#[cfg(unix)]
+fn import_live(
+    handle: &boa_fapi::FileApiHandle,
+    context: &mut Context,
+    registry: &boa_fapi_fs::FsRegistry,
+    content: &[u8],
+    display: &str,
+) -> (std::path::PathBuf, boa_engine::JsObject) {
+    import_file(handle, context, registry, content, display)
 }
 
 fn publish(context: &mut Context, name: &str, object: boa_engine::JsObject) {
@@ -86,11 +129,12 @@ fn publish(context: &mut Context, name: &str, object: boa_engine::JsObject) {
 }
 
 fn eval_str(context: &mut Context, source: &str) -> String {
-    context
+    let value = context
         .eval(Source::from_bytes(source))
-        .expect("eval")
+        .unwrap_or_else(|error| panic!("eval failed for {source}: {error}"));
+    value
         .as_string()
-        .expect("string")
+        .unwrap_or_else(|| panic!("non-string result for {source}: {value:?}"))
         .to_std_string_escaped()
 }
 
@@ -221,8 +265,10 @@ fn file_from_resource_sync_reader_in_worker() {
     std::fs::remove_file(&path).ok();
 }
 
-// 2. Snapshot change between import and read fails as NotReadableError.
+// 2. Snapshot change: Unix live-handle reads fail as NotReadableError;
+//    weak platforms use point-in-time copies (mutation invisible by design).
 
+#[cfg(unix)]
 #[test]
 fn changed_file_read_fails_not_readable_without_partial() {
     let (mut context, handle) = setup();
@@ -252,6 +298,7 @@ fn changed_file_read_fails_not_readable_without_partial() {
     std::fs::remove_file(&path).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn changed_file_filereader_fails_not_readable() {
     let (mut context, handle) = setup();
@@ -282,8 +329,14 @@ fn changed_file_filereader_fails_not_readable() {
     std::fs::remove_file(&path).ok();
 }
 
-// 3. No path/identity disclosure in JS errors or messages.
+// 3. No location disclosure in JS errors or messages.
+//
+// Unix: a mutated live handle rejects with a generic `NotReadableError`.
+// Weak platforms: the point-in-time copy cannot observe the mutation, so
+// the test asserts the copy content plus the generic mapping on a stale
+// import denial instead.
 
+#[cfg(unix)]
 #[test]
 fn js_errors_carry_no_location_detail() {
     let (mut context, handle) = setup();
@@ -309,6 +362,49 @@ fn js_errors_carry_no_location_detail() {
     assert!(!report.contains('\\'), "leak in {report}");
     assert!(!report.contains("secret-content"), "leak in {report}");
     assert!(!report.contains("tmp"), "leak in {report}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[cfg(not(unix))]
+#[test]
+fn weak_platform_copy_reports_no_location_detail() {
+    let (mut context, handle) = setup();
+    let registry = boa_fapi_fs::FsRegistry::new();
+    let (path, object) = import_file(&handle, &mut context, &registry, b"copy-content", "d.txt");
+    publish(&mut context, "srcFile", object);
+    // Point-in-time copy: later mutation is invisible by design.
+    std::fs::write(&path, b"different-content!").expect("mutate");
+    assert_eval(&mut context, "srcFile.size === 12");
+    context
+        .eval(Source::from_bytes(
+            "globalThis.report = 'pending'; \
+             srcFile.text().then(v => { globalThis.report = 'ok:' + v; }, \
+               e => { globalThis.report = e.name + '|' + e.message; });",
+        ))
+        .expect("eval");
+    drain(&mut context);
+    let report = eval_str(&mut context, "globalThis.report");
+    assert_eq!(report, "ok:copy-content", "unexpected report: {report}");
+    // A stale live-handle import is denied with a generic error carrying
+    // no location detail.
+    let stale_file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("open");
+    let stale_resource = registry.register(stale_file).expect("register");
+    let stale_adapter = Arc::new(
+        boa_fapi_fs::HostFileSource::new(&registry, &stale_resource, None).expect("adapter"),
+    );
+    let result = handle.file_from_resource(
+        &registry,
+        stale_adapter,
+        "stale.txt",
+        HostFileOptions::default(),
+        &mut context,
+    );
+    assert!(result.is_err());
+    let message = format!("{}", result.expect_err("denied"));
+    assert!(!message.contains("tmp"), "leak in {message}");
     std::fs::remove_file(&path).ok();
 }
 
@@ -342,8 +438,9 @@ fn blob_size_preflight_boundary() {
     publish(&mut context, "okFile", object8);
     assert_eval(&mut context, "okFile.size === 8");
     // A stale snapshot at import is denied before any JS object exists.
-    // Register a file, mutate it, then import via a stale adapter whose
-    // import snapshot no longer matches the live state.
+    // Unix: stale live handle (mutated after registration). Weak
+    // platforms: the same denial hits the weak-identity gate (imports of
+    // filesystem-backed resources are refused outright there).
     let stale_path = temp_file(b"stale-content-00");
     let stale_file = std::fs::OpenOptions::new()
         .read(true)
@@ -355,12 +452,13 @@ fn blob_size_preflight_boundary() {
     );
     std::fs::write(&stale_path, b"CHANGED-content-00").expect("mutate");
     let result = handle.file_from_resource(
+        &registry,
         stale_adapter,
         "stale.txt",
         HostFileOptions::default(),
         &mut context,
     );
-    assert!(result.is_err(), "stale snapshot import must fail");
+    assert!(result.is_err(), "stale/weak-identity import must fail");
     // The failed import left no global behind.
     assert_eval(&mut context, "typeof globalThis.staleFile === 'undefined'");
     std::fs::remove_file(&path8).ok();
@@ -439,6 +537,68 @@ fn materialize_limit_rejects_fs_promise_read() {
 }
 
 // 5. Shutdown: new operations rejected, pending work cancelled, no late jobs.
+
+#[test]
+fn shutdown_releases_live_handles() {
+    // Unix-only: proves `close_all` at shutdown drops the OS handle of a
+    // live import. Weak platforms hold no live handle (copy fallback), so
+    // the release proof lives in the fs unit tests (`close_all_*`).
+    #[cfg(unix)]
+    {
+        use boa_fapi_core::source::ByteSource;
+        let (mut context, handle) = setup();
+        let registry = boa_fapi_fs::FsRegistry::new();
+        let path = temp_file(b"live-bytes");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open");
+        let resource = registry.register(file).expect("register");
+        let adapter = Arc::new(
+            boa_fapi_fs::HostFileSource::new(&registry, &resource, None).expect("adapter"),
+        );
+        let object = handle
+            .file_from_resource(
+                &registry,
+                adapter,
+                "live.txt",
+                HostFileOptions::default(),
+                &mut context,
+            )
+            .expect("import");
+        publish(&mut context, "liveFile", object);
+        assert_eq!(registry.live_slot_count(), 1);
+        let source = boa_fapi_fs::FileSource::new(&registry, &resource, None).expect("source");
+        let cancel = boa_fapi_core::cancellation::CancellationToken::new();
+        assert_eq!(&source.read_range(0..4, &cancel).unwrap()[..], b"live");
+        handle.shutdown(&mut context).expect("shutdown");
+        assert_eq!(registry.live_slot_count(), 0);
+        assert!(source.read_range(4..10, &cancel).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[test]
+fn shutdown_releases_handles_and_rejects_late_use() {
+    let (mut context, handle) = setup();
+    let registry = boa_fapi_fs::FsRegistry::new();
+    let (path, object) = import_file(&handle, &mut context, &registry, b"hello", "a.txt");
+    publish(&mut context, "srcFile", object.clone());
+    // `copy_on_import` closes the copied slot eagerly, so a weak-platform
+    // import holds no live slot afterwards; on Unix the live handle stays
+    // open until shutdown. Assert per-platform expectations explicitly.
+    #[cfg(unix)]
+    assert_eq!(registry.live_slot_count(), 1);
+    #[cfg(not(unix))]
+    assert_eq!(registry.live_slot_count(), 0);
+    handle.shutdown(&mut context).expect("shutdown");
+    // Handles are dropped at shutdown, not deferred to registry
+    // destruction — and shutdown stays idempotent.
+    assert_eq!(registry.live_slot_count(), 0);
+    handle.shutdown(&mut context).expect("second shutdown");
+    assert_eq!(registry.live_slot_count(), 0);
+    std::fs::remove_file(&path).ok();
+}
 
 #[test]
 fn shutdown_rejects_new_operations_and_repeats_idempotently() {
@@ -533,12 +693,40 @@ fn post_shutdown_source_reads_fail() {
         .open(&path)
         .expect("open");
     let resource = registry.register(file).expect("register");
-    let source = boa_fapi_fs::FileSource::new(&registry, &resource, None).expect("source");
-    let cancel = boa_fapi_core::cancellation::CancellationToken::new();
-    assert_eq!(&source.read_range(0..6, &cancel).unwrap()[..], b"direct");
+    // Import through the platform path so the registry is tracked for
+    // shutdown-driven `close_all`, then shut down: the slot must be gone.
+    #[cfg(unix)]
+    {
+        let adapter = Arc::new(
+            boa_fapi_fs::HostFileSource::new(&registry, &resource, None).expect("adapter"),
+        );
+        handle
+            .file_from_resource(
+                &registry,
+                adapter,
+                "direct.txt",
+                HostFileOptions::default(),
+                &mut context,
+            )
+            .expect("import");
+        assert_eq!(registry.live_slot_count(), 1);
+    }
     handle.shutdown(&mut context).expect("shutdown");
+    // Shutdown runs `close_all` on every tracked registry. On Unix the
+    // import above tracked this registry, so the slot is gone. On weak
+    // platforms the copy fallback never tracks (no live handle exists),
+    // so the original registration slot is still live until the explicit
+    // close below — assert per-platform expectations honestly.
+    #[cfg(unix)]
+    assert_eq!(registry.live_slot_count(), 0);
+    #[cfg(not(unix))]
+    assert_eq!(registry.live_slot_count(), 1);
     resource.close();
-    assert!(source.read_range(6..12, &cancel).is_err());
+    #[cfg(unix)]
+    {
+        let source = boa_fapi_fs::FileSource::new(&registry, &resource, None);
+        assert!(source.is_err());
+    }
     std::fs::remove_file(&path).ok();
 }
 

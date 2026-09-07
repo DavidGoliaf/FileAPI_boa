@@ -1,7 +1,10 @@
 //! Filesystem-backed [`ByteSource`] over a pre-authorized read-only resource.
 //!
-//! [`FileSource`] wraps a [`RegisteredResource`] plus its import-time
-//! [`SnapshotState`]. `read_range` validates, in order:
+//! Direct handle reads ([`FileSource`]) are available only on platforms
+//! with a strong open-handle identity (see
+//! [`crate::platform_has_strong_identity`]): constructors refuse on weak
+//! platforms, where hosts must use [`open_copy_on_import`] instead.
+//! `read_range` validates, in order:
 //!
 //! 1. cancellation (before any I/O);
 //! 2. checked range arithmetic (before any system call);
@@ -61,9 +64,28 @@ impl std::fmt::Debug for FileSource {
 impl FileSource {
     /// Wraps `resource` with its import-time snapshot.
     ///
-    /// Fails when the resource was closed or the import snapshot cannot
-    /// be captured; no partial source escapes.
+    /// Fails when the resource was closed, when the platform cannot
+    /// guarantee a strong identity check on the open handle (non-Unix:
+    /// use [`open_copy_on_import`] instead), or when the import snapshot
+    /// cannot be captured; no partial source escapes.
     pub fn new(
+        registry: &FsRegistry,
+        resource: &crate::capability::RegisteredResource,
+        policy: Option<Arc<dyn FileAccessPolicy>>,
+    ) -> Result<Self, FileApiError> {
+        if !crate::platform_has_strong_identity() {
+            return Err(FileApiError::PermissionDenied);
+        }
+        Self::new_for_copy(registry, resource, policy)
+    }
+
+    /// Wraps `resource` without the strong-identity platform gate.
+    ///
+    /// `pub(crate)` backing constructor for [`open_copy_on_import`]: the
+    /// copy path is safe on every platform because its result is immutable
+    /// memory (no live handle survives), so it must stay available where
+    /// direct [`FileSource::new`] is refused.
+    pub(crate) fn new_for_copy(
         registry: &FsRegistry,
         resource: &crate::capability::RegisteredResource,
         policy: Option<Arc<dyn FileAccessPolicy>>,
@@ -212,13 +234,18 @@ impl std::fmt::Debug for HostFileSource {
 
 impl HostFileSource {
     /// Wraps `resource` with its import-time snapshot.
+    ///
+    /// Uses the copy-path constructor internally so the adapter stays
+    /// available on every platform (weak targets never serve live-handle
+    /// reads, but the adapter type still carries the import snapshot for
+    /// `file_from_resource` validation and for `copy_on_import` flows).
     pub fn new(
         registry: &FsRegistry,
         resource: &crate::capability::RegisteredResource,
         policy: Option<Arc<dyn FileAccessPolicy>>,
     ) -> Result<Self, FileApiError> {
         Ok(Self {
-            source: FileSource::new(registry, resource, policy)?,
+            source: FileSource::new_for_copy(registry, resource, policy)?,
         })
     }
 
@@ -258,17 +285,21 @@ impl FileResource for HostFileSource {
 
 /// Copies a registered resource into an immutable memory source.
 ///
-/// Recommended for platforms that cannot guarantee safe identity checks
-/// on the open handle, or for untrusted JS: the copy is a point-in-time
-/// snapshot, so later replacement races cannot leak old bytes as new
-/// reads. The returned bytes are the complete resource content bounded
-/// by `max_bytes` (`==` ok, `+1` rejected before allocation completes).
+/// The enforced fallback for platforms without a strong open-handle
+/// identity (Windows and other non-Unix targets, where direct [`FileSource`]
+/// construction is refused) and the recommended mode for untrusted JS:
+/// the copy is a point-in-time snapshot, so later replacement races cannot
+/// leak old bytes as new reads. Available on every platform. The returned
+/// bytes are the complete resource content bounded by `max_bytes` (`==`
+/// ok, `+1` rejected before allocation completes).
 pub fn open_copy_on_import(
     registry: &FsRegistry,
     resource: &crate::capability::RegisteredResource,
     max_bytes: u64,
 ) -> Result<Bytes, FileApiError> {
-    let source = FileSource::new(registry, resource, None)?;
+    // Gated constructor bypass: safe on every platform because only
+    // immutable memory escapes (the live handle is closed below).
+    let source = FileSource::new_for_copy(registry, resource, None)?;
     let len = source.len();
     if len > max_bytes {
         return Err(FileApiError::ResourceLimit(
@@ -287,5 +318,9 @@ pub fn open_copy_on_import(
         return Err(FileApiError::InvalidRange);
     }
     out.extend_from_slice(&bytes);
+    // The live handle is no longer needed: the immutable copy is the only
+    // thing that escapes. Close eagerly so a weak-platform copy never
+    // retains an OS handle.
+    source.close();
     Ok(Bytes::from(out))
 }

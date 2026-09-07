@@ -10,11 +10,16 @@
 //! - [`RootConfinedPolicy`] wraps an inner policy and additionally
 //!   verifies the live snapshot on the open handle (canonical identity
 //!   comparison, never a string-prefix check). `..`, symlink escape,
-//!   Windows junction/reparse-point escape, and path aliasing cannot
-//!   bypass it: there is no path input at all, only the open-handle
-//!   identity captured at registration time.
+//!   Windows junction/reparse-point escape, and location aliasing cannot
+//!   bypass it: there is no location input at all, only the open-handle
+//!   identity captured at registration time (Unix only — see below).
 //!
-//! Denials carry no path, identity, or policy internals.
+//! Direct imports exist only on platforms with a strong open-handle
+//! identity ([`crate::platform_has_strong_identity`], i.e. Unix):
+//! [`RegistryPolicy::authorize_open`] refuses on every other platform,
+//! where hosts must use `copy_on_import` (memory bytes, no live handle)
+//! or deny the import. Denials carry no location, identity, or policy
+//! internals.
 
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_fapi_core::policy::{FileAccessPolicy, FileGrant, FileOpenRequest};
@@ -41,9 +46,13 @@ impl FileAccessPolicy for DenyRawPathPolicy {
 /// Policy approving only resources already registered in the registry.
 ///
 /// `authorize_open` accepts a request only when its opaque resource id
-/// resolves to a live, snapshot-stable slot. `authorize_read` re-checks
-/// that the live snapshot still matches the grant snapshot before every
-/// new range/chunk operation.
+/// resolves to a live, snapshot-stable slot **and** the platform provides
+/// a strong open-handle identity (Unix). On weak platforms (Windows and
+/// other non-Unix targets) it refuses with `PermissionDenied`: hosts must
+/// use `copy_on_import` or deny the import instead of relying on a weak
+/// attributes/mtime comparison. `authorize_read` re-checks that the live
+/// snapshot still matches the grant snapshot before every new range/chunk
+/// operation.
 #[derive(Clone, Debug)]
 pub struct RegistryPolicy {
     registry: crate::capability::FsRegistry,
@@ -58,6 +67,13 @@ impl RegistryPolicy {
 
 impl FileAccessPolicy for RegistryPolicy {
     fn authorize_open(&self, request: &FileOpenRequest) -> Result<FileGrant, FileApiError> {
+        // Enforced (not advisory): without a strong open-handle identity
+        // the live-vs-import comparison cannot detect replacement, so the
+        // import is refused outright instead of falling back to a weak
+        // attributes/mtime check.
+        if !crate::platform_has_strong_identity() {
+            return Err(FileApiError::PermissionDenied);
+        }
         let import_snapshot = self.registry.import_snapshot(request.resource)?;
         let live = self.registry.live_snapshot(request.resource)?;
         if import_snapshot != live {
