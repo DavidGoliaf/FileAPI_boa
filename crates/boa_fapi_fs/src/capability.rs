@@ -186,9 +186,8 @@ impl FsRegistry {
             let inner = self.inner.lock().map_err(|_| FileApiError::Internal)?;
             let slot = inner.slots.get(&id.get()).ok_or(FileApiError::NotFound)?;
             slot.file.file.try_clone()
-        }
-        .map_err(map_io)?;
-        Ok(handle)
+        };
+        handle.map_err(map_io)
     }
 
     /// Reads exactly `len` bytes at `offset` from the open handle.
@@ -218,7 +217,7 @@ impl FsRegistry {
                 match handle.read_at(&mut out[filled..], offset + filled as u64) {
                     Ok(0) => return Err(FileApiError::InvalidRange),
                     Ok(n) => filled += n,
-                    Err(error) => return Err(map_io(&error)),
+                    Err(error) => return Err(map_io(error)),
                 }
             }
             Ok(out)
