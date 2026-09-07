@@ -1,6 +1,8 @@
 # M6 validation (incl. M6-rework R1–R4)
 
 Date: 2026-09-08. Branch `task/m6`, base `e23e0721e885561deda52c211075ed389dfd3cca`.
+Final implementation: `38d7b25f1cae07617e88e045a8c752c9b19af084`.
+Final CI/workflow commit: `d02e949595f706b405cf26bf397c7b1fce3f18f0`.
 Local platform: Windows (weak-identity target — live-handle tests are Unix-only by construction).
 
 ## Commands (all exit 0 unless noted)
@@ -59,12 +61,16 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 
 See `docs/spec-matrix.md` M6-URL-01..06, M6-CLONE-01..05, M6-REG-01 and M6-RW-R1..R4 with exact `file:symbol`, test names, and commands.
 
-## Rework R1–R4 (review `docs/reviews/M6-rework.md`, commit under review `9e6d47b`)
+## Rework R1–R4 (review `docs/reviews/M6-rework.md`, fixed in `38d7b25`)
 
 - R1 (P1, store escape closed): removed `FileApiHandle::url_store()` and `FileApiHandle::environment_key()`; added count-only `blob_url_count()`/`blob_urls_empty()`; `resolve_blob_url` builds the key internally; `BlobUrlStore::insert_capped` documented as unit-test-only (no handle/adapter forwards to it); creation stays in the single `create_url_for_specs` path (shutdown + ServiceWorker + quota + entropy + retry + owner key together).
 - R2 (P1, revoke Web IDL): missing arg throws `TypeError` before store access; conversion via central `webidl::dom_string`; throwing `toString`/`Symbol` propagate; converted strings revoke silently (`undefined`, no job, no oracle).
 - R3 (P1, symmetric clone bounds): `serialized_blob` enforces `MAX_CLONE_STRING_BYTES`; `encode()` runs `validate_payload` (bytes/strings/count/total, checked) before any byte — direct public-field construction faces decode-identical ceilings; `FCL1`/v1/tags unchanged; `MAX` accepted / `MAX + 1` rejected (core + host path).
 - R4 (P2, key identity): manual redacted `Debug` for `EnvironmentKey` (origin visible; partition/nonce `<redacted>`); `Eq`/`Hash` unchanged; public `environment_key()` removed with R1.
+
+All four findings are resolved in the implementation commit above. The
+final workflow and validation wording were corrected in `d02e949`; no
+production M6 source changes were made after `38d7b25`.
 
 ## Coverage
 
@@ -74,5 +80,5 @@ New modules: `blob_url.rs` 93.22%, `clone.rs` 88.28%, `url_shim.rs` 94.38%.
 
 ## CI
 
-- External CI (GitHub Actions, Ubuntu + Windows) status at handoff time: **NOT RUN YET** — local validation above is on Windows; Unix-only tests (`#[cfg(unix)]` live-handle/snapshot/clone-fs-safety) execute in the Ubuntu job. The implementation commit and the CI run link will be recorded in `docs/reviews/M6-handoff.md` after push.
+- External CI (GitHub Actions): [run 34150738386](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34150738386) completed successfully on both `ubuntu-latest` and `windows-latest` for final commit `d02e949`. The run passed formatting, clippy, workspace/M2–M6 suites, docs, coverage, feature-powerset, cargo-deny, and diff checks; Unix-only tests execute in the Ubuntu job.
 - Windows receives no weak identity or security fallback: live-handle imports stay refused off-Unix per the M5 contract (unchanged).

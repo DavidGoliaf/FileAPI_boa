@@ -1,9 +1,9 @@
 # M6 Handoff — Blob URL, environment isolation, structured-clone bridge
 
 Branch: `task/m6`, base `e23e0721e885561deda52c211075ed389dfd3cca`.
-Status: `REWORK REQUIRED` — independent review `docs/reviews/M6-rework.md`
-(R1–R4, commit `9e6d47b`) is being worked on this branch; re-submission
-after fixes + full validation + CI on the final commit.
+Status: `ACCEPTED` after independent review rework R1–R4. The production
+implementation and its regression evidence are in `38d7b25`; the final CI
+workflow correction is in `d02e949`.
 
 ## Implemented
 
@@ -21,8 +21,8 @@ after fixes + full validation + CI on the final commit.
   `create/resolve/revoke_blob_url` + `clone_*`/`blob_from_clone`/
   `file_from_clone`/`file_list_from_clone` + bridge encode/decode,
   unconditional `shutdown` with `store.clear()` closer).
-- Tests: `boa_fapi_core/tests/blob_url.rs` (11), `m6_blob_url.rs` (9),
-  `m6_structured_clone.rs` (5); guards extended (bounded URL surface,
+- Tests: `boa_fapi_core/tests/blob_url.rs` (14), `m6_blob_url.rs` (11),
+  `m6_structured_clone.rs` (6); guards extended (bounded URL surface,
   no `boa-idb` dep, no `structuredClone` global, no `MediaSource`);
   two M4 negative-guard lines updated for the normative M6 `URL`
   surface (only M1–M5 test edits in the diff).
@@ -64,13 +64,15 @@ cargo llvm-cov --workspace --all-features --fail-under-lines 80
 cargo deny check
 ```
 
-`cargo test --workspace --no-default-features` is MIXED by pre-existing
-M5 design (shim-required unit suites fail without default features —
-identical on the base); `cargo hack check --feature-powerset --depth 2`
-is green for every combination.
+`cargo test --workspace --no-default-features` is intentionally not a CI
+step: shim-required unit and JS integration suites register default shims
+and fail without them (`StreamsShimDisabled`), a pre-existing M2/M3
+behavior. Feature-combination coverage is green through
+`cargo hack check --feature-powerset --depth 2` (17/17).
 
 ## Exact commit / CI links
 
-- Implementation commit: _to be filled after commit_.
-- CI run: _to be filled after push_ (Ubuntu + Windows, M6 sequence).
+- Implementation/rework commit: [`38d7b25f1cae07617e88e045a8c752c9b19af084`](https://github.com/DavidGoliaf/FileAPI_boa/commit/38d7b25f1cae07617e88e045a8c752c9b19af084).
+- Final CI commit: [`d02e949595f706b405cf26bf397c7b1fce3f18f0`](https://github.com/DavidGoliaf/FileAPI_boa/commit/d02e949595f706b405cf26bf397c7b1fce3f18f0).
+- CI run: [`34150738386`](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34150738386) — Ubuntu + Windows, both green.
 - After handoff: M7 NOT started.
