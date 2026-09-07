@@ -208,3 +208,14 @@ integration suites live in `crates/boa_fapi_core/tests/`.
 | M7-REWORK-F9 | report secrecy | `runner.rs` — `scrub_detail`/`scrub_token` (blob:/file/HTTP/drive/UNC/abs paths, controls, 480-scalar/48-token char-boundary cap); `report.rs` — XML 1.0 illegal-char filtering | `runner::tests::scrubber_*`, `report::tests::serializer_checks_*` (quote/amp/NUL/Unicode/blob-in-token/Win+Unix paths, JSON round-trip) |
 | M7-REWORK-F10 | no blanket clippy allow | `boa_fapi_wpt/src/lib.rs` — crate-wide `allow(clippy::expect_used)` removed; per-`#[cfg(test)]`-module allows only | `cargo clippy --workspace --all-targets --all-features -- -D warnings` green |
 | M7-REWORK-F11 | CI/nightly wiring | `ci.yml` — job renamed M7 validation, M7 order comment, full-manifest strict + threads-2 + JSON report check, artifacts after generation; `nightly.yml` — Ubuntu nightly+miri bounded lib run, fixed-seed fuzz with timeout, Windows compatible-only note, explicit SKIP reasons | CI Ubuntu + Windows (awaiting owner verification); nightly schedule |
+
+## M7-RW2 — rework-2 findings F12–F17 (`docs/reviews/M7-rework-2.md`)
+
+| ID | Fixed boundary | Code | Test |
+|---|---|---|---|
+| M7-REWORK-2-F12 | hard timeout for default CLI | `main.rs` — every CLI file execution (threads 1 included) via `run_file_isolated` with wall kill; `run_file` stays library-only mapping | boundary: full strict exit 0 via isolated children (38 passed); threads 1/2 identical SHA-256 JSON |
+| M7-REWORK-2-F13 | typed worker protocol | `main.rs` — `WORKER-OK` (verified row) / `WORKER-TIMEOUT` (reserved) / `WORKER-ERROR register\|prelude\|readback\|file-eval\|protocol`; kill/crash/overflow/corruption → `TIMEOUT`; register/prelude/readback → FAIL rows via gate; single-line/UTF-8/size/ID verification | boundary: `--worker-file 99` → exit 2 index range; corrupt output → TIMEOUT |
+| M7-REWORK-2-F14 | duplicate JSON keys rejected | `manifest.rs` — recursive `DuplicateJsonKey(key)` (root/source/files/subtests; key name only) | `manifest::tests::rejects_duplicate_json_keys_recursive` (root/source/subtest, mixed types) |
+| M7-REWORK-2-F15 | embedded URL/path scrubbing | `runner.rs` — `scrub_token` matches `blob:`/`file:`/HTTP(S)/drive/UNC/abs-Unix anywhere in token, punctuation-preserving, host-kept HTTP(S) | `runner::tests::scrubber_redacts_paths_and_controls`, `report::tests::serializer_checks_*` (url=, parens, drive-comma, UNC-parens, 480-scalar Unicode, controls, round-trip) |
+| M7-REWORK-2-F16 | exact repository identity | `manifest.rs` — exact canonical URL equality (prefix-match retired) | `manifest::tests::rejects_malicious_repository_and_bad_subtest_collision` (wpt-malicious/path/query/fragment/userinfo/http/slash + canonical valid) |
+| M7-REWORK-2-F17 | subtest collision banned in file | `manifest.rs` — per-file `seen_names`, `DuplicateSubtest` (variant A, protocol unchanged) | same test: in-file collision → error, cross-file reuse → ok; stock manifest loads |

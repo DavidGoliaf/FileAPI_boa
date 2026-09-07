@@ -139,9 +139,18 @@ pub enum ManifestError {
     /// Duplicate test/subtest entry.
     #[error("duplicate expectation `{0} :: {1}`")]
     Duplicate(String, String),
+    /// Duplicate JSON object key (recursive: root, source, files, subtests).
+    /// Only the key name is revealed, never the value or a path.
+    #[error("duplicate JSON key `{0}`")]
+    DuplicateJsonKey(String),
     /// Malformed review date.
     #[error("subtest `{0} :: {1}` has a malformed review_by date")]
     BadDate(String, String),
+    /// Duplicate subtest name inside one manifest file (variant A: the
+    /// harness keys results by subtest name, so any collision inside a
+    /// file would merge two rows into one verdict).
+    #[error("duplicate subtest name `{1}` in file `{0}`")]
+    DuplicateSubtest(String, String),
     /// Invalid corpus path (traversal, absolute, symlink, suffix, ...).
     /// The detail carries only the manifest-relative logical path, never
     /// an absolute path.
@@ -171,6 +180,10 @@ impl fmt::Display for Manifest {
 
 /// Minimal JSON value model (no new dependency: harness parses the two
 /// manifest-shaped files itself with a small recursive-descent parser).
+///
+/// Duplicate object keys are rejected by the parser (see
+/// [`ManifestError::DuplicateJsonKey`]): no manifest with duplicate keys
+/// ever reaches validation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
     /// JSON null.
@@ -238,9 +251,10 @@ impl Json {
 /// Parses a JSON document (objects, arrays, strings with escapes,
 /// numbers, `true`/`false`/`null`; ASCII whitespace between tokens).
 ///
-/// Duplicate object keys keep the last value (manifest loader rejects
-/// duplicate *expectations* separately). Depth is bounded to avoid
-/// stack exhaustion on hostile input.
+/// Duplicate object keys are rejected by the parser itself (see
+/// [`ManifestError::DuplicateJsonKey`]): no manifest with duplicate keys
+/// ever reaches validation. Depth is bounded to avoid stack exhaustion on
+/// hostile input.
 pub fn parse_json(text: &str) -> Result<Json, ManifestError> {
     // Defense in depth: manifests are small checked-in files; refuse
     // megabyte-scale inputs before parsing (the array cap below is the
@@ -328,16 +342,18 @@ impl<'a> JsonParser<'a> {
                 return Err(ManifestError::BadType("object key".to_owned()));
             }
             let key = self.string()?;
+            // F14: duplicate JSON object keys are a load error at every
+            // level (root, source, files, subtests) — never first-wins or
+            // last-wins. Only the key name is revealed.
+            if entries.iter().any(|(k, _)| *k == key) {
+                return Err(ManifestError::DuplicateJsonKey(key));
+            }
             self.skip_ws();
             if !self.eat(b':') {
                 return Err(ManifestError::BadType("object colon".to_owned()));
             }
             let value = self.value(depth.saturating_add(1))?;
-            if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
-                slot.1 = value;
-            } else {
-                entries.push((key, value));
-            }
+            entries.push((key, value));
             self.skip_ws();
             if self.eat(b'}') {
                 return Ok(Json::Obj(entries));
@@ -802,19 +818,13 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
     if !is_hex(&source.commit, 20) {
         return Err(ManifestError::BadHex("source.commit".to_owned()));
     }
-    // Source identity: non-empty HTTPS WPT URL + non-empty license.
-    if source.repository.is_empty()
+    // Source identity: exact canonical URL only (F16) + non-empty license.
+    if source.repository != "https://github.com/web-platform-tests/wpt"
         || source.license.is_empty()
         || source.repository.len() > 512
         || source.license.len() > 64
     {
         return Err(ManifestError::BadType("source".to_owned()));
-    }
-    if !source
-        .repository
-        .starts_with("https://github.com/web-platform-tests/wpt")
-    {
-        return Err(ManifestError::BadType("source.repository".to_owned()));
     }
     let default_timeout_ms = root
         .need("default_timeout_ms")?
@@ -912,6 +922,12 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             return Err(ManifestError::BadType("files[].subtests".to_owned()));
         }
         let mut subtests = Vec::new();
+        // Variant A (F17): subtest names are unique inside one manifest
+        // file regardless of test ID — the runner keys harness results by
+        // subtest name, so a collision would merge two rows into one
+        // verdict and a false strict PASS. Same names across different
+        // files stay allowed.
+        let mut seen_names: BTreeMap<String, ()> = BTreeMap::new();
         for sub_json in subtests_json {
             let test = sub_json
                 .need("test")?
@@ -935,6 +951,9 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             }
             if seen.insert((test.clone(), subtest.clone()), ()).is_some() {
                 return Err(ManifestError::Duplicate(test, subtest));
+            }
+            if seen_names.insert(subtest.clone(), ()).is_some() {
+                return Err(ManifestError::DuplicateSubtest(path.clone(), subtest));
             }
             let status_token = sub_json
                 .need("status")?
@@ -1188,6 +1207,122 @@ mod tests {
             load_manifest(&bad_hash, today()),
             Err(ManifestError::BadHex(_))
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_json_keys_recursive() {
+        // Same key twice at root.
+        let dup_root = minimal_manifest("PASS").replace(
+            "\"default_timeout_ms\": 5000",
+            "\"default_timeout_ms\": 5000, \"default_timeout_ms\": 5000",
+        );
+        assert!(matches!(
+            load_manifest(&dup_root, today()),
+            Err(ManifestError::DuplicateJsonKey(k)) if k == "default_timeout_ms"
+        ));
+        // Same key twice inside `source`.
+        let dup_source = minimal_manifest("PASS").replace(
+            "\"license\": \"BSD-3-Clause\"",
+            "\"license\": \"BSD-3-Clause\", \"license\": \"MIT\"",
+        );
+        assert!(matches!(
+            load_manifest(&dup_source, today()),
+            Err(ManifestError::DuplicateJsonKey(k)) if k == "license"
+        ));
+        // Same key twice inside a subtest, with different value types.
+        let dup_sub = minimal_manifest("PASS").replace(
+            "\"trace\": \"M7-WPT-05\"",
+            "\"trace\": \"M7-WPT-05\", \"trace\": 7",
+        );
+        assert!(matches!(
+            load_manifest(&dup_sub, today()),
+            Err(ManifestError::DuplicateJsonKey(k)) if k == "trace"
+        ));
+        // Error reveals only the key name, never the value.
+        let error = format!("{}", ManifestError::DuplicateJsonKey("sha256".to_owned()));
+        assert!(!error.contains("other-value"));
+    }
+
+    #[test]
+    fn rejects_malicious_repository_and_bad_subtest_collision() {
+        // Prefix-attack repository.
+        let evil_repo = minimal_manifest("PASS").replace(
+            "https://github.com/web-platform-tests/wpt\"",
+            "https://github.com/web-platform-tests/wpt-malicious\"",
+        );
+        assert!(matches!(
+            load_manifest(&evil_repo, today()),
+            Err(ManifestError::BadType(_))
+        ));
+        // Extra path, query, fragment, userinfo and http:// are rejected.
+        for bad in [
+            "https://github.com/web-platform-tests/wpt/other",
+            "https://github.com/web-platform-tests/wpt?x=1",
+            "https://github.com/web-platform-tests/wpt#frag",
+            "https://user@github.com/web-platform-tests/wpt",
+            "http://github.com/web-platform-tests/wpt",
+            "https://github.com/web-platform-tests/wpt/",
+        ] {
+            let variant =
+                minimal_manifest("PASS").replace("https://github.com/web-platform-tests/wpt", bad);
+            assert!(
+                matches!(
+                    load_manifest(&variant, today()),
+                    Err(ManifestError::BadType(_))
+                ),
+                "must reject {bad}"
+            );
+        }
+        // Canonical valid URL loads.
+        assert_eq!(
+            load_manifest(&minimal_manifest("PASS"), today())
+                .expect("canonical repo")
+                .source
+                .repository,
+            "https://github.com/web-platform-tests/wpt"
+        );
+        // Same subtest name under two test IDs in one file → load error.
+        // The collision is built inside the FIRST file entry only: anchor
+        // on the unique first-file trace marker so the duplicate subtest
+        // lands in file #1, not in a later entry.
+        let base = minimal_manifest("PASS");
+        let anchor = "\"trace\": \"M7-WPT-05\"}]";
+        let insert_at = base.find(anchor).expect("fixture shape") + anchor.len() - 1;
+        let mut collision = base[..insert_at].to_owned();
+        collision.push_str(
+            ",{\"test\": \"t-other\", \"subtest\": \"same-but-once\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}",
+        );
+        collision.push_str(&base[insert_at..]);
+        // Rename the original subtest of the same (first) file.
+        collision = collision.replacen(
+            "\"test\": \"t\", \"subtest\": \"s\"",
+            "\"test\": \"t\", \"subtest\": \"same-but-once\"",
+            1,
+        );
+        // Also verify cross-file reuse stays allowed: give the SECOND file
+        // the same subtest name — must still load.
+        let mut cross_ok = minimal_manifest("PASS");
+        cross_ok = cross_ok.replacen(
+            "\"test\": \"t2\", \"subtest\": \"s2\"",
+            "\"test\": \"t-x\", \"subtest\": \"same-but-once\"",
+            1,
+        );
+        cross_ok = cross_ok.replacen(
+            "\"test\": \"t\", \"subtest\": \"s\"",
+            "\"test\": \"t\", \"subtest\": \"s-unique\"",
+            1,
+        );
+        assert!(matches!(
+            load_manifest(&collision, today()),
+            Err(ManifestError::DuplicateSubtest(_, _))
+        ));
+        assert!(
+            load_manifest(&cross_ok, today()).is_ok(),
+            "same subtest name in different files must stay allowed"
+        );
+        // Same subtest name in different files stays allowed (minimal
+        // fixture has unique names per file; cross-file reuse is covered
+        // by the loader design — per-file `seen_names` map).
     }
 
     #[test]

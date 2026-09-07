@@ -1,9 +1,10 @@
-# M7 Handoff — WPT harness and hardening (rework F1–F11 applied)
+# M7 Handoff — WPT harness and hardening (rework F1–F11 + rework-2 F12–F17 applied)
 
 Branch: `task/m7`, base `bc742df200c1aa1bc8f9cee63b0c20c37737d64c`.
-Status: rework complete per `docs/reviews/M7-rework.md` (base `b50c60e`);
-local validation green on Windows; external CI (Ubuntu + Windows)
-AWAITING OWNER VERIFICATION — no CI run is claimed here.
+Status: rework complete per `docs/reviews/M7-rework.md` (base `b50c60e`)
+and `docs/reviews/M7-rework-2.md` (base `aed9a0f`); local validation
+green on Windows; external CI (Ubuntu + Windows) AWAITING OWNER
+VERIFICATION — no CI run is claimed here.
 
 ## Implemented
 

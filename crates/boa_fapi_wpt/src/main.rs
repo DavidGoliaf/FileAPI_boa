@@ -249,13 +249,19 @@ fn verify_hashes(
 /// `--worker-file <index> --manifest <path> [--timeout-ms N]`. The worker
 /// re-loads and re-validates the manifest (schema, hashes, paths),
 /// resolves the file by manifest index (never by arbitrary path), runs it
-/// in-process with the file timeout as wall guard, and prints one of:
+/// in-process with the file timeout as wall guard, and prints exactly one
+/// protocol line:
 ///
 /// - `WORKER-OK <file-json>` — encoded [`FileResult`] as compact JSON;
-/// - `WORKER-FAIL <detail>` — runner/mapping failure for the file.
+/// - `WORKER-TIMEOUT <stable-detail>` — reserved for future kill paths
+///   (currently the parent synthesizes timeout rows; the worker never
+///   prints this itself);
+/// - `WORKER-ERROR <error-code>` — typed runner failure. Allowed codes:
+///   `register`, `prelude`, `readback`, `file-eval`, `protocol`.
 ///
-/// Stdout is bounded (one line, corpus-capped); anything else on stdout
-/// is a protocol corruption. Stderr is inherited for launch errors only.
+/// Stdout carries exactly one protocol line (bounded, corpus-capped);
+/// anything else on stdout is a protocol corruption. Stderr is inherited
+/// for launch errors only (exit 2, not part of the protocol).
 fn worker_main(argv: &[String]) -> i32 {
     let mut manifest_path: Option<String> = None;
     let mut index: Option<usize> = None;
@@ -343,7 +349,15 @@ fn worker_main(argv: &[String]) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("WORKER-FAIL {}", format_run_error(&error, &file.path));
+            // Typed worker error (F13): exit code alone never types the
+            // failure — the protocol line does.
+            let code = match error {
+                RunError::Register => "register",
+                RunError::Prelude => "prelude",
+                RunError::Readback => "readback",
+                RunError::FileEval => "file-eval",
+            };
+            println!("WORKER-ERROR {code}");
             1
         }
     }
@@ -389,7 +403,16 @@ fn run_file_isolated(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return finish_worker(status, &mut child, file);
+                return match finish_worker(status, &mut child, file) {
+                    WorkerOutcome::Row(row) => row,
+                    WorkerOutcome::Launch(launch) => {
+                        // register/prelude/readback in an isolated child
+                        // are per-file launch failures: surface them as a
+                        // FAIL row naming the class (the CLI still exits
+                        // non-zero via the strict gate when unexpected).
+                        fail_row(file, &format!("worker {} error", launch.class))
+                    }
+                };
             }
             Ok(None) => {
                 if started.elapsed() > deadline {
@@ -409,11 +432,30 @@ fn run_file_isolated(
 }
 
 /// Reads a finished worker's bounded output and maps it to a row.
+///
+/// Protocol (F13), checked in order:
+///
+/// 1. exactly one non-empty stdout line, valid UTF-8, within the output
+///    cap; anything else (empty, multi-line content before/after the
+///    protocol line, overflow) is `TIMEOUT` / protocol corruption;
+/// 2. `WORKER-OK <json>` → fully verified [`FileResult`] (path, subtest
+///    count, test/subtest IDs, expected statuses, known actual tokens —
+///    see [`worker_json_to_row`]);
+/// 3. `WORKER-TIMEOUT <detail>` → synthetic `TIMEOUT` rows (reserved;
+///    currently the parent synthesizes timeouts itself);
+/// 4. `WORKER-ERROR <code>` → `register`/`prelude`/`readback` become a
+///    CLI launch error (exit 2, F7 mapping); `file-eval` becomes FAIL
+///    rows for the file; `protocol`/unknown codes become `TIMEOUT`;
+/// 5. killed worker (wall deadline) → `TIMEOUT` rows, parent continues;
+/// 6. crash/non-zero exit without a known token → `TIMEOUT` with
+///    `worker non-zero exit` (never PASS, never NOTRUN).
+///
+/// Exit code alone never types the failure: the protocol line does.
 fn finish_worker(
     status: std::process::ExitStatus,
     child: &mut std::process::Child,
     file: &boa_fapi_wpt::manifest::ManifestFile,
-) -> FileResult {
+) -> WorkerOutcome {
     use std::io::Read as _;
     let mut stdout = Vec::new();
     if let Some(pipe) = child.stdout.take() {
@@ -427,24 +469,105 @@ fn finish_worker(
     }
     let _ = child.wait();
     if stdout.len() as u64 > MAX_WORKER_OUTPUT {
-        return timeout_row(file, "worker output overflow");
+        return WorkerOutcome::Row(timeout_row(file, "worker output overflow"));
     }
-    let text = String::from_utf8_lossy(&stdout);
-    let line = text.lines().next().unwrap_or("");
-    if status.success() && line.starts_with("WORKER-OK ") {
-        match worker_json_to_row(&line["WORKER-OK ".len()..], file) {
-            Some(row) => return row,
-            None => return timeout_row(file, "worker protocol corruption"),
+    // UTF-8 and size before parse; non-UTF8 stdout is corruption.
+    let text = match String::from_utf8(stdout) {
+        Ok(text) => text,
+        Err(_) => return WorkerOutcome::Row(timeout_row(file, "worker protocol corruption")),
+    };
+    let mut lines = text.lines();
+    let line = lines.next().unwrap_or("");
+    // Exactly one protocol line: no non-empty content before/after it.
+    if line.is_empty() || lines.any(|rest| !rest.trim().is_empty()) {
+        return WorkerOutcome::Row(timeout_row(file, "worker protocol corruption"));
+    }
+    if let Some(json) = line.strip_prefix("WORKER-OK ") {
+        return match worker_json_to_row(json, file) {
+            Some(row) => WorkerOutcome::Row(row),
+            None => WorkerOutcome::Row(timeout_row(file, "worker protocol corruption")),
+        };
+    }
+    if let Some(detail) = line.strip_prefix("WORKER-TIMEOUT ") {
+        let _ = detail;
+        return WorkerOutcome::Row(timeout_row(file, "worker timeout"));
+    }
+    if let Some(code) = line.strip_prefix("WORKER-ERROR ") {
+        return map_worker_error(code.trim(), file);
+    }
+    // No known token: killed/crashed worker → TIMEOUT (never PASS/NOTRUN).
+    if !status.success() {
+        let hint = String::from_utf8_lossy(&stderr);
+        let hint = hint.lines().next().unwrap_or("").trim();
+        if !hint.is_empty() {
+            return WorkerOutcome::Row(timeout_row(
+                file,
+                &format!("worker exit: {}", truncate_hint(hint)),
+            ));
         }
+        return WorkerOutcome::Row(timeout_row(file, "worker non-zero exit"));
     }
-    // Non-zero exit or malformed line: prefer a scrubbed stderr hint when
-    // it names the failure, else a generic worker detail.
-    let hint = String::from_utf8_lossy(&stderr);
-    let hint = hint.lines().next().unwrap_or("").trim();
-    if !status.success() && !hint.is_empty() {
-        return timeout_row(file, &format!("worker exit: {}", truncate_hint(hint)));
+    WorkerOutcome::Row(timeout_row(file, "worker protocol corruption"))
+}
+
+/// Parent-side outcome of one isolated file run.
+enum WorkerOutcome {
+    /// A verified row for the file.
+    Row(FileResult),
+    /// A CLI-wide launch error (exit 2): register/prelude/readback.
+    /// The message is reported by the caller; the payload form keeps the
+    /// mapping table explicit at the type level.
+    Launch(WorkerLaunch),
+}
+
+/// Typed launch payload for register/prelude/readback failures.
+#[derive(Debug, Clone)]
+struct WorkerLaunch {
+    /// Stable failure class: `register`, `prelude` or `readback`.
+    class: &'static str,
+}
+
+/// Maps a typed `WORKER-ERROR` line to a row or a launch error (F13 table).
+fn map_worker_error(code: &str, file: &boa_fapi_wpt::manifest::ManifestFile) -> WorkerOutcome {
+    match code {
+        "register" | "prelude" | "readback" => WorkerOutcome::Launch(WorkerLaunch {
+            class: match code {
+                "register" => "register",
+                "prelude" => "prelude",
+                _ => "readback",
+            },
+        }),
+        "file-eval" => {
+            // FAIL rows for every expected subtest (F7 mapping); when rows
+            // cannot be built (never here — the manifest guarantees ≥1
+            // subtest), the caller degrades to a launch error.
+            WorkerOutcome::Row(fail_row(file, "adapted file evaluation failed"))
+        }
+        "protocol" => WorkerOutcome::Row(timeout_row(file, "worker protocol corruption")),
+        _ => WorkerOutcome::Row(timeout_row(file, "worker protocol corruption")),
     }
-    timeout_row(file, "worker non-zero exit")
+}
+
+/// Builds a synthetic `FAIL` row for every expected subtest.
+fn fail_row(file: &boa_fapi_wpt::manifest::ManifestFile, detail: &str) -> FileResult {
+    FileResult {
+        path: file.path.clone(),
+        upstream_path: file.upstream_path.clone(),
+        group: file.group.clone(),
+        subtests: file
+            .subtests
+            .iter()
+            .map(|s| SubtestResult {
+                test: s.test.clone(),
+                subtest: s.subtest.clone(),
+                actual: ActualStatus::Fail,
+                expected: s.expected,
+                detail: scrub_detail(detail),
+                trace: s.trace.clone(),
+                elapsed_ms: 0,
+            })
+            .collect(),
+    }
 }
 
 /// Extracts the single [`FileResult`] from a `WORKER-OK` JSON line.
@@ -538,19 +661,24 @@ fn truncate_hint(hint: &str) -> String {
 
 /// Runs manifest files across `slots` isolated worker processes.
 ///
-/// Each slot owns a disjoint manifest-index chunk; every file runs in
-/// the isolated child path (same wall deadline + kill semantics as the
-/// sequential run). Results are re-sorted by manifest index before
-/// serialization, so `--threads N` output is byte-identical to `--threads
-/// 1` for the same manifest. One file's failure never drops another
-/// file's row (TIMEOUT rows are synthesized instead); `strict` still
-/// fails on any unexpected row.
+/// Each slot owns a disjoint manifest-index chunk; every file — including
+/// the default single-slot run (F12) — executes in the isolated child
+/// path with the wall deadline + kill semantics. Results are re-sorted by
+/// manifest index before serialization, so `--threads N` output is
+/// byte-identical to `--threads 1` for the same manifest. One file's
+/// failure never drops another file's row (`TIMEOUT`/`FAIL` rows are
+/// synthesized instead); `strict` still fails on any unexpected row.
+/// `texts` is accepted for API symmetry with the verification step and
+/// intentionally unused: workers re-load and re-verify the corpus
+/// themselves (never trust parent-supplied bytes across the boundary).
 fn run_files_parallel(
     args: &Args,
     manifest: &Manifest,
     slots: usize,
+    texts: &std::collections::BTreeMap<String, String>,
 ) -> Result<Vec<FileResult>, String> {
     use std::collections::BTreeMap;
+    let _ = texts;
     let exe = std::env::current_exe().map_err(|_| "cannot locate harness executable".to_owned())?;
     // Manifest-indexed work list (filter applies before chunking, so the
     // diagnostic subset keeps its manifest order in both modes).
@@ -648,41 +776,17 @@ fn run(argv: &[String]) -> Result<i32, String> {
     {
         return Err("--timeout-ms out of range 1..=300000".to_owned());
     }
-    // Hash/path validation first: the worker path reuses the same texts.
+    // Hash/path validation first: every CLI path (sequential and
+    // parallel) reuses the same validated texts.
     let texts = verify_hashes(&args.manifest, &manifest)?;
-    // Worker slots: min(threads, files). N=1 keeps the in-process
-    // deterministic path (identical rows); N>1 runs one isolated child
-    // process per slot with results re-sorted by manifest index.
+    // Every CLI file execution — including default `--threads 1` (F12) —
+    // runs through the isolated worker path with the wall deadline: the
+    // in-process pump guard cannot interrupt a hung `run_jobs()`, so only
+    // the process boundary is a hard timeout. `threads` selects only the
+    // number of concurrent children; rows always re-sort by manifest
+    // index. `run_file` stays the library mapping for unit tests.
     let slots = args.threads.min(manifest.files.len().max(1));
-    let mut files: Vec<FileResult> = Vec::new();
-    if slots <= 1 {
-        for file in &manifest.files {
-            if let Some(filter) = args.filter.as_ref()
-                && file.path != *filter
-                && !file.path.starts_with(filter)
-            {
-                continue;
-            }
-            let text = texts.get(&file.path).ok_or("missing corpus text")?;
-            let timeout_ms = args.timeout_ms.unwrap_or(
-                file.subtests
-                    .iter()
-                    .map(|s| s.timeout_ms)
-                    .max()
-                    .unwrap_or(5000),
-            );
-            let options = RunOptions {
-                max_pump_passes: 64,
-                file_timeout: Duration::from_millis(timeout_ms),
-            };
-            match run_file(file, text, &options) {
-                Ok(row) => files.push(row),
-                Err(e) => return Err(format_run_error(&e, &file.path)),
-            }
-        }
-    } else {
-        files = run_files_parallel(&args, &manifest, slots)?;
-    }
+    let files = run_files_parallel(&args, &manifest, slots, &texts)?;
     if files.is_empty() {
         return Err("filter matched no manifest files".to_owned());
     }
@@ -706,10 +810,6 @@ fn run(argv: &[String]) -> Result<i32, String> {
 
 fn format_manifest_error(error: &ManifestError) -> String {
     format!("manifest error: {error}")
-}
-
-fn format_run_error(error: &RunError, path: &str) -> String {
-    format!("run error for `{path}`: {error}")
 }
 
 /// Prints the stable human summary (counts only, no secrets/paths detail).
