@@ -36,16 +36,22 @@ jobs:
       - name: WPT harness units
         run: cargo test --package boa_fapi_wpt -- --nocapture
 
-      # miri gate: nightly + Miri on Ubuntu (bounded lib scope), explicit
-      # SKIP with reason elsewhere or when the toolchain is unavailable —
-      # never fake PASS, never masked as NOTRUN.
-      - name: miri (boa_fapi_core lib, bounded)
+      # Miri gate: a missing nightly toolchain is an explicit SKIP, but a
+      # started Miri test must fail the job when the test itself fails.
+      - name: Install nightly Miri
+        id: miri_setup
         if: matrix.miri == 'run'
+        continue-on-error: true
+        run: rustup toolchain install nightly --component miri --profile minimal
+
+      - name: miri (boa_fapi_core lib, bounded)
+        if: matrix.miri == 'run' && steps.miri_setup.outcome == 'success'
         timeout-minutes: 20
-        run: >
-          rustup toolchain install nightly --component miri --profile minimal
-          && cargo +nightly miri test --package boa_fapi_core --lib
-          || echo "miri unavailable on this runner/target → SKIP (no-miri-toolchain)"
+        run: cargo +nightly miri test --package boa_fapi_core --lib
+
+      - name: Miri unavailable
+        if: matrix.miri == 'run' && steps.miri_setup.outcome != 'success'
+        run: echo "miri unavailable on this runner/target → SKIP (no-miri-toolchain)"
 
       - name: miri (Windows — compatible hooks only)
         if: matrix.miri == 'skip'

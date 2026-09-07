@@ -163,7 +163,9 @@ Example (truncated):
 
 - Adapted subset only (7 files / 38 subtests); full `FileAPI/**` needs
   browser capabilities out of scope (Fetch, navigation, workers, server).
-- `N = 1` deterministic in-process; `N > 1` isolated workers with
-  manifest-order output (byte-identical JSON for the same manifest).
+- Every CLI file execution is an isolated worker with a wall deadline and
+  kill boundary. `N = 1` runs workers sequentially; `N > 1` schedules them
+  concurrently, with manifest-order output (byte-identical JSON for the same
+  manifest).
 - Wall-clock appears only as the CLI process-boundary deadline and the
   internal pump guard; reports carry no timing comparisons.

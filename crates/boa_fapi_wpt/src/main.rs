@@ -365,13 +365,81 @@ fn worker_main(argv: &[String]) -> i32 {
 
 /// Bounded worker output cap (2 MiB): overflow is a launch failure.
 const MAX_WORKER_OUTPUT: u64 = 2 * 1024 * 1024;
+const MAX_WORKER_STDERR: u64 = 64 * 1024;
+
+/// Bounded capture collected concurrently with the child process.
+struct PipeCapture {
+    bytes: Vec<u8>,
+    overflow: bool,
+    read_failed: bool,
+}
+
+impl PipeCapture {
+    fn failed() -> Self {
+        Self {
+            bytes: Vec::new(),
+            overflow: false,
+            read_failed: true,
+        }
+    }
+}
+
+/// Drains a worker pipe until EOF while retaining only the bounded prefix.
+/// Continuing to drain after overflow prevents the child from blocking on a
+/// full OS pipe before it can exit.
+fn read_pipe<R: std::io::Read>(mut pipe: R, limit: u64) -> PipeCapture {
+    let cap = limit as usize;
+    let mut bytes = Vec::new();
+    let mut overflow = false;
+    let mut read_failed = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let retained_limit = cap.saturating_add(1);
+                if bytes.len() < retained_limit {
+                    let keep = count.min(retained_limit - bytes.len());
+                    bytes.extend_from_slice(&buffer[..keep]);
+                }
+                if bytes.len() > cap {
+                    overflow = true;
+                    bytes.truncate(retained_limit);
+                }
+            }
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
+        }
+    }
+    PipeCapture {
+        bytes,
+        overflow,
+        read_failed,
+    }
+}
+
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: R,
+    limit: u64,
+) -> std::thread::JoinHandle<PipeCapture> {
+    std::thread::spawn(move || read_pipe(pipe, limit))
+}
+
+fn join_pipe_reader(reader: std::thread::JoinHandle<PipeCapture>) -> PipeCapture {
+    match reader.join() {
+        Ok(capture) => capture,
+        Err(_) => PipeCapture::failed(),
+    }
+}
 
 /// Runs one manifest file in an isolated child process of the same
 /// executable, killing it at the wall deadline.
 ///
-/// Returns the parsed [`FileResult`] on `WORKER-OK`, or a synthetic
-/// `TIMEOUT` row on kill / non-zero exit / truncated or corrupt output
-/// (parent always continues with the next file). Stderr is bounded and
+/// Returns the parsed [`FileResult`] on `WORKER-OK`, a synthetic `TIMEOUT`
+/// row on kill / crash / truncated or corrupt output, or a CLI launch error
+/// for typed register/prelude/readback failures. Stderr is bounded and
 /// scrubbed; only the manifest-relative file path appears in errors.
 fn run_file_isolated(
     exe: &std::path::Path,
@@ -379,7 +447,7 @@ fn run_file_isolated(
     index: usize,
     file: &boa_fapi_wpt::manifest::ManifestFile,
     timeout_ms: u64,
-) -> FileResult {
+) -> Result<FileResult, String> {
     use std::time::Instant;
     let deadline = Duration::from_millis(timeout_ms.max(1));
     let mut command = std::process::Command::new(exe);
@@ -396,36 +464,46 @@ fn run_file_isolated(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
-            return timeout_row(file, "worker spawn failed");
+            return Ok(timeout_row(file, "worker spawn failed"));
         }
     };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(timeout_row(file, "worker stdout pipe missing"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(timeout_row(file, "worker stderr pipe missing"));
+    };
+    let stdout_reader = spawn_pipe_reader(stdout, MAX_WORKER_OUTPUT);
+    let stderr_reader = spawn_pipe_reader(stderr, MAX_WORKER_STDERR);
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return match finish_worker(status, &mut child, file) {
-                    WorkerOutcome::Row(row) => row,
-                    WorkerOutcome::Launch(launch) => {
-                        // register/prelude/readback in an isolated child
-                        // are per-file launch failures: surface them as a
-                        // FAIL row naming the class (the CLI still exits
-                        // non-zero via the strict gate when unexpected).
-                        fail_row(file, &format!("worker {} error", launch.class))
-                    }
+                return match finish_worker(status, stdout_reader, stderr_reader, file) {
+                    WorkerOutcome::Row(row) => Ok(row),
+                    WorkerOutcome::Launch(launch) => Err(format!("worker {} error", launch.class)),
                 };
             }
             Ok(None) => {
                 if started.elapsed() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return timeout_row(file, "worker wall deadline exceeded");
+                    let _ = join_pipe_reader(stdout_reader);
+                    let _ = join_pipe_reader(stderr_reader);
+                    return Ok(timeout_row(file, "worker wall deadline exceeded"));
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return timeout_row(file, "worker wait failed");
+                let _ = join_pipe_reader(stdout_reader);
+                let _ = join_pipe_reader(stderr_reader);
+                return Ok(timeout_row(file, "worker wait failed"));
             }
         }
     }
@@ -450,39 +528,42 @@ fn run_file_isolated(
 /// 6. crash/non-zero exit without a known token → `TIMEOUT` with
 ///    `worker non-zero exit` (never PASS, never NOTRUN).
 ///
-/// Exit code alone never types the failure: the protocol line does.
+/// The protocol line types the failure, and its exit status must agree with
+/// the token before the result is accepted.
 fn finish_worker(
     status: std::process::ExitStatus,
-    child: &mut std::process::Child,
+    stdout_reader: std::thread::JoinHandle<PipeCapture>,
+    stderr_reader: std::thread::JoinHandle<PipeCapture>,
     file: &boa_fapi_wpt::manifest::ManifestFile,
 ) -> WorkerOutcome {
-    use std::io::Read as _;
-    let mut stdout = Vec::new();
-    if let Some(pipe) = child.stdout.take() {
-        let mut capped = pipe.take(MAX_WORKER_OUTPUT + 1);
-        let _ = capped.read_to_end(&mut stdout);
-    }
-    let mut stderr = Vec::new();
-    if let Some(pipe) = child.stderr.take() {
-        let mut capped = pipe.take(64 * 1024 + 1);
-        let _ = capped.read_to_end(&mut stderr);
-    }
-    let _ = child.wait();
-    if stdout.len() as u64 > MAX_WORKER_OUTPUT {
+    let stdout = join_pipe_reader(stdout_reader);
+    let stderr = join_pipe_reader(stderr_reader);
+    if stdout.overflow
+        || stdout.read_failed
+        || stderr.overflow
+        || stderr.read_failed
+        || stdout.bytes.len() as u64 > MAX_WORKER_OUTPUT
+    {
         return WorkerOutcome::Row(timeout_row(file, "worker output overflow"));
     }
     // UTF-8 and size before parse; non-UTF8 stdout is corruption.
-    let text = match String::from_utf8(stdout) {
+    let text = match String::from_utf8(stdout.bytes) {
         Ok(text) => text,
         Err(_) => return WorkerOutcome::Row(timeout_row(file, "worker protocol corruption")),
     };
-    let mut lines = text.lines();
+    let mut lines = text.split('\n');
     let line = lines.next().unwrap_or("");
-    // Exactly one protocol line: no non-empty content before/after it.
-    if line.is_empty() || lines.any(|rest| !rest.trim().is_empty()) {
+    // Exactly one protocol line: allow only the single newline emitted by
+    // `println!`; an additional blank line is protocol corruption too.
+    let extra_line = lines.next();
+    if line.is_empty() || extra_line.is_some_and(|rest| !rest.is_empty() || lines.next().is_some())
+    {
         return WorkerOutcome::Row(timeout_row(file, "worker protocol corruption"));
     }
     if let Some(json) = line.strip_prefix("WORKER-OK ") {
+        if !status.success() {
+            return WorkerOutcome::Row(timeout_row(file, "worker non-zero exit"));
+        }
         return match worker_json_to_row(json, file) {
             Some(row) => WorkerOutcome::Row(row),
             None => WorkerOutcome::Row(timeout_row(file, "worker protocol corruption")),
@@ -490,14 +571,20 @@ fn finish_worker(
     }
     if let Some(detail) = line.strip_prefix("WORKER-TIMEOUT ") {
         let _ = detail;
+        if status.success() {
+            return WorkerOutcome::Row(timeout_row(file, "worker protocol corruption"));
+        }
         return WorkerOutcome::Row(timeout_row(file, "worker timeout"));
     }
     if let Some(code) = line.strip_prefix("WORKER-ERROR ") {
+        if status.success() {
+            return WorkerOutcome::Row(timeout_row(file, "worker protocol corruption"));
+        }
         return map_worker_error(code.trim(), file);
     }
     // No known token: killed/crashed worker → TIMEOUT (never PASS/NOTRUN).
     if !status.success() {
-        let hint = String::from_utf8_lossy(&stderr);
+        let hint = String::from_utf8_lossy(&stderr.bytes);
         let hint = hint.lines().next().unwrap_or("").trim();
         if !hint.is_empty() {
             return WorkerOutcome::Row(timeout_row(
@@ -721,37 +808,53 @@ fn run_files_parallel(
             files: manifest_owned.files.clone(),
         };
         let exe = exe.clone();
-        handles.push(std::thread::spawn(move || {
-            let mut rows: Vec<(usize, FileResult)> = Vec::new();
-            for index in chunk {
-                let Some(file) = manifest_owned.files.get(index) else {
-                    continue;
-                };
-                let timeout_ms = timeout_override.unwrap_or(
-                    file.subtests
-                        .iter()
-                        .map(|s| s.timeout_ms)
-                        .max()
-                        .unwrap_or(5000),
-                );
-                rows.push((
-                    index,
-                    run_file_isolated(&exe, &manifest_path, index, file, timeout_ms),
-                ));
-            }
-            rows
-        }));
+        handles.push(std::thread::spawn(
+            move || -> Result<Vec<(usize, FileResult)>, String> {
+                let mut rows: Vec<(usize, FileResult)> = Vec::new();
+                for index in chunk {
+                    let Some(file) = manifest_owned.files.get(index) else {
+                        continue;
+                    };
+                    let timeout_ms = timeout_override.unwrap_or(
+                        file.subtests
+                            .iter()
+                            .map(|s| s.timeout_ms)
+                            .max()
+                            .unwrap_or(5000),
+                    );
+                    rows.push((
+                        index,
+                        run_file_isolated(&exe, &manifest_path, index, file, timeout_ms)?,
+                    ));
+                }
+                Ok(rows)
+            },
+        ));
     }
     let mut by_index: BTreeMap<usize, FileResult> = BTreeMap::new();
+    let mut first_error: Option<String> = None;
     for handle in handles {
         match handle.join() {
-            Ok(rows) => {
+            Ok(Ok(rows)) if first_error.is_none() => {
                 for (index, row) in rows {
                     by_index.insert(index, row);
                 }
             }
-            Err(_) => return Err("worker slot panicked".to_owned()),
+            Ok(Ok(_rows)) => {}
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if first_error.is_none() {
+                    first_error = Some("worker slot panicked".to_owned());
+                }
+            }
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(by_index.into_values().collect())
 }
@@ -879,5 +982,19 @@ fn main() {
             eprintln!("boa_fapi_wpt: cannot spawn worker thread");
             std::process::exit(3);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_pipe;
+    use std::io::Cursor;
+
+    #[test]
+    fn bounded_pipe_capture_retains_prefix_and_drains_input() {
+        let capture = read_pipe(Cursor::new(b"123456789".to_vec()), 4);
+        assert_eq!(capture.bytes, b"12345");
+        assert!(capture.overflow);
+        assert!(!capture.read_failed);
     }
 }

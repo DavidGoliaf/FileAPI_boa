@@ -162,46 +162,110 @@ pub fn scrub_detail(text: &str) -> String {
 /// punctuation (the URL ends at whitespace or a quote); the punctuation
 /// itself is preserved so `url(blob:u)` keeps its closing paren.
 fn scrub_token(chunk: &str) -> String {
-    // `blob:` anywhere inside the token (prefix or punctuation-adjacent)
-    // redacts to the next whitespace/quote.
-    if let Some(index) = chunk.find("blob:") {
-        let before = &chunk[..index];
-        let mut tail = &chunk[index + "blob:".len()..];
-        // Strip one trailing quote/paren/comma/semicolon/bracket set from
-        // the redacted span, then re-append it verbatim.
-        let mut suffix = String::new();
-        while tail.ends_with([')', ',', ';', ']', '}', '"', '\'']) {
-            let cut = tail.len() - 1;
-            suffix.insert(0, tail.as_bytes()[cut] as char);
-            tail = &tail[..cut];
+    // `blob:` is opaque and may occur after `url=` or an opening delimiter.
+    // If it is inside an HTTP(S)/file URL, scrub the enclosing URL first so
+    // its path cannot remain visible.
+    let blob_index = chunk.find("blob:");
+    let url_before_blob = blob_index.is_some_and(|blob| {
+        ["file://", "https://", "http://"]
+            .iter()
+            .filter_map(|marker| marker_start(chunk, marker))
+            .any(|index| index < blob)
+    });
+    if let Some(index) = blob_index.filter(|_| !url_before_blob) {
+        let (_body, suffix) = split_trailing_punctuation(&chunk[index + 5..]);
+        return format!("{}blob:<redacted>{suffix}", &chunk[..index]);
+    }
+
+    for (marker, replacement) in [
+        ("file://", "file:<redacted>"),
+        ("https://", "https://"),
+        ("http://", "http://"),
+    ] {
+        if let Some(index) = marker_start(chunk, marker) {
+            let before = &chunk[..index];
+            let (body, suffix) = split_trailing_punctuation(&chunk[index + marker.len()..]);
+            if marker == "file://" {
+                return format!("{before}{replacement}{suffix}");
+            }
+            let host_end = body.find(['/', '?', '#']).unwrap_or(body.len());
+            let host = &body[..host_end];
+            return format!("{before}{replacement}{host}<redacted-path>{suffix}");
         }
-        let _ = &tail;
-        return format!("{before}blob:<redacted>{suffix}");
     }
-    if chunk.starts_with("file://") {
-        return "file:<redacted>".to_owned();
+
+    if let Some(index) = blob_index {
+        let (_body, suffix) = split_trailing_punctuation(&chunk[index + 5..]);
+        return format!("{}blob:<redacted>{suffix}", &chunk[..index]);
     }
-    if chunk.starts_with("http://") || chunk.starts_with("https://") {
-        // Keep scheme + host, redact path/query.
-        let rest = &chunk[chunk.find("://").map(|i| i + 3).unwrap_or(0)..];
-        let host = rest.split('/').next().unwrap_or("");
-        let scheme = if chunk.starts_with("https://") {
-            "https"
-        } else {
-            "http"
-        };
-        return format!("{scheme}://{host}<redacted-path>");
+
+    if let Some(index) = marker_start(chunk, "\\\\") {
+        let (_body, suffix) = split_trailing_punctuation(&chunk[index..]);
+        return format!("{}<redacted-unc-path>{suffix}", &chunk[..index]);
     }
-    if chunk.starts_with("\\\\") {
-        return "<redacted-unc-path>".to_owned();
+    if let Some(index) = drive_path_start(chunk) {
+        let (body, suffix) = split_trailing_punctuation(&chunk[index..]);
+        let _ = body;
+        return format!("{}<redacted-drive-path>{suffix}", &chunk[..index]);
     }
-    if chunk.len() > 2 && chunk.as_bytes()[1] == b':' {
-        return "<redacted-drive-path>".to_owned();
-    }
-    if chunk.starts_with('/') {
-        return "<redacted-abs-path>".to_owned();
+    if let Some(index) = marker_start(chunk, "/") {
+        let (body, suffix) = split_trailing_punctuation(&chunk[index..]);
+        let _ = body;
+        return format!("{}<redacted-abs-path>{suffix}", &chunk[..index]);
     }
     chunk.to_owned()
+}
+
+/// Finds a marker at the beginning of a token or after a safe delimiter.
+fn marker_start(chunk: &str, marker: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(relative) = chunk[offset..].find(marker) {
+        let index = offset + relative;
+        let boundary = chunk[..index].chars().next_back();
+        if index == 0 || matches!(boundary, Some('=' | ':' | '(' | '[' | '{')) {
+            return Some(index);
+        }
+        offset = index + marker.len();
+        if offset >= chunk.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Finds a Windows drive path at a token boundary.
+fn drive_path_start(chunk: &str) -> Option<usize> {
+    let bytes = chunk.as_bytes();
+    for index in 0..bytes.len().saturating_sub(2) {
+        if bytes[index].is_ascii_alphabetic()
+            && bytes[index + 1] == b':'
+            && matches!(bytes[index + 2], b'\\' | b'/')
+            && (index == 0
+                || matches!(
+                    chunk[..index].chars().next_back(),
+                    Some('=' | ':' | '(' | '[' | '{')
+                ))
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Separates closing punctuation from a redacted token body.
+fn split_trailing_punctuation(value: &str) -> (&str, &str) {
+    let mut end = value.len();
+    while end > 0 {
+        let Some((index, character)) = value[..end].char_indices().next_back() else {
+            break;
+        };
+        if matches!(character, ')' | ',' | ';' | ']' | '}' | '"' | '\'') {
+            end = index;
+        } else {
+            break;
+        }
+    }
+    (&value[..end], &value[end..])
 }
 
 /// Registers the File API extension into a fresh context.
@@ -283,20 +347,15 @@ pub fn run_file(
         passes += 1;
     }
     // Read back recorded entries: `pass|name|message` per index.
-    // The count is clamped (10 000) and every per-index read is fallible:
-    // a hostile file redefining the probe between reads degrades to fewer
-    // entries (possibly TIMEOUT), never to a panic or an unbounded loop.
-    let count = match eval_u64(context, harness::results_probe_source()) {
-        Ok(n) => n.min(10_000),
-        Err(_) => 0,
-    };
+    // The count is clamped (10 000) and every per-index read is fallible.
+    // A readback failure is a typed worker error, never an empty result or a
+    // fabricated TIMEOUT row.
+    let count = eval_u64(context, harness::results_probe_source())?.min(10_000);
     let mut recorded: Vec<(bool, String, String)> = Vec::new();
     for index in 0..count {
         // `entry` sources are built from an integer index only — no file
         // or manifest text is interpolated into evaluated JS.
-        let Ok(entry) = eval_string(context, &harness::result_entry_source(index as usize)) else {
-            break;
-        };
+        let entry = eval_string(context, &harness::result_entry_source(index as usize))?;
         let mut parts = entry.splitn(3, '|');
         let pass = parts.next() == Some("1");
         let name = parts.next().unwrap_or("").to_owned();
@@ -502,6 +561,17 @@ mod tests {
     }
 
     #[test]
+    fn result_readback_failure_is_not_silently_empty() {
+        let file = manifest_file("PASS");
+        let result = run_file(
+            &file,
+            "globalThis.__wpt.results = null;",
+            &RunOptions::default(),
+        );
+        assert!(matches!(result, Err(RunError::Readback)));
+    }
+
+    #[test]
     fn scrubber_redacts_blob_urls() {
         assert_eq!(
             scrub_detail("saw blob:https://x/uuid here"),
@@ -532,6 +602,31 @@ mod tests {
             "at <redacted-unc-path>"
         );
         assert_eq!(scrub_detail("at /home/user/f.js"), "at <redacted-abs-path>");
+        assert_eq!(
+            scrub_detail("url=https://host/private?q=secret"),
+            "url=https://host<redacted-path>"
+        );
+        assert_eq!(
+            scrub_detail("url=https://host/blob:secret"),
+            "url=https://host<redacted-path>"
+        );
+        assert_eq!(
+            scrub_detail("(https://host/private)"),
+            "(https://host<redacted-path>)"
+        );
+        assert_eq!(
+            scrub_detail("path=/tmp/private,"),
+            "path=<redacted-abs-path>,"
+        );
+        assert_eq!(scrub_detail("(file:///tmp/private)"), "(file:<redacted>)");
+        assert_eq!(
+            scrub_detail("path=C:\\private\\secret.js,"),
+            "path=<redacted-drive-path>,"
+        );
+        assert_eq!(
+            scrub_detail("(\\\\server\\share\\secret)"),
+            "(<redacted-unc-path>)"
+        );
         // Control characters (except tab/newline/CR) are dropped; output
         // stays valid UTF-8 without mid-sequence slicing.
         assert_eq!(scrub_detail("a\u{1}b"), "ab");

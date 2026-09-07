@@ -1,10 +1,9 @@
 # M7 Handoff — WPT harness and hardening (rework F1–F11 + rework-2 F12–F17 applied)
 
 Branch: `task/m7`, base `bc742df200c1aa1bc8f9cee63b0c20c37737d64c`.
-Status: rework complete per `docs/reviews/M7-rework.md` (base `b50c60e`)
-and `docs/reviews/M7-rework-2.md` (base `aed9a0f`); local validation
-green on Windows; external CI (Ubuntu + Windows) AWAITING OWNER
-VERIFICATION — no CI run is claimed here.
+Status: M7 rework-2 implementation plus acceptance repairs are present in
+the working tree; local validation is green on Windows; external CI (Ubuntu
+and Windows) AWAITING OWNER VERIFICATION — no CI run is claimed here.
 
 ## Implemented
 
@@ -16,7 +15,9 @@ VERIFICATION — no CI run is claimed here.
   (deterministic JSON/JUnit + enum-compared strict gate), `main.rs`
   (CLI `--manifest/--strict/--threads/--filter/--json/--junit/--timeout-ms`,
   SHA-256 verification, isolated `--worker-file` child processes with
-  wall kill, 8 MiB thread for Boa recursion).
+  wall kill, 8 MiB thread for Boa recursion, concurrent bounded stdout/stderr
+  drains, exit-status/protocol agreement, and CLI launch errors for typed
+  register/prelude/readback failures).
 - Corpus: 7 adapted files in `crates/boa_fapi_wpt/corpus/*.js` +
   `wpt-manifest.json` (pinned `0968c868…`, 38 subtests, all PASS;
   upstream blob SHAs recorded; file SHA-256 verified pre-run).
@@ -77,7 +78,7 @@ accepted M6 design; powerset coverage is `cargo hack`.
 
 ## Exact commit / CI links
 
-- Implementation commit: _to be filled after commit_.
+- Implementation commit: not committed in this acceptance-repair pass.
 - CI: AWAITING OWNER VERIFICATION — no run URL/SHA is claimed here
   (CI must run on the final implementation commit on Ubuntu and Windows).
 - After handoff: next stage NOT started.
