@@ -22,8 +22,9 @@
   `package_binary_string`/`data_url_len`/`package_data_url`) used by both
   readers; the async `filereader.rs` was refactored onto it with zero
   M4-A test edits and a fully green M4-A suite.
-- Tests: `crates/boa_fapi/tests/m4_filereader_sync.rs` (20 tests covering
-  all 10 §7 groups, incl. capability-absent name preservation); `filereader_sync::tests` (5 child-module proofs:
+- Tests: `crates/boa_fapi/tests/m4_filereader_sync.rs` (21 tests covering
+  all 10 §7 groups, incl. capability-absent name preservation and the
+  throwing-label preflight-order regression test); `filereader_sync::tests` (5 child-module proofs:
   short/long/failing sources, zero-read preflight, packaging parity);
   guards (`sync_surface_is_bounded`, `no_out_of_scope_surface`, updated
   re-export list).
@@ -74,17 +75,26 @@ rewrites these local results. Final audit trace and findings:
 
 ## Coverage
 
-- Workspace: 351 tests green (42 boa_fapi unit incl. 5 sync, 13 guards,
-  51 M2 JS integration, 33 M4-A JS integration, 20 M4-B JS integration,
+- Workspace: 352 tests green (42 boa_fapi unit incl. 5 sync, 13 guards,
+  51 M2 JS integration, 33 M4-A JS integration, 21 M4-B JS integration,
   28 M3-B JS integration, 16 M3-A JS integration, 1 doc, 146 core);
   `boa_fapi` line coverage 89.95% (threshold 85%, see
   `docs/m4b-validation.md`). All M4-A tests green without edits.
 
 ## CI
 
-`CI: awaiting customer verification` — the customer checks green Windows
-and Ubuntu runs for the final commit before acceptance; no run URL/ID is
-claimed here.
+CI (verified via the GitHub API): run `34100515645` (`CI #10`, push of
+`51e6eda` on `task/m4b`) completed with conclusion `success` —
+`M4-B validation (windows-latest)` job `101673651515` green and
+`M4-B validation (ubuntu-latest)` job `101673651739` green, every step
+green on both OS:
+[run](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645),
+[Windows job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645/job/101673651515),
+[Ubuntu job](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34100515645/job/101673651739).
+That run predates the acceptance-blocker fixes (preflight order,
+`diff --check` hygiene, truthful deny/CI evidence); the current tip
+additionally awaits its own CI verification by the owner before
+acceptance. No other run URL/ID is claimed here.
 
 ## Findings / fixes
 
@@ -94,6 +104,16 @@ fixes, the `progress:5` test-expectation fix, the re-export guard
 update, and the guard rename with matrix update. Each fix re-ran the
 affected suites green; the audit was repeated until no unresolved item
 remained.
+
+Acceptance-blocker fixes (post-`51e6eda`, all resolved): the
+`readAsText` label conversion moved after the brand/argument checks with
+the `throwing_label_is_converted_after_brand_and_argument_checks`
+regression test; `docs/spec-matrix.md` M4-B rows rewritten without
+control characters or wrapped lines (`git diff --check` exit 0);
+`docs/DECISIONS.md` trailing blank line removed; `cargo deny check`
+recorded as BLOCKED with the exact acceptance-run reason while the
+verified CI run `34100515645` (success on both OS) is recorded with
+URLs.
 
 ## Explicitly omitted (separate future orders)
 

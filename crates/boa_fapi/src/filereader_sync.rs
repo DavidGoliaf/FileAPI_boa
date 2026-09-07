@@ -123,15 +123,18 @@ fn blob_arg(args: &[JsValue]) -> JsResult<Arc<BlobData>> {
 /// length preflights, then the bounded materialization.
 ///
 /// The order is fixed and documented: brand → Blob argument → encoding
-/// label → sync-size limit → source read → (data-URL length inside the
-/// caller, before its output allocation). No `ByteSource::read_range` runs
-/// and no output buffer is allocated before the brand, label, and size
-/// preflights succeed; no partial JS result ever escapes. The async
+/// label conversion and resolution → sync-size limit → source read →
+/// (data-URL length inside the caller, before its output allocation).
+/// A throwing encoding object is therefore never observed when the
+/// receiver or the Blob argument itself is illegal: those `TypeError`s
+/// come first. No `ByteSource::read_range` runs and no output buffer is
+/// allocated before the brand, label, and size preflights succeed; no
+/// partial JS result ever escapes. The async
 /// `max_concurrent_reads_per_global` quota is never consulted.
 fn read_bytes_sync(
     this: &JsValue,
     args: &[JsValue],
-    label: Option<&str>,
+    label_arg: Option<&JsValue>,
     context: &mut Context,
 ) -> JsResult<(bytes::Bytes, DomSpecs, TextEncoding)> {
     let _ = require_sync(this)?;
@@ -141,10 +144,16 @@ fn read_bytes_sync(
         .dom_specs()
         .ok_or_else(|| type_error("the DOM shim is not registered"))?;
     let limits = specs.limits().clone();
-    // Encoding labels resolve before the size preflight (same order as the
+    // Encoding label conversion and resolution come after the brand and
+    // argument checks, but before the size preflight (same order as the
     // async `readAsText`): an unknown label throws `EncodingError` even
     // for an oversized blob, with no read and no partial result.
-    let Some(encoding) = package::resolve_label(label) else {
+    let label = match label_arg {
+        None => None,
+        Some(value) if value.is_undefined() => None,
+        Some(value) => Some(dom_string(value, context)?),
+    };
+    let Some(encoding) = package::resolve_label(label.as_deref()) else {
         return Err(throw_named(&dom, "EncodingError", "unknown text encoding"));
     };
     // Sync-size preflight before any source read or output allocation.
@@ -194,12 +203,9 @@ fn read_as_binary_string_sync(
 /// `readAsText(blob, encoding?)`: decoded text, or a same-realm
 /// `DOMException`. `length = 1` (the encoding is optional).
 fn read_as_text_sync(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let label = if args.len() >= 2 && !args[1].is_undefined() {
-        Some(dom_string(&args[1], context)?)
-    } else {
-        None
-    };
-    let (bytes, _, encoding) = read_bytes_sync(this, args, label.as_deref(), context)?;
+    // The raw label value travels into the shared preamble untouched: its
+    // conversion happens there, after the brand and argument checks.
+    let (bytes, _, encoding) = read_bytes_sync(this, args, args.get(1), context)?;
     Ok(JsValue::from(JsString::from(package::decode_text(
         &encoding, &bytes,
     ))))

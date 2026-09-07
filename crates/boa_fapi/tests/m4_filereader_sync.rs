@@ -406,6 +406,50 @@ fn sync_text_matches_async_representations() {
     );
 }
 
+#[test]
+fn throwing_label_is_converted_after_brand_and_argument_checks() {
+    // A throwing encoding object must never be observed when the receiver
+    // or the Blob argument itself is illegal: brand/argument `TypeError`s
+    // come first. With a valid receiver/blob the conversion throw itself
+    // propagates (not a brand or `EncodingError` failure).
+    let mut context = setup_with_env(FileApiEnvironment::DedicatedWorker);
+    assert_eval(
+        &mut context,
+        "(() => { \
+             globalThis.evil = {}; \
+             Object.defineProperty(globalThis.evil, 'toString', \
+                 { get() { throw new Error('label-boom'); } }); \
+             return true; \
+         })()",
+    );
+    assert_eval(
+        &mut context,
+        "(() => { \
+             try { new FileReaderSync().readAsText(new Blob(['x']), globalThis.evil); \
+                 return false; } \
+             catch (e) { \
+                 return (e instanceof Error) && !(e instanceof DOMException) \
+                     && e.message === 'label-boom'; } \
+         })()",
+    );
+    assert_eval(
+        &mut context,
+        "(() => { \
+             try { FileReaderSync.prototype.readAsText.call({}, new Blob(['x']), globalThis.evil); \
+                 return false; } \
+             catch (e) { return e instanceof TypeError; } \
+         })()",
+    );
+    assert_eval(
+        &mut context,
+        "(() => { \
+             try { new FileReaderSync().readAsText(null, globalThis.evil); \
+                 return false; } \
+             catch (e) { return e instanceof TypeError; } \
+         })()",
+    );
+}
+
 // ──────────────────────────────────────────────
 // 5. Data URL: exact packaging and boundary
 // ──────────────────────────────────────────────

@@ -70,10 +70,14 @@ updated until no unresolved item remained.
 
 ## F. Document truthfulness
 
-- Validation table records factual exits (deny exit 0 locally; green CI
-  never rewrites it); coverage is the measured 89.95% lines; no TODO/
-  FIXME added; no `docs/security.md`, WPT, or filesystem docs created.
-  CI is `awaiting customer verification` with no URL/ID claimed. — PASS.
+- Validation table records factual exits (deny: acceptance exit 1,
+  BLOCKED, advisory DB unavailable there; the local exit 0 and the
+  green CI deny steps are supporting evidence only, never a rewrite of
+  the acceptance result); coverage is the measured 89.95% lines; no
+  TODO/FIXME added; no `docs/security.md`, WPT, or filesystem docs
+  created. Verified CI run `34100515645` for `51e6eda` (success, both
+  OS, URLs in `docs/m4b-validation.md`); the current tip additionally
+  awaits its own CI verification — no other run is claimed. — PASS.
 
 ## G. Findings and fixes (all resolved)
 
@@ -94,5 +98,13 @@ updated until no unresolved item remained.
    `sync_surface_is_bounded` + `no_out_of_scope_surface` with per-file
    allow rules; `docs/spec-matrix.md` M4-FR-10 row updated to the new
    names.
+7. Acceptance blockers (post-`51e6eda`): `readAsText` label conversion
+   ran before brand/argument checks — moved into the shared preamble
+   after them, with the throwing-label regression test;
+   `docs/spec-matrix.md` M4-B rows carried wrapped lines and control
+   characters — rewritten cleanly (`git diff --check` exit 0);
+   `docs/DECISIONS.md` trailing blank line removed; deny recorded as
+   BLOCKED with the exact acceptance reason while verified CI run
+   `34100515645` is recorded with URLs; counts updated to 352/21.
 
 No unresolved items remain.
