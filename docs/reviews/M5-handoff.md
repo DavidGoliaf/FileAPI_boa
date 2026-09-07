@@ -112,14 +112,15 @@ fixed and re-validated; no unresolved items).
 
 ## Honest CI status
 
-- Final code commit SHA: `11c8675743d37b77c3520fa3d91731afc7fa341d`
-- CI run: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34125651525
+- Final code commit SHA: `e23e0721e885561deda52c211075ed389dfd3cca`
+- CI run: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34130792798
   — **success** on `ubuntu-latest` and `windows-latest` (full M5 order §9
   sequence, including `boa_fapi_fs` + M5 host-integration jobs).
 
 Local: all commands exit 0 on this branch (`docs/m5-validation.md`).
 Two earlier pushes failed Linux-only clippy lints (`map_io` by-value,
 `Write` import scope, dead helper) that Windows clippy did not flag;
-all three fixed, re-validated locally, and green in the final CI run
-above. Unix-only live-handle tests executed in the Ubuntu job;
-Windows executed the refusal + copy-fallback tests.
+all three fixed, re-validated locally, and green in CI. The R4–R5 push
+(`e23e072`) is green in the final CI run above. Unix-only live-handle
+tests executed in the Ubuntu job; Windows executed the refusal +
+copy-fallback tests.

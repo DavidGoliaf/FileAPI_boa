@@ -63,8 +63,8 @@ M2/M3/M4-A/M4-B regression suites green (memory behavior unchanged).
 
 ## CI
 
-- Final code commit: `11c8675743d37b77c3520fa3d91731afc7fa341d`.
-- CI run: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34125651525
+- Final code commit: `e23e0721e885561deda52c211075ed389dfd3cca`.
+- CI run: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34130792798
   — **success** on Ubuntu + Windows (full order §9 sequence on the final SHA).
 - Unix-only tests (`#[cfg(unix)]` live-handle/snapshot tests) executed in the
   Ubuntu job; Windows executed the refusal + copy-fallback tests.
