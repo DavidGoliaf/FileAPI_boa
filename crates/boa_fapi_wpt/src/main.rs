@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use boa_fapi_wpt::manifest::{Manifest, ManifestError, load_manifest};
 use boa_fapi_wpt::report;
-use boa_fapi_wpt::runner::{FileResult, RunError, RunOptions, run_file};
+use boa_fapi_wpt::runner::{
+    ActualStatus, FileResult, RunError, RunOptions, SubtestResult, run_file, scrub_detail,
+};
 
 /// CLI configuration parsed from `std::env::args` (no new dependency:
 /// the flag set is fixed and tiny).
@@ -206,88 +208,480 @@ fn today_utc() -> String {
 }
 
 /// Verifies every manifest file hash against the stored corpus bytes.
+///
+/// Resolution uses only the manifest `corpus_root` (relative to the
+/// manifest directory): the logical `file.path` is validated, joined via
+/// [`std::path::Path`], canonicalized, and required to stay strictly
+/// inside the canonical root; symlinks anywhere in the root or candidate
+/// are launch errors. Hashes run over the raw bytes after UTF-8
+/// validation (hash-then-decode would hash different bytes than executed
+/// on non-UTF8 input). Error details carry only the manifest-relative
+/// logical path, never an absolute path.
 fn verify_hashes(
+    manifest_path: &str,
     manifest: &Manifest,
-    corpus_root: &str,
 ) -> Result<BTreeMap<String, String>, String> {
+    use boa_fapi_wpt::manifest::{MAX_CORPUS_BYTES, resolve_corpus_path};
     let mut texts = BTreeMap::new();
     for file in &manifest.files {
-        // Manifest paths are harness-relative (`corpus/*.js`); the corpus
-        // root depends on the manifest location: `<manifest-dir>/corpus`
-        // for the repo layout, or the `boa_fapi_wpt` crate dir as fallback.
-        let relative = file.path.strip_prefix("corpus/").unwrap_or(&file.path);
-        let mut candidates = Vec::new();
-        if corpus_root != "." {
-            candidates.push(format!("{corpus_root}/corpus/{relative}"));
+        let candidate = resolve_corpus_path(manifest_path, &manifest.corpus_root, &file.path)
+            .map_err(|_| format!("invalid corpus path `{}`", file.path))?;
+        let bytes = std::fs::read(&candidate)
+            .map_err(|_| format!("cannot read corpus file `{}`", file.path))?;
+        if bytes.len() > MAX_CORPUS_BYTES {
+            return Err(format!("corpus file `{}` too large", file.path));
         }
-        candidates.push(format!("crates/boa_fapi_wpt/corpus/{relative}"));
-        candidates.push(format!("{corpus_root}/{relative}"));
-        let mut loaded: Option<(String, String)> = None;
-        let mut last_error = String::new();
-        for path in &candidates {
-            match std::fs::read(path) {
-                Ok(bytes) => {
-                    loaded = Some((path.clone(), bytes_to_text(&bytes, path)?));
-                    break;
-                }
-                Err(_) => last_error = format!("cannot read corpus file `{path}`"),
-            }
-        }
-        let (path, text) = loaded.ok_or(last_error)?;
-        let digest = sha256_hex(text.as_bytes());
+        let text = String::from_utf8(bytes.clone())
+            .map_err(|_| format!("corpus file `{}` is not UTF-8", file.path))?;
+        let digest = sha256_hex(&bytes);
         if digest != file.sha256 {
             return Err(format!("hash mismatch for `{}`", file.path));
         }
-        let _ = &path;
         texts.insert(file.path.clone(), text);
     }
     Ok(texts)
 }
 
-/// Decodes corpus bytes as UTF-8.
-fn bytes_to_text(bytes: &[u8], path: &str) -> Result<String, String> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| format!("corpus file `{path}` is not UTF-8"))
+/// Internal worker mode: runs exactly one validated manifest file and
+/// prints a single-line worker report to stdout.
+///
+/// Invocation (parent only, never user-facing): the same executable with
+/// `--worker-file <index> --manifest <path> [--timeout-ms N]`. The worker
+/// re-loads and re-validates the manifest (schema, hashes, paths),
+/// resolves the file by manifest index (never by arbitrary path), runs it
+/// in-process with the file timeout as wall guard, and prints one of:
+///
+/// - `WORKER-OK <file-json>` — encoded [`FileResult`] as compact JSON;
+/// - `WORKER-FAIL <detail>` — runner/mapping failure for the file.
+///
+/// Stdout is bounded (one line, corpus-capped); anything else on stdout
+/// is a protocol corruption. Stderr is inherited for launch errors only.
+fn worker_main(argv: &[String]) -> i32 {
+    let mut manifest_path: Option<String> = None;
+    let mut index: Option<usize> = None;
+    let mut timeout_ms: Option<u64> = None;
+    let mut cursor = 1;
+    while cursor < argv.len() {
+        match argv[cursor].as_str() {
+            "--manifest" => {
+                cursor += 1;
+                manifest_path = argv.get(cursor).cloned();
+            }
+            "--worker-file" => {
+                cursor += 1;
+                index = argv.get(cursor).and_then(|raw| raw.parse::<usize>().ok());
+            }
+            "--timeout-ms" => {
+                cursor += 1;
+                timeout_ms = argv.get(cursor).and_then(|raw| raw.parse::<u64>().ok());
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    let (Some(manifest_path), Some(index)) = (manifest_path, index) else {
+        eprintln!("boa_fapi_wpt: worker needs --manifest and --worker-file <index>");
+        return 2;
+    };
+    let manifest_text = match read_text(&manifest_path) {
+        Ok(text) => text,
+        Err(message) => {
+            eprintln!("boa_fapi_wpt: {message}");
+            return 2;
+        }
+    };
+    let today = today_utc();
+    let manifest = match load_manifest(&manifest_text, &today) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("boa_fapi_wpt: {}", format_manifest_error(&error));
+            return 2;
+        }
+    };
+    let Some(file) = manifest.files.get(index) else {
+        eprintln!("boa_fapi_wpt: worker file index out of range");
+        return 2;
+    };
+    let texts = match verify_hashes(&manifest_path, &manifest) {
+        Ok(texts) => texts,
+        Err(message) => {
+            eprintln!("boa_fapi_wpt: {message}");
+            return 2;
+        }
+    };
+    let Some(text) = texts.get(&file.path) else {
+        eprintln!("boa_fapi_wpt: missing corpus text");
+        return 2;
+    };
+    if timeout_ms.is_some_and(|t| t == 0 || t > boa_fapi_wpt::manifest::MAX_TIMEOUT_MS) {
+        eprintln!("boa_fapi_wpt: --timeout-ms out of range 1..=300000");
+        return 2;
+    }
+    let timeout = timeout_ms.unwrap_or(
+        file.subtests
+            .iter()
+            .map(|s| s.timeout_ms)
+            .max()
+            .unwrap_or(5000),
+    );
+    let options = RunOptions {
+        max_pump_passes: 64,
+        file_timeout: Duration::from_millis(timeout),
+    };
+    match run_file(file, text, &options) {
+        Ok(row) => {
+            // Single-line worker report: compact JSON of the one FileResult.
+            let json = report::to_json(&manifest, std::slice::from_ref(&row), true);
+            // Bound stdout: one line, corpus-capped length.
+            let mut line = json;
+            line.retain(|c| c != '\n' && c != '\r');
+            if line.len() > 2 * 1024 * 1024 {
+                eprintln!("boa_fapi_wpt: worker output too large");
+                return 2;
+            }
+            println!("WORKER-OK {line}");
+            0
+        }
+        Err(error) => {
+            eprintln!("WORKER-FAIL {}", format_run_error(&error, &file.path));
+            1
+        }
+    }
 }
 
-/// Runs the strict gate and optionally writes reports.
-fn run(argv: &[String]) -> Result<i32, String> {
-    let args = Args::parse(argv)?;
-    let manifest_text = read_text(&args.manifest)?;
-    let today = today_utc();
-    let manifest = load_manifest(&manifest_text, &today).map_err(|e| format_manifest_error(&e))?;
-    // Corpus root: sibling `corpus/` of the manifest directory, else CWD.
-    // `--threads` is accepted for interface parity but files run
-    // sequentially in manifest order: determinism first, parallelism is
-    // not claimed by this harness (see docs/wpt.md).
-    if args.threads != 1 {
-        return Err("--threads > 1 is accepted but runs sequentially in manifest order".to_owned());
+/// Bounded worker output cap (2 MiB): overflow is a launch failure.
+const MAX_WORKER_OUTPUT: u64 = 2 * 1024 * 1024;
+
+/// Runs one manifest file in an isolated child process of the same
+/// executable, killing it at the wall deadline.
+///
+/// Returns the parsed [`FileResult`] on `WORKER-OK`, or a synthetic
+/// `TIMEOUT` row on kill / non-zero exit / truncated or corrupt output
+/// (parent always continues with the next file). Stderr is bounded and
+/// scrubbed; only the manifest-relative file path appears in errors.
+fn run_file_isolated(
+    exe: &std::path::Path,
+    manifest_path: &str,
+    index: usize,
+    file: &boa_fapi_wpt::manifest::ManifestFile,
+    timeout_ms: u64,
+) -> FileResult {
+    use std::time::Instant;
+    let deadline = Duration::from_millis(timeout_ms.max(1));
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--worker-file")
+        .arg(index.to_string())
+        .arg("--manifest")
+        .arg(manifest_path)
+        .arg("--timeout-ms")
+        .arg(timeout_ms.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return timeout_row(file, "worker spawn failed");
+        }
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return finish_worker(status, &mut child, file);
+            }
+            Ok(None) => {
+                if started.elapsed() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return timeout_row(file, "worker wall deadline exceeded");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return timeout_row(file, "worker wait failed");
+            }
+        }
     }
-    let corpus_root = manifest_dir(&args.manifest);
-    let texts = verify_hashes(&manifest, &corpus_root)?;
-    let mut files: Vec<FileResult> = Vec::new();
-    for file in &manifest.files {
+}
+
+/// Reads a finished worker's bounded output and maps it to a row.
+fn finish_worker(
+    status: std::process::ExitStatus,
+    child: &mut std::process::Child,
+    file: &boa_fapi_wpt::manifest::ManifestFile,
+) -> FileResult {
+    use std::io::Read as _;
+    let mut stdout = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        let mut capped = pipe.take(MAX_WORKER_OUTPUT + 1);
+        let _ = capped.read_to_end(&mut stdout);
+    }
+    let mut stderr = Vec::new();
+    if let Some(pipe) = child.stderr.take() {
+        let mut capped = pipe.take(64 * 1024 + 1);
+        let _ = capped.read_to_end(&mut stderr);
+    }
+    let _ = child.wait();
+    if stdout.len() as u64 > MAX_WORKER_OUTPUT {
+        return timeout_row(file, "worker output overflow");
+    }
+    let text = String::from_utf8_lossy(&stdout);
+    let line = text.lines().next().unwrap_or("");
+    if status.success() && line.starts_with("WORKER-OK ") {
+        match worker_json_to_row(&line["WORKER-OK ".len()..], file) {
+            Some(row) => return row,
+            None => return timeout_row(file, "worker protocol corruption"),
+        }
+    }
+    // Non-zero exit or malformed line: prefer a scrubbed stderr hint when
+    // it names the failure, else a generic worker detail.
+    let hint = String::from_utf8_lossy(&stderr);
+    let hint = hint.lines().next().unwrap_or("").trim();
+    if !status.success() && !hint.is_empty() {
+        return timeout_row(file, &format!("worker exit: {}", truncate_hint(hint)));
+    }
+    timeout_row(file, "worker non-zero exit")
+}
+
+/// Extracts the single [`FileResult`] from a `WORKER-OK` JSON line.
+///
+/// The worker JSON envelopes exactly one file (`files[0]`); the row is
+/// accepted only when its path matches the dispatched manifest file —
+/// anything else is protocol corruption.
+fn worker_json_to_row(
+    json: &str,
+    file: &boa_fapi_wpt::manifest::ManifestFile,
+) -> Option<FileResult> {
+    use boa_fapi_wpt::manifest::{ExpectedStatus, parse_json};
+    let root = parse_json(json).ok()?;
+    let files = root.field("files")?.as_arr()?;
+    if files.len() != 1 {
+        return None;
+    }
+    let entry = &files[0];
+    let path = entry.field("path")?.as_str()?;
+    if path != file.path {
+        return None;
+    }
+    let subtests = entry.field("subtests")?.as_arr()?;
+    if subtests.len() != file.subtests.len() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for (sub_json, expected) in subtests.iter().zip(file.subtests.iter()) {
+        let test = sub_json.field("test")?.as_str()?;
+        let subtest = sub_json.field("subtest")?.as_str()?;
+        let actual = sub_json.field("actual")?.as_str()?;
+        let detail = sub_json.field("detail")?.as_str().unwrap_or("");
+        if test != expected.test || subtest != expected.subtest {
+            return None;
+        }
+        let actual = match actual {
+            "PASS" => ActualStatus::Pass,
+            "FAIL" => ActualStatus::Fail,
+            "TIMEOUT" => ActualStatus::Timeout,
+            "NOTRUN" => ActualStatus::NotRun,
+            _ => return None,
+        };
+        rows.push(SubtestResult {
+            test: test.to_owned(),
+            subtest: subtest.to_owned(),
+            actual,
+            expected: if expected.expected.token() == "PASS" {
+                ExpectedStatus::Pass
+            } else {
+                ExpectedStatus::NotRun
+            },
+            detail: scrub_detail(detail),
+            trace: expected.trace.clone(),
+            elapsed_ms: 0,
+        });
+    }
+    Some(FileResult {
+        path: file.path.clone(),
+        upstream_path: file.upstream_path.clone(),
+        group: file.group.clone(),
+        subtests: rows,
+    })
+}
+
+/// Builds a synthetic `TIMEOUT` row for every expected subtest.
+fn timeout_row(file: &boa_fapi_wpt::manifest::ManifestFile, detail: &str) -> FileResult {
+    FileResult {
+        path: file.path.clone(),
+        upstream_path: file.upstream_path.clone(),
+        group: file.group.clone(),
+        subtests: file
+            .subtests
+            .iter()
+            .map(|s| SubtestResult {
+                test: s.test.clone(),
+                subtest: s.subtest.clone(),
+                actual: ActualStatus::Timeout,
+                expected: s.expected,
+                detail: scrub_detail(detail),
+                trace: s.trace.clone(),
+                elapsed_ms: 0,
+            })
+            .collect(),
+    }
+}
+
+/// Truncates a worker stderr hint to a stable short detail.
+fn truncate_hint(hint: &str) -> String {
+    scrub_detail(&hint.chars().take(160).collect::<String>())
+}
+
+/// Runs manifest files across `slots` isolated worker processes.
+///
+/// Each slot owns a disjoint manifest-index chunk; every file runs in
+/// the isolated child path (same wall deadline + kill semantics as the
+/// sequential run). Results are re-sorted by manifest index before
+/// serialization, so `--threads N` output is byte-identical to `--threads
+/// 1` for the same manifest. One file's failure never drops another
+/// file's row (TIMEOUT rows are synthesized instead); `strict` still
+/// fails on any unexpected row.
+fn run_files_parallel(
+    args: &Args,
+    manifest: &Manifest,
+    slots: usize,
+) -> Result<Vec<FileResult>, String> {
+    use std::collections::BTreeMap;
+    let exe = std::env::current_exe().map_err(|_| "cannot locate harness executable".to_owned())?;
+    // Manifest-indexed work list (filter applies before chunking, so the
+    // diagnostic subset keeps its manifest order in both modes).
+    let mut selected: Vec<usize> = Vec::new();
+    for (index, file) in manifest.files.iter().enumerate() {
         if let Some(filter) = args.filter.as_ref()
             && file.path != *filter
             && !file.path.starts_with(filter)
         {
             continue;
         }
-        let text = texts.get(&file.path).ok_or("missing corpus text")?;
-        let timeout_ms = args.timeout_ms.unwrap_or(
-            file.subtests
-                .iter()
-                .map(|s| s.timeout_ms)
-                .max()
-                .unwrap_or(5000),
-        );
-        let options = RunOptions {
-            max_pump_passes: 64,
-            file_timeout: Duration::from_millis(timeout_ms),
+        selected.push(index);
+    }
+    if selected.is_empty() {
+        return Err("filter matched no manifest files".to_owned());
+    }
+    // Chunk round-robin across slots for stable assignment.
+    let mut chunks: Vec<Vec<usize>> = vec![Vec::new(); slots];
+    for (position, index) in selected.into_iter().enumerate() {
+        chunks[position % slots].push(index);
+    }
+    // One OS thread per slot; each thread runs its chunk sequentially
+    // through isolated child processes. No Context/JsObject crosses
+    // threads (only validated file records by index).
+    let manifest_path = args.manifest.clone();
+    let timeout_override = args.timeout_ms;
+    let manifest_owned = Manifest {
+        source: manifest.source.clone(),
+        corpus_root: manifest.corpus_root.clone(),
+        default_timeout_ms: manifest.default_timeout_ms,
+        files: manifest.files.clone(),
+    };
+    let mut handles = Vec::new();
+    for chunk in chunks {
+        let manifest_path = manifest_path.clone();
+        let manifest_owned = Manifest {
+            source: manifest_owned.source.clone(),
+            corpus_root: manifest_owned.corpus_root.clone(),
+            default_timeout_ms: manifest_owned.default_timeout_ms,
+            files: manifest_owned.files.clone(),
         };
-        match run_file(file, text, &options) {
-            Ok(row) => files.push(row),
-            Err(e) => return Err(format_run_error(&e, &file.path)),
+        let exe = exe.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut rows: Vec<(usize, FileResult)> = Vec::new();
+            for index in chunk {
+                let Some(file) = manifest_owned.files.get(index) else {
+                    continue;
+                };
+                let timeout_ms = timeout_override.unwrap_or(
+                    file.subtests
+                        .iter()
+                        .map(|s| s.timeout_ms)
+                        .max()
+                        .unwrap_or(5000),
+                );
+                rows.push((
+                    index,
+                    run_file_isolated(&exe, &manifest_path, index, file, timeout_ms),
+                ));
+            }
+            rows
+        }));
+    }
+    let mut by_index: BTreeMap<usize, FileResult> = BTreeMap::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(rows) => {
+                for (index, row) in rows {
+                    by_index.insert(index, row);
+                }
+            }
+            Err(_) => return Err("worker slot panicked".to_owned()),
         }
+    }
+    Ok(by_index.into_values().collect())
+}
+
+/// Runs the strict gate and optionally writes reports.
+fn run(argv: &[String]) -> Result<i32, String> {
+    let args = Args::parse(argv)?;
+    // Filter is diagnostic-only: combining it with --strict would let the
+    // gate pass on a subset while excluded files fail. Reject upfront.
+    if args.strict && args.filter.is_some() {
+        return Err("--filter cannot be combined with --strict".to_owned());
+    }
+    let manifest_text = read_text(&args.manifest)?;
+    let today = today_utc();
+    let manifest = load_manifest(&manifest_text, &today).map_err(|e| format_manifest_error(&e))?;
+    if args.threads == 0 {
+        return Err("--threads must be >= 1".to_owned());
+    }
+    if args
+        .timeout_ms
+        .is_some_and(|t| t == 0 || t > boa_fapi_wpt::manifest::MAX_TIMEOUT_MS)
+    {
+        return Err("--timeout-ms out of range 1..=300000".to_owned());
+    }
+    // Hash/path validation first: the worker path reuses the same texts.
+    let texts = verify_hashes(&args.manifest, &manifest)?;
+    // Worker slots: min(threads, files). N=1 keeps the in-process
+    // deterministic path (identical rows); N>1 runs one isolated child
+    // process per slot with results re-sorted by manifest index.
+    let slots = args.threads.min(manifest.files.len().max(1));
+    let mut files: Vec<FileResult> = Vec::new();
+    if slots <= 1 {
+        for file in &manifest.files {
+            if let Some(filter) = args.filter.as_ref()
+                && file.path != *filter
+                && !file.path.starts_with(filter)
+            {
+                continue;
+            }
+            let text = texts.get(&file.path).ok_or("missing corpus text")?;
+            let timeout_ms = args.timeout_ms.unwrap_or(
+                file.subtests
+                    .iter()
+                    .map(|s| s.timeout_ms)
+                    .max()
+                    .unwrap_or(5000),
+            );
+            let options = RunOptions {
+                max_pump_passes: 64,
+                file_timeout: Duration::from_millis(timeout_ms),
+            };
+            match run_file(file, text, &options) {
+                Ok(row) => files.push(row),
+                Err(e) => return Err(format_run_error(&e, &file.path)),
+            }
+        }
+    } else {
+        files = run_files_parallel(&args, &manifest, slots)?;
     }
     if files.is_empty() {
         return Err("filter matched no manifest files".to_owned());
@@ -310,17 +704,6 @@ fn run(argv: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Manifest directory (corpus sibling) or `.` when bare.
-fn manifest_dir(manifest_path: &str) -> String {
-    if let Some(index) = manifest_path.rfind('/') {
-        manifest_path[..index].to_owned()
-    } else if let Some(index) = manifest_path.rfind('\\') {
-        manifest_path[..index].to_owned()
-    } else {
-        ".".to_owned()
-    }
-}
-
 fn format_manifest_error(error: &ManifestError) -> String {
     format!("manifest error: {error}")
 }
@@ -330,45 +713,63 @@ fn format_run_error(error: &RunError, path: &str) -> String {
 }
 
 /// Prints the stable human summary (counts only, no secrets/paths detail).
+///
+/// `NOTRUN` rows count separately from `PASS`/`FAIL`: a gap is never
+/// reported as a pass.
 fn summarize(files: &[FileResult]) {
     let mut pass = 0;
+    let mut notrun = 0;
     let mut fail = 0;
     for file in files {
         for sub in &file.subtests {
-            // Expected PASS and expected NOTRUN-with-reason both count as
-            // satisfied; anything else is unexpected.
-            let satisfied = (sub.actual.token() == "PASS" && sub.expected.token() == "PASS")
-                || (sub.expected.token() == "NOTRUN" && sub.detail.starts_with("notrun: "));
-            if satisfied {
+            if sub.actual.token() == "PASS" && sub.expected.token() == "PASS" {
                 pass += 1;
+            } else if sub.actual.token() == "NOTRUN" && sub.expected.token() == "NOTRUN" {
+                notrun += 1;
             } else {
                 fail += 1;
             }
         }
     }
     println!(
-        "wpt: {pass} expected, {fail} unexpected ({} files)",
+        "wpt: {pass} passed, {notrun} notrun, {fail} unexpected ({} files)",
         files.len()
     );
 }
 
 fn main() {
-    // Boa evaluation is deeply recursive; the default Windows main-thread
-    // stack (1 MiB) overflows where the test harness threads (2 MiB+)
-    // succeed. Run the CLI body on a dedicated 8 MiB thread so local runs
-    // and CI behave identically on every platform.
+    // `--worker-file` is the internal isolated mode (F5): run exactly one
+    // validated file and exit with the worker protocol (no strict gate, no
+    // reports). The flag is accepted anywhere in argv; anything else
+    // follows the normal CLI path.
+    //
+    // Both paths run on the dedicated 8 MiB thread below: Boa evaluation
+    // is deeply recursive and the default Windows main-thread stack
+    // (1 MiB) overflows where the test harness threads (2 MiB+) succeed.
+    // The worker inherits this protection by routing through the same
+    // spawn (it returns the worker exit code instead of the strict gate).
+    let raw: Vec<String> = std::env::args().collect();
+    let is_worker = raw.iter().any(|a| a == "--worker-file");
     let argv: Vec<String> = std::env::args().collect();
     let child = std::thread::Builder::new()
         .name("wpt-main".to_owned())
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || run(&argv));
+        .spawn(move || {
+            if is_worker {
+                worker_main(&argv)
+            } else {
+                match run(&argv) {
+                    Ok(code) => code,
+                    Err(message) => {
+                        eprintln!("boa_fapi_wpt: {message}");
+                        2
+                    }
+                }
+            }
+        });
     match child {
         Ok(join) => match join.join() {
-            Ok(Ok(code)) => std::process::exit(code),
-            Ok(Err(message)) => {
-                eprintln!("boa_fapi_wpt: {message}");
-                std::process::exit(2);
-            }
+            Ok(code) => std::process::exit(code),
             Err(_) => {
                 eprintln!("boa_fapi_wpt: worker thread panicked");
                 std::process::exit(3);

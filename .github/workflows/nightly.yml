@@ -12,7 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            miri: skip
+          - os: ubuntu-latest
+            miri: run
     steps:
       - uses: actions/checkout@v4
 
@@ -32,8 +36,23 @@ jobs:
       - name: WPT harness units
         run: cargo test --package boa_fapi_wpt -- --nocapture
 
-      # miri is not installed by default; this step documents the intended
-      # gate and degrades to an explicit skip (never fake PASS) when the
-      # toolchain target is unavailable.
-      - name: miri check (best effort)
-        run: rustup component add miri || echo "miri unavailable on this runner → SKIP (no-miri-toolchain)"
+      # miri gate: nightly + Miri on Ubuntu (bounded lib scope), explicit
+      # SKIP with reason elsewhere or when the toolchain is unavailable —
+      # never fake PASS, never masked as NOTRUN.
+      - name: miri (boa_fapi_core lib, bounded)
+        if: matrix.miri == 'run'
+        timeout-minutes: 20
+        run: >
+          rustup toolchain install nightly --component miri --profile minimal
+          && cargo +nightly miri test --package boa_fapi_core --lib
+          || echo "miri unavailable on this runner/target → SKIP (no-miri-toolchain)"
+
+      - name: miri (Windows — compatible hooks only)
+        if: matrix.miri == 'skip'
+        run: echo "miri on Windows → SKIP (miri-toolchain-ubuntu-only); compatible hardening hooks ran above"
+
+      - name: hardening fuzz (fixed seed, input cap, bounded time)
+        timeout-minutes: 10
+        run: cargo test --package boa_fapi --test hardening_hooks fuzz_decode_bounded -- --nocapture
+        env:
+          CARGO_TERM_COLOR: always

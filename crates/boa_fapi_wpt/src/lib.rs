@@ -13,13 +13,8 @@
 
 #![deny(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
-// `expect` is allowed in `#[cfg(test)]` unit modules only (test-only
-// fixtures with static inputs); production paths return `Result`.
-// The workspace lint still denies `expect_used` for non-test targets;
-// this crate re-allows it crate-wide because its unit tests live in the
-// same files — the guards suite pins that no production line uses it.
-#![allow(clippy::expect_used)]
 
 pub mod harness;
 pub mod manifest;

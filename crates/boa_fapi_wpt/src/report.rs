@@ -31,7 +31,9 @@ pub fn json_escape(text: &str) -> String {
     out
 }
 
-/// Escapes a string for XML attribute/text output.
+/// Escapes a string for XML attribute/text output (XML 1.0 validity:
+/// control characters except tab/newline/CR are dropped — they are
+/// illegal even escaped; DEL is dropped as well).
 #[must_use]
 pub fn xml_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -42,6 +44,8 @@ pub fn xml_escape(text: &str) -> String {
             '&' => out.push_str("&amp;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            '\t' | '\n' | '\r' => out.push(ch),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {}
             c => out.push(c),
         }
     }
@@ -91,6 +95,11 @@ pub fn to_json(manifest: &Manifest, files: &[FileResult], strict_pass: bool) -> 
 }
 
 /// Serializes the strict run report as deterministic JUnit XML.
+///
+/// `NOTRUN` rows (actual + expected) serialize as `<skipped>` without a
+/// `<failure>` and without raising the suite `failures` count;
+/// `FAIL`/`TIMEOUT` rows serialize as `<failure>`; unexpected rows always
+/// break strict via [`strict_pass`].
 #[must_use]
 pub fn to_junit(manifest: &Manifest, files: &[FileResult]) -> String {
     let mut out = String::new();
@@ -99,13 +108,19 @@ pub fn to_junit(manifest: &Manifest, files: &[FileResult]) -> String {
         let failures = file
             .subtests
             .iter()
-            .filter(|s| s.actual != ActualStatus::Pass || s.expected.token() == "NOTRUN")
+            .filter(|s| s.actual == ActualStatus::Fail || s.actual == ActualStatus::Timeout)
+            .count();
+        let skipped = file
+            .subtests
+            .iter()
+            .filter(|s| s.actual == ActualStatus::NotRun)
             .count();
         out.push_str(&format!(
-            "<testsuite name=\"{}\" tests=\"{}\" failures=\"{}\">",
+            "<testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" skipped=\"{}\">",
             xml_escape(&file.path),
             file.subtests.len(),
-            failures
+            failures,
+            skipped
         ));
         for sub in &file.subtests {
             out.push_str(&format!(
@@ -114,8 +129,14 @@ pub fn to_junit(manifest: &Manifest, files: &[FileResult]) -> String {
                 xml_escape(&sub.subtest)
             ));
             match sub.actual {
-                ActualStatus::Pass if sub.expected.token() == "PASS" => {}
-                _ => {
+                ActualStatus::Pass => {}
+                ActualStatus::NotRun => {
+                    out.push_str(&format!(
+                        "<skipped message=\"{}\"/>",
+                        xml_escape(&sub.detail)
+                    ));
+                }
+                ActualStatus::Fail | ActualStatus::Timeout => {
                     out.push_str(&format!(
                         "<failure message=\"actual={} expected={}\">{}</failure>",
                         sub.actual.token(),
@@ -133,17 +154,17 @@ pub fn to_junit(manifest: &Manifest, files: &[FileResult]) -> String {
     out
 }
 
-/// Strict gate: `true` only when every subtest matches its expectation.
+/// Strict gate: enum-to-enum comparison, never detail-prefix matching.
 ///
-/// `PASS`-expected rows must be actually `PASS`; `NOTRUN`-expected rows
-/// are satisfied by the harness `NOTRUN` report (recorded as expected
-/// with the gap reason — any `FAIL`/`TIMEOUT` there breaks strict).
-/// Unexpected extra rows always break strict.
+/// - `PASS` expects only actual `PASS`;
+/// - `NOTRUN` expects only actual `NOTRUN`;
+/// - `FAIL`/`TIMEOUT` always break strict (no manifest status can expect
+///   them — the loader only accepts `PASS`/`NOTRUN`).
 #[must_use]
 pub fn strict_pass(files: &[FileResult]) -> bool {
     files.iter().flat_map(|f| &f.subtests).all(|s| {
         (s.expected.token() == "PASS" && s.actual == ActualStatus::Pass)
-            || (s.expected.token() == "NOTRUN" && s.detail.starts_with("notrun: "))
+            || (s.expected.token() == "NOTRUN" && s.actual == ActualStatus::NotRun)
     })
 }
 
@@ -181,7 +202,9 @@ mod tests {
             subtests: vec![row(ActualStatus::Fail, ExpectedStatus::Pass, "x")],
         }];
         assert!(!strict_pass(&fail));
-        let gap = vec![FileResult {
+        // A NOTRUN gap reported as actual FAIL (old mapping) breaks strict:
+        // only actual NOTRUN satisfies expected NOTRUN.
+        let gap_fail = vec![FileResult {
             path: "p".to_owned(),
             upstream_path: "u".to_owned(),
             group: "g".to_owned(),
@@ -191,12 +214,49 @@ mod tests {
                 "notrun: needs X",
             )],
         }];
+        assert!(!strict_pass(&gap_fail));
+        let gap = vec![FileResult {
+            path: "p".to_owned(),
+            upstream_path: "u".to_owned(),
+            group: "g".to_owned(),
+            subtests: vec![row(
+                ActualStatus::NotRun,
+                ExpectedStatus::NotRun,
+                "notrun: needs X",
+            )],
+        }];
         assert!(strict_pass(&gap));
+        let timeout = vec![FileResult {
+            path: "p".to_owned(),
+            upstream_path: "u".to_owned(),
+            group: "g".to_owned(),
+            subtests: vec![row(ActualStatus::Timeout, ExpectedStatus::Pass, "t")],
+        }];
+        assert!(!strict_pass(&timeout));
     }
 
     #[test]
     fn json_and_junit_escape_deterministically() {
         assert_eq!(json_escape("a\"b"), "a\\\"b");
         assert_eq!(xml_escape("a<b"), "a&lt;b");
+    }
+
+    #[test]
+    fn serializer_checks_quote_amp_nul_unicode_blob_and_paths() {
+        // Quote/ampersand, NUL (dropped in XML), Unicode passthrough.
+        assert_eq!(
+            json_escape("q\"&\u{0}é"),
+            "q\\\"&\u{0}é".replace('\u{0}', "\\u0000")
+        );
+        assert_eq!(xml_escape("q\"&\u{0}é"), "q&quot;&amp;é");
+        // `blob:` inside a token and OS paths are scrubbed before reports.
+        assert_eq!(
+            crate::runner::scrub_detail("see (blob:uuid-1), C:\\a\\b.js and /tmp/x"),
+            "see (blob:<redacted>), <redacted-drive-path> and <redacted-abs-path>"
+        );
+        // JSON stays valid: escaped detail round-trips through the parser.
+        let escaped = json_escape("a\"b\\c");
+        let wrapped = format!("{{\"d\": \"{escaped}\"}}");
+        assert!(crate::manifest::parse_json(&wrapped).is_ok());
     }
 }

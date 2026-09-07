@@ -25,59 +25,131 @@ pub fn prelude_source(file_label: &str) -> String {
         r#"
 (function() {
   var results = globalThis.__wpt.results;
-  function record(kind, name, pass, message) {
-    results.push({ kind: kind, name: String(name), pass: !!pass, message: String(message || "") });
+  // Bounded record state: name/message are scrub-safe truncated text;
+  // `pending` tracks terminal completion per test name.
+  var states = {};
+  function safe_text(value) {
+    var text;
+    try { text = String(value); } catch (e) { return "<unformattable>"; }
+    if (text.length > 480) { text = text.slice(0, 480); }
+    return text;
+  }
+  function safe_error(e) {
+    try {
+      if (e && e.message) { return safe_text(e.name + ": " + e.message); }
+      return safe_text(e);
+    } catch (err) { return "<unformattable>"; }
   }
   function fmt(value) {
     try { return String(value); } catch (e) { return "<unformattable>"; }
   }
+  function record_once(name, pass, message) {
+    var key = String(name);
+    var state = states[key];
+    if (state === "passed" || state === "failed") {
+      results.push({ kind: "test", name: key, pass: false, message: "duplicate terminal completion" });
+      states[key] = "failed";
+      return;
+    }
+    if (pass) {
+      if (state === "failed") { return; }
+      states[key] = "passed";
+    } else {
+      states[key] = "failed";
+    }
+    results.push({ kind: "test", name: key, pass: !!pass, message: safe_text(message || "") });
+  }
+  function record(kind, name, pass, message) {
+    record_once(name, pass, message);
+  }
+  function run_step(name, fn, thisArg, args) {
+    try {
+      return fn.apply(thisArg, args);
+    } catch (e) {
+      // Exceptions from step callbacks become FAIL records instead of
+      // escaping into the Boa job queue (which would surface as TIMEOUT).
+      record_once(name, false, safe_error(e));
+      return undefined;
+    }
+  }
   globalThis.test = function(fn, name) {
     try {
       var t = { name: name, done: false, cleanup: [] };
-      t.step = function(f) { return f(); };
-      t.step_func = function(f) { return f; };
+      t.step = function(f) { return run_step(name, f, this, []); };
+      t.step_func = function(f) { return function() { return run_step(name, f, this, arguments); }; };
       t.add_cleanup = function(f) { t.cleanup.push(f); };
       t.done = function() { t.done = true; };
       fn(t);
-      for (var i = 0; i < t.cleanup.length; i++) { t.cleanup[i](); }
-      record("test", name, true, "");
+      try {
+        for (var i = 0; i < t.cleanup.length; i++) { t.cleanup[i](); }
+      } catch (e) {
+        // Cleanup failure: FAIL without a second PASS.
+        record_once(name, false, safe_error(e));
+        return;
+      }
+      record_once(name, true, "");
     } catch (e) {
-      record("test", name, false, (e && e.message) ? (e.name + ": " + e.message) : fmt(e));
+      record_once(name, false, safe_error(e));
     }
   };
   globalThis.async_test = function(name) {
     var t = { name: name, pending: true, cleanup: [] };
-    t.step = function(f) { return f(); };
-    t.step_func = function(f) { return function() { return f.apply(this, arguments); }; };
+    t.step = function(f) { return run_step(name, f, this, []); };
+    t.step_func = function(f) {
+      return function() { return run_step(name, f, this, arguments); };
+    };
     t.add_cleanup = function(f) { t.cleanup.push(f); };
     t.done = function() {
       // Second `done()` is a harness failure, not a silent pass: record
       // explicitly so duplicate completion breaks strict instead of
       // masquerading as PASS.
       if (!t.pending) {
-        record("test", t.name, false, "async_test done() called twice");
+        record_once(t.name, false, "async_test done() called twice");
         return;
       }
       t.pending = false;
-      record("test", t.name, true, "");
-      for (var i = 0; i < t.cleanup.length; i++) { t.cleanup[i](); }
+      try {
+        for (var i = 0; i < t.cleanup.length; i++) { t.cleanup[i](); }
+      } catch (e) {
+        // Cleanup failure turns the test FAIL without a second PASS.
+        record_once(t.name, false, safe_error(e));
+        return;
+      }
+      record_once(t.name, true, "");
     };
     return t;
   };
   globalThis.promise_test = function(fn, name) {
     var label = name;
+    var p;
     try {
-      var p = fn();
-      if (p && typeof p.then === "function") {
-        p.then(
-          function() { record("test", label, true, ""); },
-          function(e) { record("test", label, false, (e && e.message) ? (e.name + ": " + e.message) : fmt(e)); }
-        );
-      } else {
-        record("test", label, false, "promise_test did not return a promise");
+      p = fn();
+    } catch (e) {
+      record_once(label, false, safe_error(e));
+      return;
+    }
+    if (!p || typeof p.then !== "function") {
+      record_once(label, false, "promise_test did not return a promise");
+      return;
+    }
+    try {
+      var chained = p.then(
+        function() {
+          try {
+            record_once(label, true, "");
+          } catch (e) {
+            record_once(label, false, safe_error(e));
+          }
+        },
+        function(e) { record_once(label, false, safe_error(e)); }
+      );
+      // A throwing fulfillment callback must not become an unhandled
+      // rejection: the chained promise always has a rejection handler.
+      if (chained && typeof chained.then === "function") {
+        chained.then(undefined, function(e) { record_once(label, false, safe_error(e)); });
       }
     } catch (e) {
-      record("test", label, false, (e && e.message) ? (e.name + ": " + e.message) : fmt(e));
+      record_once(label, false, safe_error(e));
     }
   };
   function same(a, b) {

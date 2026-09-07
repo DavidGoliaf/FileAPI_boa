@@ -101,6 +101,8 @@ pub struct ManifestSource {
 pub struct Manifest {
     /// Pinned upstream source.
     pub source: ManifestSource,
+    /// Corpus root relative to the manifest directory.
+    pub corpus_root: String,
     /// Default per-subtest timeout in milliseconds.
     pub default_timeout_ms: u64,
     /// Files in manifest order.
@@ -140,6 +142,14 @@ pub enum ManifestError {
     /// Malformed review date.
     #[error("subtest `{0} :: {1}` has a malformed review_by date")]
     BadDate(String, String),
+    /// Invalid corpus path (traversal, absolute, symlink, suffix, ...).
+    /// The detail carries only the manifest-relative logical path, never
+    /// an absolute path.
+    #[error("invalid corpus path `{0}`")]
+    BadPath(String),
+    /// Symlinks are forbidden in the corpus root and candidates.
+    #[error("symlinks are not allowed in corpus")]
+    Symlink(String),
     /// Expired `review_by` date.
     #[error("subtest `{0} :: {1}` review_by {2} has expired")]
     Expired(String, String, String),
@@ -486,16 +496,270 @@ fn is_hex(text: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Checks `YYYY-MM-DD` shape (calendar validity is not required; expiry
-/// compares lexicographically, which is order-correct for this shape).
+/// Maximum accepted timeout (5 minutes): bounds `--timeout-ms` and the
+/// per-subtest `timeout_ms` against unbounded/hung runs.
+pub const MAX_TIMEOUT_MS: u64 = 300_000;
+
+/// Maximum accepted corpus file bytes (1 MiB of adapted JS).
+pub const MAX_CORPUS_BYTES: usize = 1024 * 1024;
+
+/// Maximum accepted lengths for manifest text fields.
+pub const MAX_PATH_LEN: usize = 256;
+/// Maximum accepted lengths for test/subtest names.
+pub const MAX_NAME_LEN: usize = 256;
+/// Maximum accepted lengths for reason/owner/trace fields.
+pub const MAX_META_LEN: usize = 512;
+
+/// Mandatory WPT groups: every strict manifest covers all six.
+pub const REQUIRED_GROUPS: [&str; 6] = [
+    "FileAPI/blob",
+    "FileAPI/file",
+    "FileAPI/filelist-section",
+    "FileAPI/reading-data-section",
+    "FileAPI/FileReader",
+    "FileAPI/BlobURL",
+];
+
+/// Validates a logical adapted path: exactly `corpus/<name>.js` with no
+/// leading slash, drive prefix, `..` segment, NUL/control characters or
+/// non-`.js` suffix. This is a logical name, never an OS path: joining
+/// happens only through [`resolve_corpus_path`] after this check.
+pub fn check_logical_path(path: &str) -> Result<String, ManifestError> {
+    if path.is_empty() || path.len() > MAX_PATH_LEN {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    }
+    if path.contains('*') {
+        return Err(ManifestError::Wildcard(path.to_owned(), String::new()));
+    }
+    let Some(relative) = path.strip_prefix("corpus/") else {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    };
+    if relative.is_empty() || !relative.ends_with(".js") {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    }
+    if path.as_bytes().iter().any(|b| *b < 0x20 || *b == 0x7F) {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    }
+    if relative.contains('\\') {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    }
+    if path.len() > 2 && path.as_bytes()[1] == b':' {
+        return Err(ManifestError::BadPath(path.to_owned()));
+    }
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(ManifestError::BadPath(path.to_owned()));
+        }
+    }
+    Ok(relative.to_owned())
+}
+
+/// Validates `corpus_root` (manifest-relative): non-empty, no absolute
+/// form, no backslash, no empty segment, no `..`.
+///
+/// NOTE: resolution failures at runtime distinguish `BadPath` (policy
+/// violation: traversal/absolute/suffix) from I/O errors by mapping
+/// the latter to `BadPath("cannot resolve …")` with the logical path
+/// only — absolute filesystem paths never surface.
+pub fn check_corpus_root(root: &str) -> Result<(), ManifestError> {
+    if root.is_empty() || root.len() > MAX_PATH_LEN {
+        return Err(ManifestError::BadPath(root.to_owned()));
+    }
+    if root.starts_with('/') || root.starts_with('\\') {
+        return Err(ManifestError::BadPath(root.to_owned()));
+    }
+    if root
+        .as_bytes()
+        .iter()
+        .any(|b| *b < 0x20 || *b == 0x7F || *b == b'\\')
+    {
+        return Err(ManifestError::BadPath(root.to_owned()));
+    }
+    if root.len() > 2 && root.as_bytes()[1] == b':' {
+        return Err(ManifestError::BadPath(root.to_owned()));
+    }
+    for segment in root.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(ManifestError::BadPath(root.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a validated logical path strictly inside the canonical corpus
+/// root: `manifest_dir` + `corpus_root` are canonicalized first, the
+/// candidate is joined via [`std::path::Path`], canonicalized, and required
+/// to stay strictly inside the root. Every component of the root and the
+/// candidate is checked with `symlink_metadata`: any symlink in either is
+/// a launch error. Returns the canonical candidate path.
+pub fn resolve_corpus_path(
+    manifest_path: &str,
+    corpus_root: &str,
+    logical_path: &str,
+) -> Result<std::path::PathBuf, ManifestError> {
+    use std::path::{Component, Path};
+    check_corpus_root(corpus_root)?;
+    let relative = check_logical_path(logical_path)?;
+    let manifest_dir = Path::new(manifest_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    // Canonicalize the manifest directory first: a symlinked CWD must not
+    // smuggle the root outside the repository. A non-existent directory
+    // is a load error (never fall back to another root).
+    // NOTE: on Windows, `canonicalize` returns verbatim `\\?\`-prefixed
+    // paths; `starts_with` below compares canonical-vs-canonical, so the
+    // prefix is consistent on both sides.
+    //
+    // Empty parent means "the manifest file lives in the CWD": resolve
+    // the CWD itself instead of canonicalizing the empty path (which
+    // fails with NotFound on Windows and would brick root-level runs).
+    let canonical_dir = if manifest_dir.as_os_str().is_empty() {
+        std::env::current_dir()
+    } else {
+        manifest_dir.canonicalize()
+    }
+    .map_err(|_| ManifestError::BadPath(format!("cannot resolve {logical_path}")))?;
+    let root = canonical_dir.join(corpus_root);
+    reject_symlinks(&canonical_dir)?;
+    // The root itself must exist as a real directory: missing roots are
+    // launch errors, not silent fallbacks. (`symlink_metadata` follows no
+    // links: a symlinked root is rejected here before `canonicalize`
+    // would resolve it away.)
+    let root_meta = match std::fs::symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return Err(ManifestError::BadPath(format!(
+                "cannot resolve {logical_path}"
+            )));
+        }
+    };
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        return Err(ManifestError::Symlink(logical_path.to_owned()));
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| ManifestError::BadPath(format!("cannot resolve {logical_path}")))?;
+    reject_symlinks(&canonical_root)?;
+    // The logical name was validated segment-by-segment above; rebuild it
+    // through `Path` components (never string concatenation) as defense
+    // in depth against separator confusion.
+    let mut candidate = canonical_root.clone();
+    for part in relative.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(ManifestError::BadPath(logical_path.to_owned()));
+        }
+        candidate.push(Path::new(part));
+    }
+    // The candidate must exist as a real file (not a directory, not a
+    // symlink): `canonicalize` would otherwise resolve links away before
+    // we can reject them.
+    let candidate_meta = std::fs::symlink_metadata(&candidate)
+        .map_err(|_| ManifestError::BadPath(format!("cannot resolve {logical_path}")))?;
+    if !candidate_meta.is_file() || candidate_meta.file_type().is_symlink() {
+        return Err(ManifestError::Symlink(logical_path.to_owned()));
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| ManifestError::BadPath(format!("cannot resolve {logical_path}")))?;
+    if !canonical.starts_with(&canonical_root) || canonical == canonical_root {
+        return Err(ManifestError::BadPath(format!(
+            "cannot resolve {logical_path}"
+        )));
+    }
+    // Component-level symlink check on the resolved candidate path (the
+    // pre-canonical check above already rejected a symlinked final file).
+    reject_symlinks(&canonical)?;
+    // Defensive: the logical path must reproduce itself (no `.`/`..`
+    // survived the join), and only `.js` files resolve.
+    let mut rebuilt = std::path::PathBuf::new();
+    let mut count = 0;
+    for component in canonical
+        .strip_prefix(&canonical_root)
+        .map_err(|_| ManifestError::BadPath(format!("cannot resolve {logical_path}")))?
+        .components()
+    {
+        match component {
+            Component::Normal(part) => {
+                rebuilt.push(part);
+                count += 1;
+            }
+            _ => return Err(ManifestError::BadPath(logical_path.to_owned())),
+        }
+    }
+    if count == 0 || canonical.extension().and_then(|e| e.to_str()) != Some("js") {
+        return Err(ManifestError::BadPath(logical_path.to_owned()));
+    }
+    let _ = rebuilt;
+    Ok(canonical)
+}
+
+/// Rejects any symlink component of `path` (parents included).
+///
+/// Missing trailing components (a candidate file that exists) are fine —
+/// the canonical check after join is authoritative. Every existing prefix
+/// must be a real directory, never a symlink.
+///
+/// NOTE: drive-root prefixes (`D:\`) have no parent metadata to check —
+/// `symlink_metadata` on a drive root fails on Windows; only the corpus
+/// root itself and everything below it are symlink-checked.
+fn reject_symlinks(path: &std::path::Path) -> Result<(), ManifestError> {
+    use std::path::Component;
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(ManifestError::Symlink(path.to_string_lossy().into_owned()));
+            }
+            Component::Normal(_) => {}
+        }
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ManifestError::Symlink(path.to_string_lossy().into_owned()));
+            }
+            Ok(_) => {}
+            // Missing components are fine (candidate file itself); the
+            // canonical check after join is authoritative.
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Checks `YYYY-MM-DD` as a real calendar date (month/day validated,
+/// leap years included); expiry compares lexicographically, which is
+/// order-correct for this shape.
 fn is_date(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[..4].iter().all(|b| b.is_ascii_digit())
-        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
-        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| bytes[range].iter().all(|b| b.is_ascii_digit());
+    if !digits(0..4) || !digits(5..7) || !digits(8..10) {
+        return false;
+    }
+    let month: u32 = text[5..7].parse().unwrap_or(0);
+    let day: u32 = text[8..10].parse().unwrap_or(0);
+    let year: i32 = text[0..4].parse().unwrap_or(0);
+    if !(1..=12).contains(&month) || day < 1 {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    day <= max_day
 }
 
 /// Loads and validates a manifest document.
@@ -538,13 +802,33 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
     if !is_hex(&source.commit, 20) {
         return Err(ManifestError::BadHex("source.commit".to_owned()));
     }
+    // Source identity: non-empty HTTPS WPT URL + non-empty license.
+    if source.repository.is_empty()
+        || source.license.is_empty()
+        || source.repository.len() > 512
+        || source.license.len() > 64
+    {
+        return Err(ManifestError::BadType("source".to_owned()));
+    }
+    if !source
+        .repository
+        .starts_with("https://github.com/web-platform-tests/wpt")
+    {
+        return Err(ManifestError::BadType("source.repository".to_owned()));
+    }
     let default_timeout_ms = root
         .need("default_timeout_ms")?
         .as_u64()
         .ok_or_else(|| ManifestError::BadType("default_timeout_ms".to_owned()))?;
-    if default_timeout_ms == 0 {
+    if default_timeout_ms == 0 || default_timeout_ms > MAX_TIMEOUT_MS {
         return Err(ManifestError::BadType("default_timeout_ms".to_owned()));
     }
+    let corpus_root = root
+        .need("corpus_root")?
+        .as_str()
+        .ok_or_else(|| ManifestError::BadType("corpus_root".to_owned()))?
+        .to_owned();
+    check_corpus_root(&corpus_root)?;
     let files_json = root
         .need("files")?
         .as_arr()
@@ -590,8 +874,24 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
         {
             return Err(ManifestError::BadType("files[] empty field".to_owned()));
         }
-        if path.contains('*') || upstream_path.contains('*') || capability.contains('*') {
+        // Strict logical path policy (F2): only `corpus/<name>.js`, no
+        // traversal, absolute form, drive prefix or control characters.
+        // The normalized relative part is unused here — resolution happens
+        // in `resolve_corpus_path` — but validation runs at load so bad
+        // manifests fail before any filesystem access.
+        check_logical_path(&path)?;
+        // Upstream provenance: non-empty `FileAPI/` path without wildcards.
+        if upstream_path.contains('*')
+            || !upstream_path.starts_with("FileAPI/")
+            || upstream_path.len() > MAX_PATH_LEN
+        {
             return Err(ManifestError::Wildcard(path.clone(), String::new()));
+        }
+        if capability.contains('*') || capability.len() > MAX_META_LEN {
+            return Err(ManifestError::Wildcard(path.clone(), String::new()));
+        }
+        if group.len() > MAX_PATH_LEN || !REQUIRED_GROUPS.contains(&group.as_str()) {
+            return Err(ManifestError::BadType("files[].group".to_owned()));
         }
         if seen_paths.insert(path.clone(), ()).is_some() {
             return Err(ManifestError::Duplicate(path.clone(), String::new()));
@@ -626,7 +926,11 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             if test.contains('*') || subtest.contains('*') {
                 return Err(ManifestError::Wildcard(test.clone(), subtest.clone()));
             }
-            if test.is_empty() || subtest.is_empty() {
+            if test.is_empty()
+                || subtest.is_empty()
+                || test.len() > MAX_NAME_LEN
+                || subtest.len() > MAX_NAME_LEN
+            {
                 return Err(ManifestError::BadType("subtests[].test".to_owned()));
             }
             if seen.insert((test.clone(), subtest.clone()), ()).is_some() {
@@ -643,7 +947,7 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
                     .ok_or_else(|| ManifestError::BadType("subtests[].timeout_ms".to_owned()))?,
                 None => default_timeout_ms,
             };
-            if timeout_ms == 0 {
+            if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
                 return Err(ManifestError::BadType("subtests[].timeout_ms".to_owned()));
             }
             let reason = sub_json
@@ -671,6 +975,18 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_owned();
+            // Every subtest carries the full expectation record: lengths
+            // are bounded; `reason` non-empty only has meaning for
+            // non-PASS (PASS rows keep it empty by convention, but the
+            // loader does not reject a stale reason on PASS — strict
+            // compares enum statuses, never the reason text).
+            for value in [&reason, &sub_capability, &owner, &review_by, &trace] {
+                if value.len() > MAX_META_LEN {
+                    return Err(ManifestError::BadType(
+                        "subtests[] meta too long".to_owned(),
+                    ));
+                }
+            }
             if expected != ExpectedStatus::Pass {
                 if reason.is_empty() {
                     return Err(ManifestError::MissingReason(
@@ -730,14 +1046,28 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
     if files.is_empty() {
         return Err(ManifestError::BadType("files".to_owned()));
     }
+    // Manifest completeness: all six mandatory groups are present.
+    {
+        let mut groups: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for file in &files {
+            groups.insert(file.group.as_str());
+        }
+        for required in REQUIRED_GROUPS {
+            if !groups.contains(required) {
+                return Err(ManifestError::BadType("files[] missing group".to_owned()));
+            }
+        }
+    }
     Ok(Manifest {
         source,
+        corpus_root,
         default_timeout_ms,
         files,
     })
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -746,16 +1076,74 @@ mod tests {
     }
 
     fn minimal_manifest(status: &str) -> String {
+        let sha = "e".repeat(64);
+        let file = |path: &str,
+                    upstream: &str,
+                    group: &str,
+                    test: &str,
+                    subtest: &str,
+                    st: &str| {
+            format!(
+                "{{\"path\": \"{path}\", \"upstream_path\": \"{upstream}\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"{group}\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"{test}\", \"subtest\": \"{subtest}\", \"status\": \"{st}\", \"reason\": \"needs Dom\", \"capability\": \"c\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M7-WPT-05\"}}]}}"
+            )
+        };
         format!(
-            r#"{{"schema_version": 1, "source": {{"repository": "https://github.com/web-platform-tests/wpt", "commit": "0968c868d8095217d18d86b34c7f21dccae58768", "license": "BSD-3-Clause"}}, "default_timeout_ms": 5000, "files": [{{"path": "corpus/a.js", "upstream_path": "FileAPI/blob/a.any.js", "upstream_blob_sha": "43c29ada4d5455410ab40c79c5982de2b973d2ba", "sha256": "{}", "group": "FileAPI/blob", "capability": "blob", "subtests": [{{"test": "t", "subtest": "s", "status": "{status}", "reason": "needs Dom", "capability": "c", "owner": "o", "review_by": "2099-01-01", "trace": "M7-WPT-05"}}]}}]}}"#,
-            "e".repeat(64)
+            "{{\"schema_version\": 1, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{}, {}, {}, {}, {}, {}]}}",
+            file(
+                "corpus/a.js",
+                "FileAPI/blob/a.any.js",
+                "FileAPI/blob",
+                "t",
+                "s",
+                status
+            ),
+            file(
+                "corpus/b.js",
+                "FileAPI/file/b.any.js",
+                "FileAPI/file",
+                "t2",
+                "s2",
+                "PASS"
+            ),
+            file(
+                "corpus/c.js",
+                "FileAPI/filelist-section/c.any.js",
+                "FileAPI/filelist-section",
+                "t3",
+                "s3",
+                "PASS"
+            ),
+            file(
+                "corpus/d.js",
+                "FileAPI/reading-data-section/d.any.js",
+                "FileAPI/reading-data-section",
+                "t4",
+                "s4",
+                "PASS"
+            ),
+            file(
+                "corpus/e.js",
+                "FileAPI/FileReader/e.any.js",
+                "FileAPI/FileReader",
+                "t5",
+                "s5",
+                "PASS"
+            ),
+            file(
+                "corpus/f.js",
+                "FileAPI/BlobURL/f.any.js",
+                "FileAPI/BlobURL",
+                "t6",
+                "s6",
+                "PASS"
+            ),
         )
     }
 
     #[test]
     fn accepts_pass_manifest() {
         let manifest = load_manifest(&minimal_manifest("PASS"), today()).expect("load");
-        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files.len(), 6);
         assert_eq!(manifest.files[0].subtests.len(), 1);
     }
 

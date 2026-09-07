@@ -1,18 +1,21 @@
-# M7 Handoff — WPT harness and hardening
+# M7 Handoff — WPT harness and hardening (rework F1–F11 applied)
 
 Branch: `task/m7`, base `bc742df200c1aa1bc8f9cee63b0c20c37737d64c`.
-Status: implementation complete, local validation green on Windows;
-external CI (Ubuntu + Windows) NOT RUN YET at handoff time.
+Status: rework complete per `docs/reviews/M7-rework.md` (base `b50c60e`);
+local validation green on Windows; external CI (Ubuntu + Windows)
+AWAITING OWNER VERIFICATION — no CI run is claimed here.
 
 ## Implemented
 
 - Harness (`boa_fapi_wpt`, zero new deps): `manifest.rs` (strict
-  schema-1 loader + self-contained JSON parser), `harness.rs`
-  (testharness prelude), `runner.rs` (per-file fresh `Context`, bounded
+  schema-1 loader + self-contained JSON parser + `corpus_root`/path
+  policy), `harness.rs` (testharness prelude with `record_once`/
+  `run_step`), `runner.rs` (per-file fresh `Context`, bounded
   `run_jobs()` pump, PASS/FAIL/TIMEOUT/NOTRUN), `report.rs`
-  (deterministic JSON/JUnit + strict gate), `main.rs` (CLI
-  `--manifest/--strict/--threads/--filter/--json/--junit/--timeout-ms`,
-  SHA-256 verification, 8 MiB worker thread for Boa recursion).
+  (deterministic JSON/JUnit + enum-compared strict gate), `main.rs`
+  (CLI `--manifest/--strict/--threads/--filter/--json/--junit/--timeout-ms`,
+  SHA-256 verification, isolated `--worker-file` child processes with
+  wall kill, 8 MiB thread for Boa recursion).
 - Corpus: 7 adapted files in `crates/boa_fapi_wpt/corpus/*.js` +
   `wpt-manifest.json` (pinned `0968c868…`, 38 subtests, all PASS;
   upstream blob SHAs recorded; file SHA-256 verified pre-run).
@@ -32,10 +35,12 @@ external CI (Ubuntu + Windows) NOT RUN YET at handoff time.
 
 None normative. Deliberate scoped choices (all documented): adapted
 subset instead of full upstream pass (browser capabilities out of
-scope — exact gaps, never wildcard PASS); `expect_used` re-allowed
-crate-wide in `boa_fapi_wpt` (unit-test fixtures only — pinned by a
-comment, no production use); `main.rs` worker thread for Boa stack
-depth (platform parity, not semantics).
+scope — exact gaps, never wildcard PASS); `--worker-file` internal
+worker protocol (validated file index only, no shell/command string);
+`run_file` kept as the library mapping while strict CLI uses the
+isolated path (both documented in `docs/wpt.md`); per-test-module
+`allow(clippy::expect_used)` in harness unit tests only (no production
+use — workspace clippy green without blanket allow).
 
 ## ADR
 
@@ -46,17 +51,25 @@ ADR-0033 (zero new production dependencies for the harness) — see
 
 ```powershell
 cargo fmt --all -- --check
+cargo check --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo test --package boa_fapi_wpt -- --nocapture
 cargo test --package boa_fapi --test appendix_a_acceptance -- --nocapture
 cargo test --package boa_fapi --test abort_races -- --nocapture
+cargo test --package boa_fapi --test abort_races_fs -- --nocapture
+cargo test --package boa_fapi --test hardening_hooks -- --nocapture
 cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict
-$env:RUSTDOCFLAGS='-Dwarnings'; cargo doc --workspace --no-deps
-cargo llvm-cov --workspace --all-features --fail-under-lines 80
-cargo deny check
-cargo hack check --feature-powerset --depth 2
+cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --threads 2
+cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --filter corpus/blob
+cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --filter corpus/blob
+cargo doc --workspace --no-deps
 git diff --check
 ```
+
+Expected boundary results: full strict exit 0 (38 passed, 0 notrun,
+0 unexpected); threads 2 exit 0 with SHA-256-identical JSON to
+threads 1; non-strict filter exit 0 with the subset report; strict +
+filter exit 2 (`--filter cannot be combined with --strict`).
 
 `cargo test --workspace --no-default-features` stays NOT RUN by the
 accepted M6 design; powerset coverage is `cargo hack`.
@@ -64,5 +77,6 @@ accepted M6 design; powerset coverage is `cargo hack`.
 ## Exact commit / CI links
 
 - Implementation commit: _to be filled after commit_.
-- CI run: _to be filled after push_ (Ubuntu + Windows, M7 sequence).
+- CI: AWAITING OWNER VERIFICATION — no run URL/SHA is claimed here
+  (CI must run on the final implementation commit on Ubuntu and Windows).
 - After handoff: next stage NOT started.

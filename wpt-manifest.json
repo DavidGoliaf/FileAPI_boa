@@ -6,6 +6,7 @@
     "license": "BSD-3-Clause"
   },
   "default_timeout_ms": 5000,
+  "corpus_root": "crates/boa_fapi_wpt/corpus",
   "files": [
     {
       "path": "corpus/blob-constructor.js",
