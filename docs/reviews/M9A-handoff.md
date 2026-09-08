@@ -63,8 +63,11 @@ warnings (license fields/duplicate transitive crates), при этом его ch
 комбинациях. Follow-up P0 diff реализации: 2 файла, 9 insertions(+), 18
 deletions; лимит 3000 строк не превышен.
 
-CI evidence для follow-up P0 будет добавлено после завершения нового
-workflow run для коммита `edb8bb2`.
+CI evidence получено для follow-up P0-коммита `431a355`:
+[run 34268593654](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34268593654)
+завершился `success`; Windows, Ubuntu и macOS jobs — все `success`. В CI
+прошли workspace tests, WPT strict runs, coverage, cargo-hack, cargo-deny,
+package, docs и diff check.
 
 ## Targeted-search classification
 
