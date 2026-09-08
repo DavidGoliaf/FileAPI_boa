@@ -997,6 +997,7 @@ fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;foo="a;b";charset=windows-1252' }), 'unknown-label') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;foo;charset=windows-1252' }), 'unknown-label') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;foo="x"junk;charset=windows-1252' }), 'unknown-label') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset="windows-1252' }), 'unknown-label') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes]), '\t windows-1252 \r\n') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset=utf-8' }), '\u00A0windows-1252\u00A0') !== '\uFFFD') return false;
             globalThis.m9aMimeAsync = { events: [], result: null, error: null };
@@ -1006,7 +1007,7 @@ fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
             reader.onload = function () { m9aMimeAsync.events.push('load'); m9aMimeAsync.result = this.result; };
             reader.onerror = function () { m9aMimeAsync.events.push('error'); m9aMimeAsync.error = this.error; };
             reader.onloadend = function () { m9aMimeAsync.events.push('loadend'); };
-            reader.readAsText(new Blob([bytes], { type: 'text/plain;charset="windows-1252"' }), 'unknown-label');
+            reader.readAsText(new Blob([bytes], { type: 'text/plain;charset="windows-1252' }), 'unknown-label');
             return true;
         })()
         "#,

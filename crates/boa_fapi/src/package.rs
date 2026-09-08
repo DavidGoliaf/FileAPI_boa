@@ -276,41 +276,31 @@ pub(crate) fn mime_charset(media_type: &str) -> Option<String> {
         }
 
         let mut value = String::new();
-        let mut value_valid = true;
         if input[position] == '"' {
             position += 1;
-            let mut closed = false;
             while position < end {
                 match input[position] {
                     '"' => {
                         position += 1;
-                        closed = true;
                         break;
                     }
                     '\\' => {
                         position += 1;
                         if position == end {
-                            value_valid = false;
+                            value.push('\\');
                             break;
                         }
                         value.push(input[position]);
                         position += 1;
                     }
-                    value_char if is_http_quoted_string_char(value_char) => {
+                    value_char => {
+                        // Fetch's HTTP quoted-string collector appends every
+                        // non-quote/non-backslash code point, including ';',
+                        // and lets EOF terminate the collection naturally.
                         value.push(value_char);
                         position += 1;
                     }
-                    _ => {
-                        value_valid = false;
-                        while position < end && input[position] != ';' {
-                            position += 1;
-                        }
-                        break;
-                    }
                 }
-            }
-            if !closed {
-                continue;
             }
             // WHATWG ignores text between the closing quote and the next
             // semicolon, e.g. `charset="windows-1252"junk`.
@@ -334,7 +324,6 @@ pub(crate) fn mime_charset(media_type: &str) -> Option<String> {
 
         let name_valid = !name.is_empty()
             && name.iter().copied().all(is_mime_token_char)
-            && value_valid
             && value.chars().all(is_http_quoted_string_char);
         let is_charset = name
             .iter()
@@ -479,13 +468,14 @@ mod tests {
     }
 
     #[test]
-    fn mime_parser_skips_malformed_parameters_and_preserves_later_charset() {
+    fn mime_parser_skips_malformed_parameters_and_accepts_eof_quote() {
         let expected = Some(String::from("windows-1252"));
         assert_eq!(mime_charset("text/plain;charset =windows-1252"), None);
         assert_eq!(
             mime_charset("text/plain;foo=\"a;b\";charset=windows-1252"),
             expected
         );
+        assert_eq!(mime_charset("text/plain;charset=\"windows-1252"), expected);
         assert_eq!(
             mime_charset("text/plain;foo;charset=windows-1252"),
             expected
