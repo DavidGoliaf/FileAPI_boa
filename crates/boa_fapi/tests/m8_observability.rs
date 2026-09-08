@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use boa_engine::{Context, Source, js_string};
-use boa_fapi::{FileApiEnvironment, FileApiExtension, UrlEntropySource};
+use boa_fapi::{
+    CloneAdapter, CloneBridgeDescriptor, FileApiEnvironment, FileApiExtension, UrlEntropySource,
+};
+use boa_fapi_core::clone::{CLONE_ENCODING_VERSION, CloneError, FileApiClonePayload};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
@@ -255,6 +258,40 @@ fn setup_worker() -> (Context, boa_fapi::FileApiHandle) {
     (context, handle)
 }
 
+#[derive(Debug)]
+struct TestBridge;
+
+impl CloneAdapter for TestBridge {
+    fn descriptor(&self) -> CloneBridgeDescriptor {
+        CloneBridgeDescriptor {
+            name: String::from("m8-test-bridge"),
+            version: CLONE_ENCODING_VERSION,
+        }
+    }
+
+    fn encode(&self, payload: &FileApiClonePayload) -> Result<Vec<u8>, CloneError> {
+        payload.encode()
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<FileApiClonePayload, CloneError> {
+        FileApiClonePayload::decode(bytes)
+    }
+}
+
+fn setup_with_bridge() -> (Context, boa_fapi::FileApiHandle) {
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock {
+            millis: 1_700_000_000_000,
+        }))
+        .entropy(Arc::new(CounterEntropy::default()))
+        .clone_adapter(Arc::new(TestBridge))
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
+    (context, handle)
+}
+
 fn run_jobs(context: &mut Context) {
     context.run_jobs().expect("run_jobs");
     context.run_jobs().expect("run_jobs");
@@ -445,6 +482,25 @@ fn tracing_emits_only_allowlisted_fields() {
         let _ = clone_handle
             .blob_from_clone(&payload, &mut clone_context)
             .expect("decode");
+
+        // Bridge encode/decode must report logical payload size, not wire size.
+        let (mut bridge_context, bridge_handle) = setup_with_bridge();
+        let bridge_blob = bridge_handle
+            .blob_from_bytes(
+                bytes::Bytes::from_static(b"bridge-bytes"),
+                "text/plain",
+                &mut bridge_context,
+            )
+            .expect("bridge blob");
+        let bridge_payload = bridge_handle
+            .clone_blob(&bridge_blob)
+            .expect("bridge payload");
+        let bridge_bytes = bridge_handle
+            .clone_encode_via_bridge(&bridge_payload)
+            .expect("bridge encode");
+        let _ = bridge_handle
+            .clone_decode_via_bridge(&bridge_bytes)
+            .expect("bridge decode");
     });
     let events = snapshot_events(&events);
     assert_allowlisted(&events);
@@ -468,6 +524,20 @@ fn tracing_emits_only_allowlisted_fields() {
             "missing operation {required}: {ops:?}"
         );
     }
+    let url_create = events
+        .iter()
+        .find(|event| event.fields.get("operation") == Some(&String::from("blob_url_create")))
+        .expect("blob_url_create event");
+    assert_eq!(url_create.fields.get("size"), Some(&String::from("9")));
+    let bridge_encode = events
+        .iter()
+        .filter(|event| event.fields.get("operation") == Some(&String::from("clone_encode")))
+        .find(|event| event.fields.get("size") == Some(&String::from("12")))
+        .expect("clone_encode must report the 12-byte logical payload");
+    assert_eq!(
+        bridge_encode.fields.get("result_class"),
+        Some(&String::from("ok"))
+    );
 }
 
 // ── 2. terminal result classes ──
@@ -616,6 +686,7 @@ fn tracing_emits_terminal_result_classes() {
             .expect("host blob");
         shut_handle.shutdown(&mut shut_context).expect("shutdown");
         let _ = shut_handle.clone_blob(&live);
+        let _ = shut_handle.create_blob_url(&live);
         let _ = shut_context;
     });
     let events = snapshot_events(&events);
@@ -630,6 +701,10 @@ fn tracing_emits_terminal_result_classes() {
             "missing result_class {required}: {classes:?}"
         );
     }
+    assert!(events.iter().any(|event| {
+        event.fields.get("operation") == Some(&String::from("blob_url_create"))
+            && event.fields.get("result_class") == Some(&String::from("shutdown"))
+    }));
     // not_found (foreign URL) is platform-independent; snapshot/invalid are
     // Unix-live (Windows yields permission at import instead — also allowed).
     assert!(

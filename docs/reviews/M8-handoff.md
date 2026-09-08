@@ -1,7 +1,7 @@
 # M8 Handoff — release closure and observability (tracing default-off)
 
 Branch: `task/m8`, base `92192927d8bf9d6ebf3ed4e6ca60c9966e3c4dff` (M7 baseline).
-Status: REWORK REQUIRED — wasm blocker Q4 open (see below). Handoff is evidence, not acceptance.
+Status: AWAITING CI — local M8 gates are green; external platform CI has not yet been run on the final commit. Handoff is evidence, not acceptance.
 Implementation commit: PENDING (recorded here at commit time).
 
 ## Implemented
@@ -29,7 +29,7 @@ Implementation commit: PENDING (recorded here at commit time).
   `docs/spec-matrix.md` (M8-REL-01..05, M8-SEC-01, M8-RACE-01),
   `CHANGELOG.md` (M8 entry, no new JS API), `docs/DECISIONS.md`
   (ADR-0034 tracing dep), `docs/m8-validation.md`,
-  `QUESTIONS.md` Q4 wasm blocker.
+  `QUESTIONS.md` Q4 wasm resolution and ADR-0035 target configuration.
 - Historical M1–M7 audit/handoff/rework docs untouched.
 
 ## Deviations
@@ -42,13 +42,13 @@ Implementation commit: PENDING (recorded here at commit time).
 
 ## Blocker
 
-- Q4 (wasm): `cargo check --target wasm32-unknown-unknown --package
-  boa_fapi --no-default-features --lib` fails on the pre-existing
-  transitive `getrandom v0.4.3` via `boa_engine` (no wasm32 backend
-  without `wasm_js`). `boa_fapi_core` wasm check passes. Recorded in
-  `QUESTIONS.md` Q4 with command, output, and acceptance impact. No
-  workaround applied (§2.8). DoD wasm item NOT met; external CI cannot
-  turn it green without an owner decision.
+- Q4 (wasm): both required wasm checks pass. The existing Boa `js` and
+  `getrandom/wasm_js` backends are enabled only for the wasm target, with the
+  required `getrandom_backend="wasm_js"` cfg recorded in ADR-0035.
+- Package verification: `cargo package --workspace --all-features` verifies
+  all four crates. `.cargo/config.toml` supplies temporary-registry patches
+  for unpublished workspace packages; normal workspace path edges are
+  unchanged, and `--no-verify` is not used.
 
 ## Demo commands (exit codes on Windows, this tree)
 
@@ -62,10 +62,10 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict # 0 (3
 cargo llvm-cov --package boa_fapi_core --all-features --fail-under-lines 85 # 0 (89.94% lines)
 cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 80 # 0 (87.20% lines)
 cargo check --target wasm32-unknown-unknown --package boa_fapi_core # 0
-cargo check --target wasm32-unknown-unknown --package boa_fapi --no-default-features --lib # FAIL (Q4 blocker)
+cargo check --target wasm32-unknown-unknown --package boa_fapi --no-default-features --lib # 0
 cargo hack check --feature-powerset --depth 2 # 0 (27 checks)
 cargo deny check # 0 (pre-existing duplicate-version warnings only)
-cargo package --workspace --all-features # 0 (to target/, not committed)
+cargo package --workspace --all-features # 0 (all four crates verified)
 $env:RUSTDOCFLAGS='-Dwarnings'; cargo doc --workspace --no-deps # 0
 git diff --check # 0
 ```
@@ -74,7 +74,7 @@ Coverage totals: core 89.94% lines (gate 85), boa_fapi 87.20% (gate 80),
 workspace 81.08% (gate 80).
 External CI run URLs (Ubuntu/macOS/Windows): AWAITING CI — no run claimed here.
 Changed files: `.github/workflows/ci.yml`, `CHANGELOG.md`, `Cargo.lock`,
-`Cargo.toml`, `QUESTIONS.md`, `README.md`, `LICENSE-MIT`,
+`Cargo.toml`, `QUESTIONS.md`, `README.md`, `LICENSE-MIT`, `.cargo/config.toml`,
 `crates/boa_fapi/Cargo.toml`, four crate READMEs, `src/observability.rs`,
 `src/{extension,promise_read,streams,filereader,filereader_sync,lib}.rs`,
 `tests/{m8_observability,m8_feature_off}.rs`, `docs/{DECISIONS,architecture,

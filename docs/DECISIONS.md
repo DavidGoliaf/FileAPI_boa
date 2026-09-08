@@ -747,3 +747,23 @@ tokio-ecosystem стандарт де-факто для structured events (ак�
 фичи); `cargo-deny` чист (только pre-existing duplicate-version
 warnings); telemetry-слой — внутренний instrumentation без публичных
 адаптеров и без вызовов JS.
+
+## ADR-0035 (M8): wasm backend для уже существующей Boa entropy-зависимости
+
+Контекст: обязательный memory-only gate M8 собирает `boa_fapi` на
+`wasm32-unknown-unknown` с отключёнными File API features. `boa_engine` и
+`boa_fapi` используют уже существующие `getrandom` 0.4 и 0.3; без web
+backend upstream crates намеренно завершаются `compile_error!`. Добавлять
+новый runtime, JS API или новый crate для этого gate нельзя.
+
+Решение: для wasm target включать существующую feature `boa_engine::js`,
+которая подключает его штатный `getrandom/wasm_js` backend, и
+`getrandom/wasm_js` для прямой зависимости `boa_fapi`. В корневом
+`.cargo/config.toml` зафиксировать требуемый для `getrandom` 0.3 cfg
+`getrandom_backend="wasm_js"`. На native targets dependency features и
+rustflags не меняются; новых зависимостей и public API нет.
+
+Последствия: оба обязательных wasm `cargo check` проходят воспроизводимо,
+а web entropy implementation остаётся штатной реализацией upstream. Runtime
+использование File API на wasm по-прежнему не расширяется: M8 проверяет
+только memory-only compilation gate.

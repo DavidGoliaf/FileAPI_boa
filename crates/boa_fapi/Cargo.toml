@@ -3,7 +3,7 @@ name = "boa_fapi"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Boa File API bindings (Blob, File, FileList)"
 
 [lints]
@@ -32,3 +32,7 @@ tracing = ["dep:tracing"]
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[target.'cfg(all(target_family = "wasm", not(any(target_os = "emscripten", target_os = "wasi"))))'.dependencies]
+boa_engine = { workspace = true, features = ["js"] }
+getrandom = { workspace = true, features = ["wasm_js"] }

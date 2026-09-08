@@ -11,6 +11,7 @@ members = [
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT"
+license-file = "LICENSE-MIT"
 repository = "https://github.com/DavidGoliaf/FileAPI_boa"
 
 [workspace.lints.rust]

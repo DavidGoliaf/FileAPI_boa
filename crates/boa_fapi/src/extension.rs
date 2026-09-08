@@ -824,7 +824,7 @@ pub(crate) fn create_url_for_specs(
         };
         crate::observability::emit(
             "blob_url_create",
-            0,
+            data.size(),
             crate::observability::elapsed_ms(trace_start),
             0,
             class,
@@ -1289,7 +1289,24 @@ impl FileApiHandle {
     /// never overwrite. After `shutdown` the call fails before touching
     /// any state.
     pub fn create_blob_url(&self, object: &JsObject) -> JsResult<String> {
-        self.reject_if_shutdown()?;
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        if self.is_shutdown() {
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "blob_url_create",
+                0,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                "shutdown",
+                trace_env,
+            );
+            return Err(crate::error::type_error(
+                "the File API runtime is shut down",
+            ));
+        }
         let data = brand::require_blob(&boa_engine::JsValue::from(object.clone()))
             .map_err(|_| crate::error::type_error("URL.createObjectURL requires a Blob"))?;
         create_url_for_specs(&self.specs, &data).map_err(|error| match error {
@@ -1395,7 +1412,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(FileApiClonePayload::Blob(blob)) => {
-                    let size = blob.bytes.len() as u64;
+                    let size = clone_payload_size(&FileApiClonePayload::Blob(blob.clone()));
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1451,7 +1468,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(FileApiClonePayload::File(file)) => {
-                    let size = file.bytes.len() as u64;
+                    let size = clone_payload_size(&FileApiClonePayload::File(file.clone()));
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1539,7 +1556,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(FileApiClonePayload::FileList(files)) => {
-                    let size: u64 = files.iter().map(|f| f.bytes.len() as u64).sum();
+                    let size = clone_payload_size(&FileApiClonePayload::FileList(files.clone()));
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1599,10 +1616,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(_) => {
-                    let size = match payload {
-                        FileApiClonePayload::Blob(blob) => blob.bytes.len() as u64,
-                        _ => 0,
-                    };
+                    let size = clone_payload_size(payload);
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1663,10 +1677,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(_) => {
-                    let size = match payload {
-                        FileApiClonePayload::File(file) => file.bytes.len() as u64,
-                        _ => 0,
-                    };
+                    let size = clone_payload_size(payload);
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1739,12 +1750,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(_) => {
-                    let size: u64 = match payload {
-                        FileApiClonePayload::FileList(files) => {
-                            files.iter().map(|f| f.bytes.len() as u64).sum()
-                        }
-                        _ => 0,
-                    };
+                    let size = clone_payload_size(payload);
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1798,8 +1804,8 @@ impl FileApiHandle {
         #[cfg(feature = "tracing")]
         {
             let (size, chunks, class) = match &outcome {
-                Ok(bytes) => {
-                    let size = bytes.len() as u64;
+                Ok(_) => {
+                    let size = clone_payload_size(payload);
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1850,13 +1856,7 @@ impl FileApiHandle {
         {
             let (size, chunks, class) = match &outcome {
                 Ok(payload) => {
-                    let size: u64 = match payload {
-                        FileApiClonePayload::Blob(blob) => blob.bytes.len() as u64,
-                        FileApiClonePayload::File(file) => file.bytes.len() as u64,
-                        FileApiClonePayload::FileList(files) => {
-                            files.iter().map(|f| f.bytes.len() as u64).sum()
-                        }
-                    };
+                    let size = clone_payload_size(payload);
                     (
                         size,
                         if size == 0 { 0 } else { 1 },
@@ -1918,6 +1918,17 @@ fn clone_error_from_core(error: boa_fapi_core::file_api_error::FileApiError) -> 
         | FileApiError::InvalidRange
         | FileApiError::Internal => CloneError::SourceFailed,
         _ => CloneError::SourceFailed,
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn clone_payload_size(payload: &FileApiClonePayload) -> u64 {
+    match payload {
+        FileApiClonePayload::Blob(blob) => blob.bytes.len() as u64,
+        FileApiClonePayload::File(file) => file.bytes.len() as u64,
+        FileApiClonePayload::FileList(files) => files.iter().fold(0_u64, |total, file| {
+            total.saturating_add(file.bytes.len() as u64)
+        }),
     }
 }
 

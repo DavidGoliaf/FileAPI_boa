@@ -1,0 +1,10 @@
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
+
+# Keep unpublished workspace path dependencies resolvable during Cargo's
+# package verification. Normal workspace path edges remain unchanged; this
+# patch is consumed only when packaged manifests rewrite them to crates.io.
+[patch.crates-io]
+boa_fapi_core = { path = "crates/boa_fapi_core" }
+boa_fapi_fs = { path = "crates/boa_fapi_fs" }
+boa_fapi = { path = "crates/boa_fapi" }

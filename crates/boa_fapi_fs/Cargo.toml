@@ -3,7 +3,7 @@ name = "boa_fapi_fs"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Capability-based filesystem-backed ByteSource with snapshot validation (M5)"
 
 [lints]

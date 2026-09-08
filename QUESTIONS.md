@@ -39,20 +39,14 @@ toolchain.
 
 ## Q4 (M8): wasm memory-only `cargo check` для `boa_fapi --no-default-features --lib`
 
-**Blocker (записан по правилу §2.8, работа остановлена для этого пункта acceptance).**
+**Решено в M8.** Для `wasm32-unknown-unknown` включены штатная feature
+`boa_engine::js`, `getrandom/wasm_js` для прямой зависимости `boa_fapi` и
+cfg `getrandom_backend="wasm_js"` в `.cargo/config.toml`. Native targets
+этим изменением не затрагиваются; новых dependencies и public API нет.
 
-- Команда: `cargo check --target wasm32-unknown-unknown --package boa_fapi --no-default-features --lib`
-- Полный вывод (сокращён до причины): `getrandom v0.4.3` (транзитивная
-  зависимость `boa_engine v0.22` → `rand v0.10.2` / `tempfile`) не
-  поддерживает `wasm32-unknown-unknown` без фичи `wasm_js`:
-  `backends.rs:176 compile_error!("The wasm32/64-unknown-unknown are not
-  supported by default; ...")` + `E0425 fill_inner/inner_u32/inner_u64 not
-  found in backends`.
-- Влияние на acceptance: пункт DoD «оба wasm `cargo check` проходят» не
-  выполнен на чистом `task/m8`; `cargo check --target
-  wasm32-unknown-unknown --package boa_fapi_core` зелёный (чистый
-  memory-only путь без `getrandom`/`boa_engine`).
-- Обхода нет: добавлять `wasm_js`-фичу/`getrandom`-fallback, менять Boa-
-  зависимости или ослаблять gate запрещено (§2.3–§2.4). Требуется решение
-  владельца: либо зафиксированный upstream-фикс Boa 0.22, либо смена
-  трактовки wasm-gate для `boa_fapi` в заказе.
+- Команда: `cargo check --target wasm32-unknown-unknown --package boa_fapi
+  --no-default-features --lib`
+- Результат после исправления: exit 0; остаются только pre-existing
+  dead-code warnings для отключённых host-only helpers.
+- `cargo check --target wasm32-unknown-unknown --package boa_fapi_core` также
+  проходит.

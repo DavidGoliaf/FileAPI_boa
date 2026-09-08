@@ -39,6 +39,9 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --workspace --all-features
 
+      - name: cargo test (M8 tracing feature-off guard)
+        run: cargo test --package boa_fapi --test m8_feature_off -- --nocapture
+
       - name: cargo test (M2 JS integration)
         run: cargo test --package boa_fapi --test m2_blob_file_filelist -- --nocapture
 
