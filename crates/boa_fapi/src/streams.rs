@@ -514,7 +514,16 @@ fn pump_one(
     resolvers: &ResolvingFunctions,
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    // FIFO accounting: this job consumes exactly its own slot.
+    // Shutdown: settle nothing further against a destroyed context. Pending
+    // reads already hold their resolvers, but resolving them would deliver
+    // callbacks after shutdown, so late completions are dropped silently.
+    #[cfg(feature = "fs")]
+    if crate::extension::snapshot(context)
+        .map(|specs| specs.shutdown.is_shutdown())
+        .unwrap_or(false)
+    {
+        return Ok(JsValue::undefined());
+    }
     {
         let mut state = shared.borrow_mut();
         state.pending = state.pending.saturating_sub(1);

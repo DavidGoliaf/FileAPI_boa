@@ -10,7 +10,7 @@ env:
 
 jobs:
   m3-validation:
-    name: M4-B validation (${{ matrix.os }})
+    name: M5 validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M4-B §9, in order.
+      # Work order M5 §9, in order.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -53,6 +53,12 @@ jobs:
 
       - name: cargo test (M4-B FileReaderSync)
         run: cargo test --package boa_fapi --test m4_filereader_sync -- --nocapture
+
+      - name: cargo test (boa_fapi_fs)
+        run: cargo test --package boa_fapi_fs --all-features -- --nocapture
+
+      - name: cargo test (M5 filesystem File)
+        run: cargo test --package boa_fapi --test m5_file_fs -- --nocapture
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps

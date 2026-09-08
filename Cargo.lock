@@ -147,6 +147,7 @@ dependencies = [
  "base64",
  "boa_engine",
  "boa_fapi_core",
+ "boa_fapi_fs",
  "boa_gc",
  "bytes",
  "encoding_rs",
@@ -166,6 +167,11 @@ dependencies = [
 [[package]]
 name = "boa_fapi_fs"
 version = "0.1.0"
+dependencies = [
+ "boa_fapi_core",
+ "bytes",
+ "thiserror",
+]
 
 [[package]]
 name = "boa_fapi_wpt"

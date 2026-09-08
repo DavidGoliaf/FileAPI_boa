@@ -13,6 +13,7 @@
 //! - [`error`] — Resource limit kind enum.
 //! - [`limits`] — Configurable resource limits.
 //! - [`mime`] — MIME type normalization.
+//! - [`policy`] — Filesystem capability/policy boundary (Boa-free).
 //! - [`snapshot`] — Snapshot state enum.
 //! - [`source`] — Byte source abstraction and memory implementation.
 
@@ -28,5 +29,6 @@ pub mod error;
 pub mod file_api_error;
 pub mod limits;
 pub mod mime;
+pub mod policy;
 pub mod snapshot;
 pub mod source;

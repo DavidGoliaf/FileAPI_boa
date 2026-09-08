@@ -47,8 +47,8 @@ Native data owns `Arc<BlobData>` plus immutable Rust strings/numbers only;
 it contains no `JsObject`/`JsValue`/`Context` and is GC-safe through the
 `boa_gc` derive with `#[unsafe_ignore_trace]` on non-GC fields.
 
-Not implemented (M4-B+): FileReaderSync, workers, filesystem-backed
-sources, blob URLs, structured clone, full DOM/HTML, WPT harness.
+Not implemented (M6+): blob URLs, structured clone, full DOM/HTML,
+full WHATWG Streams beyond the shim, workers runtime, WPT harness.
 
 ### Layer 2b: `boa_fapi` promise reads (M3-A)
 `promise_read.rs` owns the single conversion/packaging/scheduling path for
@@ -141,12 +141,54 @@ packaging shared with the async reader:
   filesystem-backed sources, snapshot validation, blob URLs, structured
   clone, full DOM/Workers runtime, WPT harness, M5.
 
-### Layer 3: Host adapters (future M5+)
+### Layer 3: Host adapters (M5 filesystem)
 
-Platform-specific implementations:
-- `boa_fapi_fs` — filesystem-backed `ByteSource` with snapshot checking
-- `boa_fapi_wpt` — WPT test harness
-- Future: DOM adapter, Streams adapter, URL store
+`boa_fapi_fs` owns the capability-based filesystem source; `boa_fapi`
+(`fs` feature, default on) owns the host import and the lifecycle:
+
+- `boa_fapi_core::policy` — Boa-free boundary: `HostResourceId`,
+  `FileOpenRequest`, `FileGrant`, `FileResource`, `FileResourceOpener`,
+  `FileAccessPolicy`, `DenyAllPolicy`. No location/handle/secret in any
+  type, method, or error.
+- `boa_fapi_core::snapshot` — `FileSnapshot { identity, size, mtime }`
+  plus `SnapshotState::Memory | Filesystem(FileSnapshot)`; `BlobData`
+  derives its blob-level snapshot from its segments (first filesystem
+  snapshot wins; the per-source check is the security boundary).
+- `boa_fapi_fs::FsRegistry` — owns already-open read-only handles by
+  opaque id; captures the import snapshot with safe `Metadata` APIs;
+  the `Mutex` guards only the slot map and is never held across I/O
+  (handles are cloned via `try_clone` under a short lock; metadata and
+  positional reads run on the clone after the lock drops). `close`
+  removes the slot (handle drops immediately), `close_all` drops every
+  slot, `on_shutdown`/`run_closers` fire one-shot closers outside the
+  lock.
+- `boa_fapi_fs::FileSource` / `HostFileSource` — `ByteSource` over a
+  registered slot, Unix-only (`PermissionDenied` elsewhere): cancel →
+  checked arithmetic → live-vs-import snapshot → policy hook →
+  positional read → exact-length check → post-read confirm;
+  `open_copy_on_import` (every platform; closes the consumed registration
+  on success, limit refusal, allocation failure, and read error — one
+  copy per registration) is the enforced fallback for weak platforms and
+  untrusted JS.
+- `boa_fapi_fs::policy` — `DenyRawPathPolicy` (default deny),
+  `RegistryPolicy` (live-slot approval + per-read revalidation; refuses
+  `authorize_open` off-Unix), `RootConfinedPolicy` (open-handle identity
+  only, never string prefix).
+- `boa_fapi::FileApiHandle::file_from_resource(registry, Arc<dyn
+  FileResource>, display_name, options, context)` — validates live==
+  import plus the weak-platform gate before any JS object, preflights
+  `max_blob_size`, tracks the registry for shutdown `close_all`, wraps in
+  `ArcResourceSource` (shutdown-aware, per-read snapshot checks),
+  attaches only the display name (`/` → `:`, no basename). Signature
+  adaptation (`registry` + `Arc` vs target `&dyn`) recorded in ADR-0024.
+- `boa_fapi::lifecycle` — `ShutdownFlag` (closed bit + cancellation +
+  tracked closers) in `RegisteredSpecs`/handle/every fs import;
+  `FileApiHandle::shutdown` runs all closers exactly once (`close_all`
+  per tracked registry → OS handles drop **at shutdown**), cancels
+  pending work, and makes late jobs settle nothing. Blob URL store and
+  structured-clone lifetime stay M6 extension points.
+- No JS path API exists: no raw-path import, no directory enumeration,
+  no location/identity in JS errors, tracing, blob URLs, or artifacts.
 
 ## ByteSource as boundary
 
@@ -163,7 +205,7 @@ Future filesystem implementations will check snapshot stability on each read and
 boa_fapi_core (no external runtime deps beyond bytes/thiserror)
     └── bytes, thiserror
 
-boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror + encoding_rs + base64
-boa_fapi_fs (future) → boa_fapi_core + std::fs
+boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror + encoding_rs + base64 (+ boa_fapi_fs with `fs`)
+boa_fapi_fs → boa_fapi_core + bytes + thiserror + std::fs
 boa_fapi_wpt (future) → boa_fapi_core + test harness
 ```

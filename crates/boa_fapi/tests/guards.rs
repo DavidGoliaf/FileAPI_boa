@@ -193,6 +193,7 @@ fn internal_binding_modules_expose_no_public_items() {
         "dom.rs",
         "filereader.rs",
         "filereader_sync.rs",
+        "lifecycle.rs",
         "package.rs",
         "webidl.rs",
     ] {
@@ -299,10 +300,12 @@ fn filereader_and_dom_surface_is_bounded() {
     // `DOMException`, `FileReader` globals; EventTarget's 3 methods;
     // Event's 7 attributes + 2 methods; ProgressEvent's 3 attributes;
     // DOMException's `name`/`message`; FileReader's 5 methods, 3 readonly
-    // attributes, 6 handlers, 3 constants. No FileReaderSync, workers, fs,
+    // attributes, 6 handlers, 3 constants. No FileReaderSync, workers,
     // URL/clone/WPT, full DOM (tree dispatch, capture/bubble, CustomEvent,
     // AbortSignal) or full Streams surface may appear in `dom.rs` or
-    // `filereader.rs`.
+    // `filereader.rs`. M5 lifecycle shutdown is the only exception: the
+    // `fs`-gated `shutdown`/`ShutdownFlag` checks in `filereader.rs` are
+    // allowed and asserted by the dedicated M5 shutdown tests.
     for module in ["dom.rs", "filereader.rs"] {
         let content = read(&workspace_root().join(format!("crates/boa_fapi/src/{module}")));
         // Every production mention of an excluded API must be absent; only
@@ -318,7 +321,6 @@ fn filereader_and_dom_surface_is_bounded() {
             "CustomEvent",
             "AbortSignal",
             "capturePhase",
-            "\"fs\"",
             "std::fs",
             "std::path",
             "BlobData::materialize",
@@ -327,6 +329,11 @@ fn filereader_and_dom_surface_is_bounded() {
             for line in content.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("//") {
+                    continue;
+                }
+                if module == "filereader.rs"
+                    && (trimmed.contains("shutdown") || trimmed.contains("ShutdownFlag"))
+                {
                     continue;
                 }
                 if trimmed.contains(forbidden) {
@@ -511,6 +518,9 @@ fn no_out_of_scope_surface() {
         }
     }
     // Out-of-scope APIs are absent everywhere, including the new modules.
+    // (`boa_fapi_fs` owns filesystem I/O behind the opaque capability;
+    // `boa_fapi` production code holds no `std::fs`/`std::path` itself —
+    // the `fs` feature only wires the opaque `FileResource` trait.)
     let mut all = String::new();
     for entry in walk_rs(&src) {
         all.push_str(&read(&entry));
@@ -549,10 +559,26 @@ fn no_out_of_scope_surface() {
 #[test]
 fn public_api_exposes_no_paths_or_mutable_bytes() {
     // The public Rust API surface is exactly the extension/handle/clock/error
-    // types; native data, segments and brand keys stay private.
+    // types; native data, segments and brand keys stay private. The `fs`
+    // host import takes an opaque `Arc<dyn FileResource>` (never a
+    // filesystem location): `file_from_resource` is the only allowed
+    // production mention of the resource trait in `extension.rs`.
     let extension = read(&workspace_root().join("crates/boa_fapi/src/extension.rs"));
     assert!(!extension.contains("pub(crate) struct BlobNative"));
     assert!(!extension.contains("pub struct BlobNative"));
+    for forbidden in ["PathBuf", "std::fs", "std::path"] {
+        let mut hits = 0;
+        for line in extension.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "extension.rs must not contain {forbidden}");
+    }
     let lib = read(&workspace_root().join("crates/boa_fapi/src/lib.rs"));
     for forbidden in [
         "BlobNative",

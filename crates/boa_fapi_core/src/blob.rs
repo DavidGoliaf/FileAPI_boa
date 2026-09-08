@@ -55,6 +55,22 @@ pub struct BlobData {
     snapshot: SnapshotState,
 }
 
+/// Computes the blob-level snapshot for `segments`.
+///
+/// `Memory` when every segment reports `Memory`; otherwise the first
+/// `Filesystem` snapshot in segment order. The blob-level value is
+/// informational (JS metadata stability): the security boundary is the
+/// per-source validation inside each `ByteSource::read_range`, which
+/// re-checks its own import snapshot before every chunk.
+fn snapshot_for_segments(segments: &[BlobSegment]) -> SnapshotState {
+    for seg in segments {
+        if let SnapshotState::Filesystem(state) = seg.source.snapshot() {
+            return SnapshotState::Filesystem(state);
+        }
+    }
+    SnapshotState::Memory
+}
+
 impl BlobData {
     /// Creates an empty blob with the given media type.
     pub fn empty(media_type: impl AsRef<str>) -> Self {
@@ -112,11 +128,12 @@ impl BlobData {
             return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize));
         }
 
+        let snapshot = snapshot_for_segments(&segments);
         Ok(Self {
             segments,
             size: total_size,
             media_type,
-            snapshot: SnapshotState::Memory,
+            snapshot,
         })
     }
 
@@ -173,11 +190,12 @@ impl BlobData {
         if total_size > limits.max_blob_size {
             return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize));
         }
+        let snapshot = snapshot_for_segments(&segments);
         Ok(Self {
             segments,
             size: total_size,
             media_type,
-            snapshot: SnapshotState::Memory,
+            snapshot,
         })
     }
 
@@ -395,11 +413,12 @@ impl BlobData {
             return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize));
         }
 
+        let snapshot = snapshot_for_segments(&new_segments);
         Ok(Self {
             segments: new_segments,
             size: span,
             media_type: new_media_type,
-            snapshot: SnapshotState::Memory,
+            snapshot,
         })
     }
 }
