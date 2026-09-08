@@ -882,14 +882,16 @@ rework-handoff.
 ## ADR-0041 (M9-A acceptance remediation): local MIME parser
 
 Контекст: MIME `charset` нельзя извлекать ad hoc-разделением строки по
-`;`: сначала требуется успешный parse type/subtype и параметров, включая
-quoted values, case-insensitive names и duplicate policy. Новая внешняя
-зависимость не нужна для ограниченного packaging surface.
+`;`: сначала требуется parse type/subtype, после чего параметры обрабатываются
+по permissive WHATWG algorithm — malformed parameter пропускается, quoted
+value может содержать `;`, а suffix после закрывающей кавычки игнорируется.
+Новая внешняя зависимость не нужна для ограниченного packaging surface.
 
 Решение: использовать небольшой локальный parser в
-`crates/boa_fapi/src/package.rs`. Он проверяет ASCII MIME grammar,
-поддерживает token/quoted parameter values, выбирает первый duplicate
-parameter и возвращает charset только после успешного parse. `mime`/прочие
+`crates/boa_fapi/src/package.rs`. Он проверяет ASCII grammar type/subtype,
+пропускает malformed individual parameters, поддерживает token/quoted
+parameter values, выбирает первый duplicate parameter и возвращает charset из
+сформированного MIME record. `mime`/прочие
 crate не добавляются: они были бы шире текущего surface, не дают выигрыша
 для этой фиксированной операции и потребовали бы license/maintenance gate.
 

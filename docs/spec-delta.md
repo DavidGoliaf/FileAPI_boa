@@ -46,8 +46,11 @@ extension as change control: it narrows no normative requirement, it
 only makes the MIME-type input observable that the WD already
 references. `FileReader` and `FileReaderSync` share the single
 `package::resolve_text_encoding` selector, so both emit identical
-strings. MIME charset extraction is gated by a successful MIME parse;
-syntactically invalid types do not contribute a charset.
+strings. MIME charset extraction is gated by a successful type/subtype parse;
+malformed individual parameters are skipped as required by the WHATWG MIME
+parser, so later valid parameters remain visible. Quoted values may contain
+semicolons and suffix text after a closing quote is ignored to the next
+separator.
 
 ## Superseded by M9-A (sequence contract)
 
