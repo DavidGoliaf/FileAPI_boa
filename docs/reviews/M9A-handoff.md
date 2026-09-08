@@ -62,9 +62,11 @@ warnings (license fields/duplicate transitive crates), при этом его ch
 комбинациях. Incremental remediation diff реализации: 2 файла, 220
 insertions(+), 88 deletions; лимит 3000 строк не превышен.
 
-CI evidence для этой remediation-подачи будет добавлено после завершения
-нового workflow run для коммита `8d07e6a` и следующего документационного
-коммита.
+CI evidence получено для remediation-коммита `14bc8b4`:
+[run 34262671553](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34262671553)
+завершился `success`; Windows job `102184263576`, macOS job `102184263749`,
+Ubuntu job `102184263844` — все `success`. В CI прошли workspace tests, WPT
+strict runs, coverage, cargo-hack, cargo-deny, package, docs и diff check.
 
 ## Targeted-search classification
 

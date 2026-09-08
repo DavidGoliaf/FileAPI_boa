@@ -100,5 +100,8 @@ listed M9-A remediation scope was started.
 
 ## External acceptance evidence
 
-CI evidence for remediation is recorded in the handoff after the new workflow
-run completes. M9-B remains outside this work order.
+CI run [34262671553](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34262671553)
+for remediation commit `14bc8b4` completed successfully on Windows job
+`102184263576`, macOS job `102184263749` and Ubuntu job `102184263844`.
+The complete CI matrix, including WPT strict runs and release gates, passed.
+M9-B remains outside this work order.
