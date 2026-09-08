@@ -93,8 +93,8 @@ listed M9-A remediation scope was started.
 
 ## External acceptance evidence
 
-The required CI runs for both project platforms were not available from this
-workspace: the implementation commit was not pushed and no external run IDs
-or links can be recorded. This remains the sole acceptance blocker. The
-current implementation is otherwise ready for independent CI-backed
-re-acceptance; M9-B remains outside this work order.
+CI run [34258018136](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34258018136)
+for commit `2f53748` completed successfully on Windows job `102168615348`,
+macOS job `102168615552` and Ubuntu job `102168615816`. The complete CI
+matrix, including WPT strict runs and the release gates, passed. M9-B remains
+outside this work order.

@@ -60,9 +60,12 @@ warnings (license fields/duplicate transitive crates), при этом его ch
 комбинациях. Incremental diff реализации: 7 файлов, 615 insertions(+),
 75 deletions; лимит 3000 строк не превышен.
 
-CI evidence для текущего implementation commit не получено: commit не
-публиковался, external runs и ссылки отсутствуют. Это единственный
-оставшийся acceptance blocker; локальные результаты не выдаются за CI.
+CI evidence получено для implementation commit `2f53748`:
+[run 34258018136](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34258018136)
+завершился `success`; Windows job `102168615348`, macOS job
+`102168615552`, Ubuntu job `102168615816` — все `success`. В CI прошли
+workspace tests, WPT strict runs, coverage, cargo-hack, cargo-deny, package,
+docs и diff check.
 
 ## Targeted-search classification
 
