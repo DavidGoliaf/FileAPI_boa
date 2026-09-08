@@ -1,4 +1,4 @@
-# Security model (M5 filesystem)
+# Security model (M5 filesystem + M6 URL/clone)
 
 ## Threat model
 
@@ -45,8 +45,38 @@
   nothing; no callback runs after context destruction; no locations leak
   into queues or errors.
 
-## Non-goals (M6+)
+## Non-goals (M7+)
 
-Blob URL store lifetime, structured-clone lifetime, full Workers
-runtime, and the WPT harness are separate extension points and are not
-implemented here.
+Full Workers runtime and the WPT harness are separate extension points
+and are not implemented here.
+
+## M6 — Blob URL isolation and clone payload secrecy
+
+- **URL guessing/enumeration.** UUIDs are 128-bit OS CSPRNG
+  (`getrandom`; counters/timestamps/PRNGs forbidden by contract, no
+  fallback). Malformed, unknown, revoked and foreign-partition URLs
+  share one externally observable class (identical display, no token,
+  UUID, origin internals, existence bit or host metadata); `revoke` is
+  a silent no-op for foreign/malformed input, so neither resolve nor
+  revoke is an oracle. Collision retries with fresh entropy and never
+  overwrites.
+- **Cross-partition read.** The store key is origin *and* opaque
+  partition *and* per-global nonce (opaque origins share the
+  `blob:null/` prefix but never a key). Same origin alone never
+  authorizes: `resolve` checks the full key before handing out the
+  `Arc<BlobData>`. ServiceWorker contexts cannot create URLs at all.
+- **URL content leakage.** URLs carry only `<serialized-origin>/<uuid>`;
+  partition keys, capabilities, handles and paths never serialize.
+  `ResolvedBlob` exposes only the shared bytes, media type and checked
+  length. Logs/tests carry no full URLs, UUIDs or decoded bodies.
+- **Clone exfiltration.** Payloads carry materialized bytes + public
+  metadata only; host paths, capabilities, OS handles and snapshot
+  identities never encode (checked by construction and by the
+  filesystem-safety test, which also asserts no location in errors).
+  Decode enforces version + checked bounds before allocation; future
+  versions are rejected, never misread.
+- **Shutdown race (M6).** `store.clear()` runs as a tracked closer at
+  shutdown (strong refs released immediately, idempotent); URL creation
+  and clone entry points reject after shutdown; already-handed-out
+  `Arc` reads still complete safely without touching a destroyed
+  context; no late jobs or callbacks.

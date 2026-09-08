@@ -7,7 +7,7 @@ A Rust implementation of the [File API](https://www.w3.org/TR/FileAPI/) for the 
 | Crate | Purpose |
 |---|---|
 | `boa_fapi_core` | Platform-independent data model and algorithms (no Boa dependency) |
-| `boa_fapi` | Boa bindings: `Blob`, `File`, `FileList` (M2), promise reads (M3-A), streams shim (M3-B), DOM shim + async `FileReader` (M4-A), worker-only sync `FileReaderSync` (M4-B), `fs` host import + shutdown (M5); Web IDL conversions, brands, GC-safe native data |
+| `boa_fapi` | Boa bindings: `Blob`, `File`, `FileList` (M2), promise reads (M3-A), streams shim (M3-B), DOM shim + async `FileReader` (M4-A), worker-only sync `FileReaderSync` (M4-B), `fs` host import + shutdown (M5), Blob URL store + `URL` shim (M6), structured-clone bridge (M6); Web IDL conversions, brands, GC-safe native data |
 | `boa_fapi_fs` | Capability-based filesystem-backed `ByteSource` with snapshot validation (M5) |
 | `boa_fapi_wpt` | Future WPT test harness (M7+) |
 
@@ -114,10 +114,23 @@ context.run_jobs().expect("jobs failed");
   immediately), cancels pending filesystem work, rejects new operations,
   and lets late jobs settle nothing after context destruction. Disable
   with `--no-default-features` (memory API and registration keep
-  working; no partial filesystem surface).
+   working; no partial filesystem surface).
+- **M6 (`boa_fapi` `url-shim` + `structured-clone` features, default
+  on)**: isolated Blob URL store with `URL.createObjectURL()` /
+  `URL.revokeObjectURL()` (namespace object, not WHATWG URL:
+  `blob:<serialized-origin>/<uuid-v4>`, OS CSPRNG via `getrandom`,
+  resolvable only within the same origin *and* storage partition;
+  ServiceWorker creation forbidden; shutdown clears the store) plus the
+  versioned structured-clone bridge for `Blob`/`File`/`FileList`
+  (`FCL1`/v1/`SCF_*` encoding of materialized bytes + public metadata;
+  host `CloneAdapter`, no `boa-idb` dependency). Disable either with
+  `FileApiExtensionBuilder::url_shim(false)` /
+  `::structured_clone(false)` or `--no-default-features` (M1–M5 keep
+  working; the JS surface stays absent; host store/clone helpers keep
+  working as pure Rust).
 
-Not yet implemented (M6–M7): worker environments beyond the descriptor,
-blob URLs, structured clone, full DOM/HTML,
+Not yet implemented (M7): worker environments beyond the descriptor,
+full DOM/HTML,
 full WHATWG Streams (`pipeTo`, `tee`, BYOB, transformers), WPT harness.
 ## Building
 
@@ -148,3 +161,9 @@ Filesystem capability/snapshot units (no Boa):
 `cargo test --package boa_fapi_fs --all-features`.
 Host `file_from_resource` integration (real JS + temp files + shutdown):
 `cargo test --package boa_fapi --test m5_file_fs`.
+Blob URL integration (real JS + isolation + limits + shutdown):
+`cargo test --package boa_fapi --test m6_blob_url`.
+Structured-clone integration (round-trips + versioning + bridge):
+`cargo test --package boa_fapi --test m6_structured_clone`.
+Core URL/clone units (Boa-free):
+`cargo test --package boa_fapi_core --test blob_url`.

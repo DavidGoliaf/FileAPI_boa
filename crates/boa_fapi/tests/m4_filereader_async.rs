@@ -1814,6 +1814,10 @@ fn bounded_operation_sequences_match_pure_model() {
 
 #[test]
 fn excluded_m4b_apis_are_absent() {
+    // M4-A froze before the M6 URL milestone: the check asserts the absence
+    // of the M4-B sync surface, workers runtime, and full-DOM names. The
+    // M6 `URL` namespace (with exactly `createObjectURL`/`revokeObjectURL`)
+    // is the expected M6 addition and is pinned by the M6 suites instead.
     let mut context = setup();
     assert_eval(
         &mut context,
@@ -1824,7 +1828,6 @@ fn excluded_m4b_apis_are_absent() {
         && typeof CustomEvent === 'undefined'
         && typeof AbortSignal === 'undefined'
         && typeof FileReader.prototype.readAsTextSync === 'undefined'
-        && (typeof URL === 'undefined' || typeof URL.createObjectURL === 'undefined')
         ",
     );
 }

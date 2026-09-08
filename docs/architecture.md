@@ -47,8 +47,59 @@ Native data owns `Arc<BlobData>` plus immutable Rust strings/numbers only;
 it contains no `JsObject`/`JsValue`/`Context` and is GC-safe through the
 `boa_gc` derive with `#[unsafe_ignore_trace]` on non-GC fields.
 
-Not implemented (M6+): blob URLs, structured clone, full DOM/HTML,
-full WHATWG Streams beyond the shim, workers runtime, WPT harness.
+Not implemented (M7+): full DOM/HTML, full WHATWG Streams beyond the
+shim, workers runtime, WPT harness.
+
+### Layer 2f: `boa_fapi` Blob URL store + `URL` shim (M6)
+`boa_fapi_core::blob_url` owns the Boa-free store; `boa_fapi::url_shim`
+owns the JS namespace; `extension.rs` owns the wiring:
+
+- `EnvironmentDescriptor { kind, serialized_origin, partition, nonce }`
+  (explicit host config, never inferred) + comparable `EnvironmentKey`:
+  only the origin is serialized into `blob:<origin>/<uuid-v4>`; the
+  partition and nonce never leave the key (redacted even from `Debug`);
+- `BlobUrlStore` (per-context `Arc`, `Mutex<HashMap>` + atomic `seq`,
+  O(1); lock held only for the map op): `insert_capped` (quota-atomic,
+  `Collision` never overwrites), `resolve` (full-key check before the
+  `Arc<BlobData>`; malformed/unknown/revoked/foreign share one opaque
+  class), `revoke` (idempotent silent no-op; handed-out `Arc` reads to
+  completion), `clear()` at shutdown (tracked closer, all strong refs
+  released, idempotent);
+- `URL` is a namespace object (not a constructor, not WHATWG URL):
+  `createObjectURL` (Blob-brand only, `length` 1) draws 16 CSPRNG bytes
+  from the configured `UrlEntropySource` (production `OsEntropy` via
+  `getrandom`, tests inject deterministic entropy), retries collisions
+  bounded with fresh entropy, returns the string in the calling realm
+  with no Boa job; `revokeObjectURL` (same shape) always returns
+  `undefined`; failures are one network-error equivalent `TypeError`
+  (never token/UUID/origin/existence/host detail); ServiceWorker forbids
+  creation with no partial global change; `url-shim` off leaves the
+  `URL` name untouched while host store ops keep working;
+- `ResolvedBlob` (`Arc<BlobData>` + media type + checked length) is the
+  host Fetch boundary: no network handler is registered by `boa-fapi`.
+
+### Layer 2g: `boa_fapi` structured-clone bridge (M6, no `boa-idb`)
+`boa_fapi_core::clone` owns the versioned encoding; `clone_bridge.rs`
+owns the host bridge; `extension.rs` owns the entry points:
+
+- layout `FCL1 | u32 version (= 1) | u32 tag (BLOB/FILE/FLST) | body`
+  with `Cursor` checked arithmetic against `MAX_CLONE_BYTES` /
+  `MAX_CLONE_STRING_BYTES` / `MAX_CLONE_FILES`: malformed/truncated/
+  overflow/unknown-version/unknown-tag/trailing fail without panic or
+  partial output; payloads carry materialized bytes + public metadata
+  only (M1-normalized type, sanitized name, stored `lastModified`) —
+  never paths, capabilities, OS handles or snapshot identities;
+- `clone_blob`/`clone_file`/`clone_file_list` materialize through the
+  existing checked path (`SourceFailed` typed, no partial payload;
+  every list element brand-checked before output); `blob_from_clone`/
+  `file_from_clone`/`file_list_from_clone` rebuild with a new immutable
+  backing (kind mismatch fails before JS state);
+- `CloneAdapter`/`CloneBridgeDescriptor` is the only `boa-idb` coupling
+  (no dependency in any feature combination): version preflight before
+  any `globalThis` mutation (`CloneBridgeIncompatible` + rollback),
+  `NoBridge`/`Shutdown` before payload; no JS `structuredClone` global
+  exists by design (host-side capability); `structured-clone` off keeps
+  M1–M5 behavior with no partial surface.
 
 ### Layer 2b: `boa_fapi` promise reads (M3-A)
 `promise_read.rs` owns the single conversion/packaging/scheduling path for
@@ -205,7 +256,7 @@ Future filesystem implementations will check snapshot stability on each read and
 boa_fapi_core (no external runtime deps beyond bytes/thiserror)
     └── bytes, thiserror
 
-boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror + encoding_rs + base64 (+ boa_fapi_fs with `fs`)
+boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror + encoding_rs + base64 + getrandom (+ boa_fapi_fs with `fs`)
 boa_fapi_fs → boa_fapi_core + bytes + thiserror + std::fs
 boa_fapi_wpt (future) → boa_fapi_core + test harness
 ```

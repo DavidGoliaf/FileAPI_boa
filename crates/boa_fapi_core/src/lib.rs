@@ -7,7 +7,9 @@
 //! # Modules
 //!
 //! - [`blob`] — Segmented immutable byte storage with File API slice semantics.
+//! - [`blob_url`] — Isolated Blob URL store, environment identity and URL format.
 //! - [`cancellation`] — Cooperative cancellation tokens.
+//! - [`clone`] — Versioned structured-clone payload encoding.
 //! - [`endings`] — Line ending normalization.
 //! - [`file_api_error`] — File API error types.
 //! - [`error`] — Resource limit kind enum.
@@ -23,7 +25,9 @@
 #![deny(clippy::panic)]
 
 pub mod blob;
+pub mod blob_url;
 pub mod cancellation;
+pub mod clone;
 pub mod endings;
 pub mod error;
 pub mod file_api_error;

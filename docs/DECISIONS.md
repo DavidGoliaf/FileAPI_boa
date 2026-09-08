@@ -524,3 +524,172 @@ shutdown не компилируются, memory API и регистрация �
 `sync`) + существующие `bytes`/`thiserror`/`boa_fapi_core`; отдельный
 dependency-ADR не нужен. `cargo hack check --feature-powerset --depth 2`
 зелёный.
+
+## ADR-0028 (M6): environment identity — origin + partition + nonce, never inferred
+
+Контекст: ТЗ §1.2/§3.2/§8 требует изоляции Blob URL по origin и storage
+partition через host-controlled environment descriptor; заказ M6 §3
+запрещает выводить descriptor из thread id, адреса `Context`, случайной
+характеристики процесса или callback presence, а opaque origin обязан
+быть непереиспользуемым для нового global.
+
+Решение: core `EnvironmentDescriptor { kind, serialized_origin,
+partition, nonce }` (Boa-free, `boa_fapi_core::blob_url`) + сравнимый
+`EnvironmentKey { origin, partition, nonce }`. Биндинги строят его только
+из явных builder-полей (`environment`/`origin`/`partition`/`nonce`,
+дефолты `Window`/`"https://localhost"`/`0`/`0`); никакого вывода из
+потока/контекста нет. `serialized_origin` — единственное, что попадает в
+URL (`blob:<origin>/<uuid>`); partition и nonce не сериализуются и
+отредактированы из обоих `Debug` (`EnvironmentDescriptor` и
+`EnvironmentKey` — ручные redacted-impl; регрессия
+`url_key_debug_redacts_partition_and_nonce`). Opaque origin — фиксированная строка
+`"null"`, но ключ несёт host-supplied `nonce`, поэтому два opaque global
+никогда не делят ключ при общем `blob:null/`-префиксе. Resolve требует
+равенства полного ключа (одного origin недостаточно). Маппинг целевой
+формы ТЗ (`EnvironmentDescriptor`/`EnvironmentKey`) — 1:1, без
+адаптации; `FileApiEnvironment::Window/DedicatedWorker/SharedWorker/
+ServiceWorker` сохранён как kind/compatibility surface (ServiceWorker
+запрещает создание URL).
+
+Последствия: same-partition check до выдачи `Arc<BlobData>`; foreign URL
+неотличим от missing (один display string у `Malformed`/`Unavailable`);
+тесты `url_partition_and_nonce_isolation`,
+`url_failures_share_one_opaque_class`,
+`same_origin_partitions_isolate` фиксируют изоляцию.
+
+## ADR-0029 (M6): зависимость `getrandom` 0.3 для CSPRNG UUID
+
+Контекст: заказ M6 §2.7 требует криптографически непредсказуемый UUID
+для Blob URL (счётчик, timestamp, обычный PRNG запрещены) и ADR на
+каждую новую production dependency (maintenance, license, `cargo-deny`,
+отсутствие более узкого решения).
+
+Решение: `getrandom = "0.3"` (workspace dep; в `boa_fapi` — единственное
+место генерации UUID). Обоснование: узкая single-purpose библиотека
+Rust Random WG (активно поддерживается, десятки миллионов загрузок),
+пермиссивная лицензия MIT OR Apache-2.0 (allow-list `deny.toml` не
+меняется), MSRV 1.85 (ниже нашего 1.91), `no_std`-совместима,
+без `unsafe` в нашем коде (вызов — safe wrapper `getrandom::fill`).
+Более узкого решения нет: `rand`/`uuid` тянут лишнее (генераторы,
+парсеры, serde-фасады); std не даёт CSPRNG (`HashMap` RandomState —
+не криптографический и запрещён контрактом); `boa_engine` CSPRNG не
+экспортирует. `uuid`-крейт не взят сознательно: нужен ровно v4-формат
+одной функцией `format_uuid_v4` (~15 строк, биты версии/варианта
+ставятся у нас), а парсинг — строгий shape-check `parse_blob_url`
+(36 символов, дефисы, nibble `4`, вариант `8/9/a/b`). Production
+default — `OsEntropy` (`getrandom::fill` напрямую, без перебора
+блоков); тестовый entropy source injectable через builder
+(`UrlEntropySource`: `CounterEntropy`/`StuckEntropy` в M6-сюитах).
+Платформенный отказ `getrandom` — `BlobUrlError::EntropyUnavailable`
+(тот же network-error equivalent в JS), без fallback на счётчик/PRNG
+по построению. `cargo-deny` чист (advisories/bans/licenses/sources).
+
+Последствия: повтор UUID — `Collision` с bounded retry (8 попыток со
+свежей энтропией), никогда тихий overwrite; creation timestamp не
+является источником UUID и не попадает в URL (только монотонный `seq`
+в entry как creation metadata); `cargo hack --feature-powerset`
+зелёный (entropy signage живёт в `ExtensionConfig` независимо от
+`url-shim` feature).
+
+## ADR-0030 (M6): URL store lifetime — context-local store + shutdown clear
+
+Контекст: ТЗ §8.4 требует удаления всех URL global при shutdown/
+уничтожении runtime; заказ M6 §4.2/§4.3 требует revoke-семантику (новые
+resolve — network-error, начатые чтения — до завершения) и отсутствие
+Fetch-регистрации в `boa-fapi`.
+
+Решение: `BlobUrlStore` (core, Boa-free: `Mutex<HashMap<String, Entry>>`
++ `AtomicU64 seq`, амортизированный O(1); мьютекс держится только на
+map-операцию, никогда через I/O/JS) живёт per-context
+(`Arc<BlobUrlStore>` в `RegisteredSpecs`; хэндл его не возвращает —
+только count-only `blob_url_count()`/`blob_urls_empty()`; guard запрещает
+`pub fn url_store`/`environment_key` и store/key в любой `pub fn`
+сигнатуре/`pub use`): два контекста никогда не делят store/shutdown. Entry — `Arc<BlobData>` +
+`EnvironmentKey` owner + `seq`. Shutdown трекает closer
+`store.clear()` во флаге (как fs-closers): все сильные ссылки падают в
+момент shutdown, повторный shutdown — no-op, новых JS callbacks нет.
+`revoke` — после M6-rework R2: required-arg + центральный `webidl::dom_string`
+(missing arg — `TypeError` до store, abrupt конверсия propagates), затем
+idempotentный silent no-op для malformed/unknown/revoked/foreign (не oracle);
+уже выданный `Arc` читается до конца (`materialize` после revoke доказан
+тестом). `ResolvedBlob` — только `Arc<BlobData>` + `media_type`/`size`
+(нет path/capability/handle/partition key/URL token). Resolver —
+`FileApiHandle::resolve_blob_url` (host Fetch boundary, без network
+handler); JS-facing failure — один `TypeError("blob URL is not
+available")` для malformed/unknown/foreign/revoked/collision (не
+различает наличие чужой записи, не выдаёт UUID/origin/existence bit).
+
+Последствия: `url_shutdown_lifetime`,
+`url_revoke_keeps_live_reads_and_clear_releases` фиксируют lifetime;
+`resolve_blob_url` отдаёт только разрешённый body metadata.
+
+## ADR-0031 (M6): feature/API compatibility — `FileApiHandle`, не `FileApiExtension`
+
+Контекст: целевая форма ТЗ §4.1 (`FileApiExtension::register →
+()/shutdown`) отличается от принятой M2–M5 формы (`register →
+FileApiHandle`, `handle::shutdown`); заказ M6 §3 требует зафиксировать
+совместимость до реализации и не ломать старые вызовы.
+
+Решение: сохранена форма `register → FileApiHandle`; эквивалентность
+зафиксирована здесь: `FileApiHandle::shutdown` даёт те же гарантии
+(идемпотентность, атомарность к новым операциям, отмена pending work,
+никаких callbacks после уничтожения `Context`), плюс M6 — `clear()` URL
+store. M5 `shutdown` расширен с `#[cfg(feature = "fs")]` на
+безусловный (флаг живёт в каждой регистрации): M1–M5 вызовы продолжают
+собираться и работать бит-в-бит (все M2–M5 сюиты зелёные без правок,
+кроме двух M4 negative-guard строк про `URL`, обновлённых под
+нормативный M6 surface). Новые builder-флаги `url_shim`/
+`structured_clone` (default true) + `origin`/`partition`/`nonce`/
+`entropy`/`clone_adapter`: `url-shim`/`structured-clone` off оставляют
+JS-surface отсутствующим, host-операции и M1–M5 — рабочими
+(документированный выбор заказа §4.3/§5.2: отсутствующий surface вместо
+`UrlAdapter`-ошибки, т.к. host URL adapter вне scope M6). `CloneAdapter`
+— единственный мост к `boa-idb` (зависимости нет в любой комбинации,
+guards фиксируют). `URL` — namespace-object (не конструктор, не WHATWG
+URL): `createObjectURL.length === 1`, `revokeObjectURL.length === 1`,
+`typeof URL === "object"`, `[Symbol.toStringTag] === "URL"`.
+
+Последствия: diff scoped только M6; `M6-REG-01` — powerset зелёный;
+`UrlAdapter`/`TaskAdapter`/`DomAdapter`/`StreamAdapter` остаются вне
+scope (штрафов за их отсутствие нет — shim'ы покрывают).
+
+## ADR-0032 (M6): versioned clone encoding `FCL1`/v1 и SCF tags
+
+Контекст: ТЗ §4.5/§6.7 требует serializable `Blob`/`File`/`FileList`
+через подключаемый bridge без зависимости от `boa-idb`: payload несёт
+bytes + публичную метаинформацию, но никогда path/capability/handle/
+snapshot identity; нужны стабильная версия, checked lengths/counts,
+fallible decode и mapping зарезервированных SCF tags.
+
+Решение: core `boa_fapi_core::clone` (Boa-free): layout `b"FCL1" | u32
+LE version (= 1, `CLONE_ENCODING_VERSION`) | u32 LE tag | body`.
+Теги: `SCF_BLOB_TAG = 0x424C_4F42` (`"BLOB"`), `SCF_FILE_TAG =
+0x4649_4C45` (`"FILE"`), `SCF_FILE_LIST_TAG = 0x464C_5354`
+(`"FLST"`) — стабильны с версией, задокументированы здесь; proprietary
+IDB-формат не внедряется. Body — le-длины + байты + UTF-8 строки +
+`i64 lastModified`; decode — `Cursor` с checked arithmetic против
+`MAX_CLONE_BYTES` (256 MiB) / `MAX_CLONE_STRING_BYTES` (1 MiB) /
+`MAX_CLONE_FILES` (100k): malformed/truncated/overflow/unknown-version/
+unknown-tag/трейлинг — `CloneError::{Malformed, UnsupportedVersion,
+LimitExceeded}` без panic и без partial output (same-version fixture в
+core-тестах). После M6-rework R3 границы симметричны: `serialized_blob`
+тоже проверяет string ceiling, а `encode()` прогоняет публичные поля
+через `validate_payload` (bytes/strings/count/total, checked) до
+первого байта — прямые конструкции без хелперов видят те же границы,
+что и decode; принятое всегда декодируется текущим декодером. Encode — из уже материализованных bytes через
+существующий checked path (`max_materialize_bytes`;
+snapshot/permission/short-read — `SourceFailed` без partial payload);
+`File` хранит sanitized `name` (`/` → `:` идемпотентно при decode) и
+stored `lastModified` (часы не читаются); результат — новый immutable
+backing (mutable JS buffers не делятся). `FileList` — порядок,
+количество, brand каждого элемента до упаковки (partial list запрещён;
+identity только внутри результата). `CloneAdapter { descriptor,
+encode, decode }` + `CloneBridgeDescriptor { name, version }` —
+capability/version check до изменения глобалов
+(`RegisterError::CloneBridgeIncompatible` + полный rollback);
+`NoBridge`/`Shutdown` — до payload. JS-глобалов у bridge нет
+сознательно (host-side capability, не `structuredClone`).
+
+Последствия: `M6-CLONE-01..05` — round-trip, fs-safety (unix live),
+versioned encoding, adapter/lifecycle; `boa-idb` не зависит ни в одной
+комбинации; M7 exclusions (WPT, benchmark-hardening) — вне scope.

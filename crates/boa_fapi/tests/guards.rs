@@ -195,6 +195,8 @@ fn internal_binding_modules_expose_no_public_items() {
         "filereader_sync.rs",
         "lifecycle.rs",
         "package.rs",
+        "url_shim.rs",
+        "clone_bridge.rs",
         "webidl.rs",
     ] {
         let content = read(&src.join(module));
@@ -203,6 +205,14 @@ fn internal_binding_modules_expose_no_public_items() {
             let starts_public = trimmed == "pub" || trimmed.starts_with("pub ");
             let starts_crate_public =
                 trimmed.starts_with("pub(crate) ") || trimmed.starts_with("pub(super) ");
+            // The reference fake bridge is the one deliberate exception:
+            // it is re-exportable host API, documented in its module docs.
+            if module == "clone_bridge.rs" && trimmed.starts_with("pub struct FakeCloneBridge") {
+                continue;
+            }
+            if module == "clone_bridge.rs" && trimmed.starts_with("pub fn ") {
+                continue;
+            }
             assert!(
                 !starts_public || starts_crate_public,
                 "{module} must not expose public items: {trimmed}"
@@ -219,11 +229,15 @@ fn lib_rs_denies_unsafe_and_limits_re_exports() {
         "pub use clock::{Clock, SystemClock};",
         "pub use error::RegisterError;",
         "pub use extension::{",
+        "CloneAdapter",
+        "CloneBridgeDescriptor",
         "FileApiEnvironment",
         "FileApiExtension",
         "FileApiExtensionBuilder",
         "FileApiHandle",
         "HostFileOptions",
+        "OsEntropy",
+        "UrlEntropySource",
     ] {
         assert!(lib.contains(exposed), "lib.rs must contain `{exposed}`");
     }
@@ -304,8 +318,10 @@ fn filereader_and_dom_surface_is_bounded() {
     // URL/clone/WPT, full DOM (tree dispatch, capture/bubble, CustomEvent,
     // AbortSignal) or full Streams surface may appear in `dom.rs` or
     // `filereader.rs`. M5 lifecycle shutdown is the only exception: the
-    // `fs`-gated `shutdown`/`ShutdownFlag` checks in `filereader.rs` are
-    // allowed and asserted by the dedicated M5 shutdown tests.
+    // `shutdown`/`ShutdownFlag` checks in `filereader.rs` are
+    // allowed and asserted by the dedicated M5 shutdown tests. M6 shutdown
+    // is configuration-wide (no longer `fs`-gated), so the same exception
+    // covers the ungated checks.
     for module in ["dom.rs", "filereader.rs"] {
         let content = read(&workspace_root().join(format!("crates/boa_fapi/src/{module}")));
         // Every production mention of an excluded API must be absent; only
@@ -473,20 +489,26 @@ fn sync_surface_is_bounded() {
 
 #[test]
 fn no_out_of_scope_surface() {
-    // M5+ APIs (filesystem, URL, clone, WPT, full DOM/workers runtime)
-    // never appear in production sources. `FileReaderSync` and the worker
-    // descriptors live only in `filereader_sync.rs` (surface) and
-    // `extension.rs` (capability wiring); every other module must not
-    // mention them.
+    // M5 filesystem surface plus the M6 URL/clone surface live only in
+    // their own modules and the capability wiring. `FileReaderSync` and
+    // the worker descriptors live only in `filereader_sync.rs` (surface)
+    // and `extension.rs` (capability wiring); URL/clone names live only
+    // in `url_shim.rs`, `clone_bridge.rs`, `extension.rs` and `lib.rs`.
+    // Every other module must not mention them.
     let src = workspace_root().join("crates/boa_fapi/src");
     for entry in walk_rs(&src) {
         let name = entry
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        // The sync surface, the capability wiring, and the public
-        // re-exports legitimately name the descriptor.
-        if name == "filereader_sync.rs" || name == "extension.rs" || name == "lib.rs" {
+        // The sync/URL/clone surfaces, the capability wiring, and the
+        // public re-exports legitimately name the descriptors.
+        if name == "filereader_sync.rs"
+            || name == "url_shim.rs"
+            || name == "clone_bridge.rs"
+            || name == "extension.rs"
+            || name == "lib.rs"
+        {
             continue;
         }
         let content = read(&entry);
@@ -517,18 +539,20 @@ fn no_out_of_scope_surface() {
             );
         }
     }
-    // Out-of-scope APIs are absent everywhere, including the new modules.
-    // (`boa_fapi_fs` owns filesystem I/O behind the opaque capability;
-    // `boa_fapi` production code holds no `std::fs`/`std::path` itself —
-    // the `fs` feature only wires the opaque `FileResource` trait.)
+    // M6 owns exactly the bounded URL/clone surface: `createObjectURL`,
+    // `revokeObjectURL` (shim only) and the host bridge names. Everything
+    // else out-of-scope stays absent everywhere, including the new
+    // modules. (`boa_fapi_fs` owns filesystem I/O behind the opaque
+    // capability; `boa_fapi` production code holds no `std::fs`/`std::path`
+    // itself — the `fs` feature only wires the opaque `FileResource`
+    // trait. `structuredClone` as a JS global never exists: the bridge is
+    // host-side only.)
     let mut all = String::new();
     for entry in walk_rs(&src) {
         all.push_str(&read(&entry));
         all.push('\n');
     }
     for forbidden in [
-        "createObjectURL",
-        "revokeObjectURL",
         "structuredClone",
         "CustomEvent",
         "AbortSignal",
@@ -536,6 +560,9 @@ fn no_out_of_scope_surface() {
         "std::path",
         "tokio",
         "std::thread",
+        "MediaSource",
+        "boa-idb",
+        "boa_idb",
     ] {
         let mut hits = 0;
         for line in all.lines() {
@@ -548,6 +575,42 @@ fn no_out_of_scope_surface() {
             }
         }
         assert_eq!(hits, 0, "must not introduce {forbidden}");
+    }
+    // The bounded URL methods appear only where they belong.
+    for module in ["url_shim.rs", "extension.rs"] {
+        let content = read(&src.join(module));
+        assert!(
+            content.contains("createObjectURL") && content.contains("revokeObjectURL"),
+            "{module} must own the URL methods"
+        );
+    }
+    for entry in walk_rs(&src) {
+        let name = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == "url_shim.rs" || name == "extension.rs" {
+            continue;
+        }
+        let content = read(&entry);
+        for forbidden in ["createObjectURL", "revokeObjectURL"] {
+            let mut hits = 0;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.contains(forbidden) {
+                    hits += 1;
+                }
+            }
+            assert_eq!(
+                hits,
+                0,
+                "{} must not introduce {forbidden}",
+                entry.display()
+            );
+        }
     }
     let extension = read(&src.join("extension.rs"));
     assert!(
@@ -562,11 +625,30 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
     // types; native data, segments and brand keys stay private. The `fs`
     // host import takes an opaque `Arc<dyn FileResource>` (never a
     // filesystem location): `file_from_resource` is the only allowed
-    // production mention of the resource trait in `extension.rs`.
+    // production mention of the resource trait in `extension.rs`. M6 adds
+    // the opaque URL/clone entry points (`create_blob_url`,
+    // `resolve_blob_url`, `revoke_blob_url`, `clone_*`,
+    // `blob_url_count`/`blob_urls_empty`) plus the
+    // `UrlEntropySource`/`CloneAdapter` host traits — still no paths,
+    // handles, partition keys or `BlobData` internals in the public types.
+    // The live store and the environment key are never returned: no public
+    // method may hand out the store or the key (`SharedUrlStore` itself is
+    // `pub(crate)`-only; checked as a declaration, not a substring, so the
+    // private alias definition does not trip the guard).
     let extension = read(&workspace_root().join("crates/boa_fapi/src/extension.rs"));
     assert!(!extension.contains("pub(crate) struct BlobNative"));
     assert!(!extension.contains("pub struct BlobNative"));
-    for forbidden in ["PathBuf", "std::fs", "std::path"] {
+    for forbidden in [
+        "PathBuf",
+        "std::fs",
+        "std::path",
+        "boa-idb",
+        "boa_idb",
+        "pub fn url_store",
+        "pub fn environment_key",
+        "-> EnvironmentKey",
+        "pub type SharedUrlStore",
+    ] {
         let mut hits = 0;
         for line in extension.lines() {
             let trimmed = line.trim();
@@ -579,6 +661,23 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         }
         assert_eq!(hits, 0, "extension.rs must not contain {forbidden}");
     }
+    // The store/key types themselves must never appear in a public
+    // signature. `extension.rs` keeps them `pub(crate)`-internal: assert
+    // no `pub fn` returns them and no `pub use` re-exports them.
+    for line in extension.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("pub fn ") {
+            assert!(
+                !trimmed.contains("SharedUrlStore")
+                    && !trimmed.contains("BlobUrlStore")
+                    && !trimmed.contains("EnvironmentKey"),
+                "no public method may return the store or key: {trimmed}"
+            );
+        }
+    }
     let lib = read(&workspace_root().join("crates/boa_fapi/src/lib.rs"));
     for forbidden in [
         "BlobNative",
@@ -586,10 +685,66 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         "FileListNative",
         "PathBuf",
         "std::fs",
+        "SharedUrlStore",
+        "BlobUrlStore",
+        "EnvironmentKey",
     ] {
         assert!(
             !lib.contains(forbidden),
             "lib.rs public surface must not expose {forbidden}"
+        );
+    }
+    // The `pub(crate)` store alias itself must never become public.
+    assert!(
+        !extension.contains("pub type SharedUrlStore"),
+        "SharedUrlStore alias must stay pub(crate)"
+    );
+    // `boa-idb` must never become a dependency: docs may name it as the
+    // explicitly-absent integration, but no manifest and no `use` may.
+    for source in ["extension.rs", "lib.rs", "clone_bridge.rs", "url_shim.rs"] {
+        let content = read(&workspace_root().join(format!("crates/boa_fapi/src/{source}")));
+        for forbidden in ["extern crate boa_idb", "use boa_idb", "boa_idb::"] {
+            let mut hits = 0;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.contains(forbidden) {
+                    hits += 1;
+                }
+            }
+            assert_eq!(hits, 0, "{source} must not use {forbidden}");
+        }
+    }
+    // No workspace manifest may depend on `boa-idb` in any feature
+    // combination.
+    for manifest in [
+        "Cargo.toml",
+        "crates/boa_fapi/Cargo.toml",
+        "crates/boa_fapi_core/Cargo.toml",
+        "crates/boa_fapi_fs/Cargo.toml",
+    ] {
+        let content = read(&workspace_root().join(manifest));
+        assert!(
+            !content.contains("boa-idb") && !content.contains("boa_idb"),
+            "{manifest} must not depend on boa-idb"
+        );
+    }
+    // The public URL/clone surface exists and stays opaque.
+    for required in [
+        "create_blob_url",
+        "resolve_blob_url",
+        "revoke_blob_url",
+        "clone_blob",
+        "blob_url_count",
+        "blob_urls_empty",
+        "UrlEntropySource",
+        "CloneAdapter",
+    ] {
+        assert!(
+            extension.contains(required),
+            "extension.rs must contain `{required}`"
         );
     }
 }
