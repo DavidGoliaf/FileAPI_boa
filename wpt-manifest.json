@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "https://github.com/web-platform-tests/wpt",
+    "commit": "0968c868d8095217d18d86b34c7f21dccae58768",
+    "license": "BSD-3-Clause"
+  },
+  "default_timeout_ms": 5000,
+  "corpus_root": "crates/boa_fapi_wpt/corpus",
+  "files": [
+    {
+      "path": "corpus/blob-constructor.js",
+      "upstream_path": "FileAPI/blob/Blob-constructor.any.js",
+      "upstream_blob_sha": "03155b99cb20ea34fa5167e5107141e18fc08647",
+      "sha256": "ebf876f7226a3a850eaac07c795c05a4cdffa74a2c9dd8b5a1e24b4e84a03795",
+      "group": "FileAPI/blob",
+      "capability": "blob-constructor",
+      "subtests": [
+        {"test": "blob-constructor", "subtest": "Blob interface object", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "blob-constructor", "subtest": "Blob constructor with no arguments", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "blob-constructor", "subtest": "Blob constructor with no arguments, without 'new'", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "blob-constructor", "subtest": "Blob constructor with undefined as first argument", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "blob-constructor", "subtest": "Passing non-objects, Dates and RegExps for blobParts should throw a TypeError.", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "blob-constructor", "subtest": "blobParts not an object: boolean", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "blob-constructor", "subtest": "blobParts not an object: string", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "blob-constructor", "subtest": "blobParts not an object: number", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "blob-constructor", "subtest": "Blob constructor with string part", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "blob-constructor", "subtest": "Passing typed arrays as elements of the blobParts array should work.", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "blob-constructor", "subtest": "Array with two blobs", "status": "PASS", "reason": "", "capability": "blob-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"}
+      ]
+    },
+    {
+      "path": "corpus/blob-slice.js",
+      "upstream_path": "FileAPI/blob/Blob-slice.any.js",
+      "upstream_blob_sha": "bedc8d737302a0f4c0464db103c66bfe1ca2e3e2",
+      "sha256": "ca2d84b1768ba47552f01c0d22bf7a1e5ad55179f2ddd31680d4be5a3ebce10a",
+      "group": "FileAPI/blob",
+      "capability": "blob-slice",
+      "subtests": [
+        {"test": "blob-slice", "subtest": "Blob slice positive range", "status": "PASS", "reason": "", "capability": "blob-slice", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "blob-slice", "subtest": "Blob slice negative range", "status": "PASS", "reason": "", "capability": "blob-slice", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "blob-slice", "subtest": "Blob slice clamping and empty span", "status": "PASS", "reason": "", "capability": "blob-slice", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "blob-slice", "subtest": "Blob slice content type normalization", "status": "PASS", "reason": "", "capability": "blob-slice", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "blob-slice", "subtest": "Blob slice returns a new Blob without mutating the original", "status": "PASS", "reason": "", "capability": "blob-slice", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"}
+      ]
+    },
+    {
+      "path": "corpus/file-constructor.js",
+      "upstream_path": "FileAPI/file/File-constructor.any.js",
+      "upstream_blob_sha": "e84bf25b3be47d850d1fc9583fecfddde9dbea84",
+      "sha256": "2d25681faddcf4c76e9fc4f5dfe84468dc65b8515deaea696c4aec91d4961d97",
+      "group": "FileAPI/file",
+      "capability": "file-constructor",
+      "subtests": [
+        {"test": "file-constructor", "subtest": "File constructor basic", "status": "PASS", "reason": "", "capability": "file-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "file-constructor", "subtest": "File name slashes become colons", "status": "PASS", "reason": "", "capability": "file-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "file-constructor", "subtest": "File type normalization", "status": "PASS", "reason": "", "capability": "file-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "file-constructor", "subtest": "File lastModified supplied", "status": "PASS", "reason": "", "capability": "file-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "file-constructor", "subtest": "File constructor requires bits and name", "status": "PASS", "reason": "", "capability": "file-constructor", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"}
+      ]
+    },
+    {
+      "path": "corpus/filelist-section.js",
+      "upstream_path": "FileAPI/filelist-section/filelist.any.js",
+      "upstream_blob_sha": "d51ba5a34c77d2ee83959facb46823a242ed2378",
+      "sha256": "f77780a68ccb769403b58ad562b18583d65a0cb35977cfd95db89642b890088a",
+      "group": "FileAPI/filelist-section",
+      "capability": "filelist",
+      "subtests": [
+        {"test": "filelist-section", "subtest": "FileList has no public constructor", "status": "PASS", "reason": "", "capability": "filelist", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"},
+        {"test": "filelist-section", "subtest": "Host file order is observable before FileList creation", "status": "PASS", "reason": "", "capability": "filelist", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-01"}
+      ]
+    },
+    {
+      "path": "corpus/reading-data-section.js",
+      "upstream_path": "FileAPI/reading-data-section/blob-text.any.js",
+      "upstream_blob_sha": "d8e385913991aaa8f289146c00f7f96b917befd4",
+      "sha256": "6d9bc1e45df95afbdc2d06bd4cdd8511cf2b8529f8c184186ceaff66feda44cb",
+      "group": "FileAPI/reading-data-section",
+      "capability": "promise-reads",
+      "subtests": [
+        {"test": "reading-data-section", "subtest": "Blob text() decodes ASCII", "status": "PASS", "reason": "", "capability": "promise-reads", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "reading-data-section", "subtest": "Blob text() of empty blob", "status": "PASS", "reason": "", "capability": "promise-reads", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "reading-data-section", "subtest": "Blob text() concatenates parts", "status": "PASS", "reason": "", "capability": "promise-reads", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "reading-data-section", "subtest": "File inherits text()", "status": "PASS", "reason": "", "capability": "promise-reads", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "reading-data-section", "subtest": "Blob arrayBuffer() returns exact bytes", "status": "PASS", "reason": "", "capability": "promise-reads", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"}
+      ]
+    },
+    {
+      "path": "corpus/filereader-read.js",
+      "upstream_path": "FileAPI/FileReader/FileReader-readAsText.any.js",
+      "upstream_blob_sha": "1da9f84fab8bd252281394bcf1d2c562faf4ce5d",
+      "sha256": "af976f8d3b6aa092315f263e87c1f7d308e48c34e0445d86f4281a6f30f5f148",
+      "group": "FileAPI/FileReader",
+      "capability": "filereader",
+      "subtests": [
+        {"test": "filereader-read", "subtest": "FileReader initial state", "status": "PASS", "reason": "", "capability": "filereader", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "filereader-read", "subtest": "FileReader readAsText enters LOADING", "status": "PASS", "reason": "", "capability": "filereader", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "filereader-read", "subtest": "FileReader result is pending before jobs run", "status": "PASS", "reason": "", "capability": "filereader", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"},
+        {"test": "filereader-read", "subtest": "FileReader constants", "status": "PASS", "reason": "", "capability": "filereader", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-03"}
+      ]
+    },
+    {
+      "path": "corpus/bloburl-create-revoke.js",
+      "upstream_path": "FileAPI/BlobURL/create-revoke.any.js",
+      "upstream_blob_sha": "c3257a37247e9f341313d33e5dc9d0c48ae6fa1e",
+      "sha256": "0e79668e1b67de36f9a0d1d2debefe2947095bdc875793b99882cebb49cf1935",
+      "group": "FileAPI/BlobURL",
+      "capability": "blob-url",
+      "subtests": [
+        {"test": "bloburl-create-revoke", "subtest": "URL.createObjectURL returns a blob: URL", "status": "PASS", "reason": "", "capability": "blob-url", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "bloburl-create-revoke", "subtest": "Two URLs never collide", "status": "PASS", "reason": "", "capability": "blob-url", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "bloburl-create-revoke", "subtest": "URL.createObjectURL rejects non-Blob brands", "status": "PASS", "reason": "", "capability": "blob-url", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "bloburl-create-revoke", "subtest": "URL.revokeObjectURL is idempotent and silent", "status": "PASS", "reason": "", "capability": "blob-url", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "bloburl-create-revoke", "subtest": "URL.revokeObjectURL requires an argument", "status": "PASS", "reason": "", "capability": "blob-url", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"},
+        {"test": "bloburl-create-revoke", "subtest": "URL.createObjectURL accepts File", "status": "PASS", "reason": "", "capability": "blob-url", "owner": "m7", "review_by": "2027-09-08", "trace": "M7-WPT-02"}
+      ]
+    }
+  ]
+}

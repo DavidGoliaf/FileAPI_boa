@@ -129,9 +129,18 @@ context.run_jobs().expect("jobs failed");
   working; the JS surface stays absent; host store/clone helpers keep
   working as pure Rust).
 
-Not yet implemented (M7): worker environments beyond the descriptor,
+Not yet implemented: worker environments beyond the descriptor,
 full DOM/HTML,
-full WHATWG Streams (`pipeTo`, `tee`, BYOB, transformers), WPT harness.
+full WHATWG Streams (`pipeTo`, `tee`, BYOB, transformers).
+
+- **M7 (`boa_fapi_wpt` harness + acceptance/race/hardening suites)**:
+  deterministic strict CLI over the pinned adapted WPT subset (7 files /
+  38 subtests, SHA-256 verified, explicit `run_jobs()` pumping,
+  PASS/FAIL/TIMEOUT/NOTRUN with deterministic JSON/JUnit reports):
+  `cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict`.
+  Reports are written with `--json`/`--junit` (CI artifacts, never
+  committed). Full DOM/HTML/Workers/Fetch/full Streams stay explicitly
+  out of scope (exact capability gaps in expectations, never PASS).
 ## Building
 
 ```sh
@@ -167,3 +176,11 @@ Structured-clone integration (round-trips + versioning + bridge):
 `cargo test --package boa_fapi --test m6_structured_clone`.
 Core URL/clone units (Boa-free):
 `cargo test --package boa_fapi_core --test blob_url`.
+Appendix-A acceptance (observable M1–M6 surface, real JS + jobs):
+`cargo test --package boa_fapi --test appendix_a_acceptance`.
+Race matrix (abort/stale/quota/URL/shutdown/snapshot/UTF-8, real JS):
+`cargo test --package boa_fapi --test abort_races`
+(`abort_races_fs` for the `fs`-gated filesystem race).
+Bounded hardening hooks (differential/fuzz/bench/leak, informational):
+`cargo test --package boa_fapi --test hardening_hooks`.
+WPT harness unit tests: `cargo test --package boa_fapi_wpt`.

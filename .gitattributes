@@ -1,0 +1,4 @@
+# WPT corpus hashes are over raw bytes; keep checkout bytes identical on
+# Windows and Unix so manifest SHA-256 verification is portable.
+crates/boa_fapi_wpt/corpus/*.js text eol=lf
+wpt-manifest.json text eol=lf

@@ -10,7 +10,7 @@ env:
 
 jobs:
   m3-validation:
-    name: M6 validation (${{ matrix.os }})
+    name: M7 validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M6 §9, in order.
+      # Work order M7 §11, in order (M1–M6 order preserved, then M7).
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -68,6 +68,52 @@ jobs:
 
       - name: cargo test (M6 structured clone)
         run: cargo test --package boa_fapi --test m6_structured_clone -- --nocapture
+
+      - name: cargo test (M7 appendix-A acceptance)
+        run: cargo test --package boa_fapi --test appendix_a_acceptance -- --nocapture
+
+      - name: cargo test (M7 abort races)
+        run: cargo test --package boa_fapi --test abort_races -- --nocapture
+
+      - name: cargo test (M7 abort races, fs)
+        run: cargo test --package boa_fapi --test abort_races_fs -- --nocapture
+
+      - name: cargo test (M7 hardening hooks)
+        run: cargo test --package boa_fapi --test hardening_hooks -- --nocapture
+
+      - name: cargo test (M7 WPT harness units)
+        run: cargo test --package boa_fapi_wpt -- --nocapture
+
+      - name: WPT strict run
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --json target/wpt-report.json --junit target/wpt-report.xml
+
+      - name: WPT strict run (threads 2, ordered output)
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --threads 2 --json target/wpt-report-t2.json
+
+      - name: WPT report check (actual PASS/NOTRUN only)
+        shell: pwsh
+        run: >
+          $json = Get-Content target/wpt-report.json -Raw | ConvertFrom-Json;
+          $bad = @($json.files | ForEach-Object { $_.subtests } | Where-Object { $_.actual -ne 'PASS' -and $_.actual -ne 'NOTRUN' });
+          if ($bad.Count -ne 0) { throw "unexpected WPT statuses: $($bad.Count)" }
+
+      - name: Upload WPT reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-reports-${{ matrix.os }}
+          path: |
+            target/wpt-report.json
+            target/wpt-report.xml
+            target/wpt-report-t2.json
+
+      - name: SBOM (cargo tree)
+        run: cargo tree --workspace --all-features --prefix none > target/sbom.txt
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.os }}
+          path: target/sbom.txt
 
       # NOTE: there is deliberately no `cargo test --workspace
       # --no-default-features` step. The lib unit suites (`src/tests.rs`,

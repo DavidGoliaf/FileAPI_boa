@@ -177,6 +177,11 @@ dependencies = [
 [[package]]
 name = "boa_fapi_wpt"
 version = "0.1.0"
+dependencies = [
+ "boa_engine",
+ "boa_fapi",
+ "thiserror",
+]
 
 [[package]]
 name = "boa_gc"

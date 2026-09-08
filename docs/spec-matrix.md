@@ -160,3 +160,62 @@ integration suites live in `crates/boa_fapi_core/tests/`.
 | M6-RW-R2 | required-arg/DOMString revoke | `url_shim.rs` — `revoke_object_url` via central `webidl::dom_string`; missing arg throws `TypeError`; abrupt conversion propagates; converted strings revoke silently | `m6_blob_url.rs::revoke_webidl_conversion`, `::create_revoke_semantics` (missing-arg case) |
 | M6-RW-R3 | symmetric clone encode bounds | `clone.rs` — `serialized_blob` enforces `MAX_CLONE_STRING_BYTES`; `encode` runs `validate_payload` (bytes/strings/count/total, checked) before any byte; format unchanged | `blob_url.rs::clone_encode_bounds_are_symmetric`; `m6_structured_clone.rs::clone_host_path_enforces_blob_media_type_bound` |
 | M6-RW-R4 | redacted key identity | `blob_url.rs` — manual redacted `Debug` for `EnvironmentKey` (origin visible; partition/nonce `<redacted>`); `Eq`/`Hash` unchanged | `blob_url.rs::url_key_debug_redacts_partition_and_nonce` |
+
+## M7-WPT — deterministic harness over the pinned adapted subset (`boa_fapi_wpt`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-WPT-01 | pinned corpus, SHA-256 and manifest completeness | `crates/boa_fapi_wpt/src/manifest.rs` — `load_manifest` (schema 1, pinned commit hex, per-file SHA-256, exact subtests, dup-path rejection, depth/array/number/string bounds); `src/main.rs` — `verify_hashes` before execution, mismatch is a launch error | `manifest::tests::accepts_pass_manifest`, `::rejects_bad_schema_and_bad_hash`, `::rejects_deep_nesting_surrogate_and_dup_path`; strict CLI run on `wpt-manifest.json` (7 files / 38 subtests, all PASS) |
+| M7-WPT-02 | `.any.js`/JS-only adaptation in a real Boa Context | `src/harness.rs` — `prelude_source` (no upstream fetch/DOM); `src/runner.rs` — `run_file` (fresh `Context` + `FileApiExtension` per file); `corpus/*.js` adapted subsets | `blob-constructor` (11), `blob-slice` (5), `file-constructor` (5), `filelist-section` (2), `bloburl-create-revoke` (6) subtests via `--strict` |
+| M7-WPT-03 | assertions, async/promise tests, job pump and timeout | `src/harness.rs` — `test`/`async_test`/`promise_test`, assertions, `done`/`step`; `src/runner.rs` — bounded `run_jobs()` pump (64 passes + wall guard), `TIMEOUT` vs JS-failure split | `reading-data-section` (5, `promise_test`), `filereader-read` (4), `runner::tests::passing_file_maps_to_pass`, `::failing_assertion_maps_to_fail` |
+| M7-WPT-04 | deterministic statuses and JSON/JUnit output | `src/report.rs` — `to_json`/`to_junit` (manifest order, fixed keys, no timestamps/paths/secrets; `scrub_detail` redacts `blob:`) | `report::tests::strict_gate_needs_exact_match`, `::json_and_junit_escape_deterministically`; `--json`/`--junit` strict artifacts in CI |
+| M7-WPT-05 | exact expectations and strict unexpected-result gate | `src/manifest.rs` — exact entries, no wildcards, `MissingReason`/expiry load errors; `src/report.rs` — `strict_pass` (unexpected rows break strict) | `manifest::tests::rejects_unknown_status_and_wildcards`, `::rejects_missing_reason_and_expired_review`; strict CLI exit non-zero on any mismatch |
+
+## M7-RACE — deterministic race matrix (`boa_fapi`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-RACE-01 | FileReader abort/stale completion/quota races | `crates/boa_fapi/tests/abort_races.rs` — abort before first chunk, abort between progress events, stale-after-restart, 64+1 quota with recovery | `::abort_before_first_chunk_reports_abort_loadend`, `::abort_between_progress_events_suppresses_stale_load`, `::stale_completion_after_new_operation_is_noop`, `::concurrent_read_quota_recovers` |
+| M7-RACE-02 | URL revoke/resolve and context shutdown races | `abort_races.rs` — revoke-before/after-resolve with live Arc reads, shutdown with pending promise/reader (no late settlement, late creation rejected) | `::revoke_before_and_after_resolve`, `::context_shutdown_settles_nothing_late` |
+| M7-RACE-03 | filesystem snapshot mutation and UTF-8 boundary matrix | `abort_races_fs.rs` — post-creation mutation → mapped `DOMException`, never partial bytes (Unix live / non-Unix copy); `abort_races.rs` — `i64::MIN/MAX`/empty/reversed slices, multibyte sizes, BOM strip | `::filesystem_mutation_after_creation`, `::slice_and_utf8_boundary_matrix`, `::worker_environment_sync_without_jobs` |
+
+## M7-HARD — leak/repeat, differential/fuzz/bench, CI/nightly (`boa_fapi`, `boa_fapi_wpt`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-HARD-01 | leak/repeat tests and no late JS settlement | `crates/boa_fapi/tests/hardening_hooks.rs` — `leak_repeat` (8× create/revoke/shutdown cycles, counts to zero, fresh contexts isolated) | `hardening_hooks::leak_repeat` |
+| M7-HARD-02 | bounded differential/fuzz/bench hooks | `hardening_hooks.rs` — `differential_smoke` (Node when present else skip-with-reason), `fuzz_decode_bounded` (fixed seed, 64 KiB cap, 512 cases), `bench_smoke` (clone/resolve medians, informational) | `hardening_hooks::differential_smoke`, `::fuzz_decode_bounded`, `::bench_smoke` |
+| M7-HARD-03 | CI matrix, SBOM artifact and scheduled nightly checks | `.github/workflows/ci.yml` (M7 steps + SBOM artifact), `.github/workflows/nightly.yml` (scheduled fuzz/miri-shape runs, visible failures) | CI Ubuntu + Windows strict run; nightly schedule |
+
+## M7-DOC — documentation
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M7-DOC-01 | WPT/spec-delta/README/changelog documentation | `docs/wpt.md`, `docs/spec-delta.md`, `README.md` (M7 scope), `CHANGELOG.md`, `QUESTIONS.md` (supply decision), `docs/DECISIONS.md` (ADR-0033 harness deps) | `cargo doc --workspace --no-deps` (`-Dwarnings`); reproduced strict run from docs alone |
+
+## M7-RW — rework findings F1–F11 (`docs/reviews/M7-rework.md`)
+
+| ID | Fixed boundary | Code | Test |
+|---|---|---|---|
+| M7-REWORK-F1 | strict+filter launch error | `main.rs` — `run` rejects `--strict` with `--filter` before manifest read | boundary: `--strict --filter` → exit 2 `--filter cannot be combined with --strict` |
+| M7-REWORK-F2 | corpus_root + strict path scheme | `manifest.rs` — `corpus_root` field, `check_logical_path`/`check_corpus_root`/`resolve_corpus_path` (Path join, canonicalize, strict containment, symlink rejection); `main.rs` — `verify_hashes` over raw bytes | boundary: `../`, absolute, backslash, NUL, non-`.js`, symlink, outside-root → launch error exit 2; only logical `file.path` in details |
+| M7-REWORK-F3 | actual NOTRUN end to end | `runner.rs` — `ActualStatus::NotRun`; `report.rs` — enum-compared `strict_pass`, JSON `NOTRUN`, JUnit `<skipped>`; `main.rs` — separate summary count | boundary: expected NOTRUN → JSON/JUnit actual NOTRUN + skipped; `report::tests::strict_gate_needs_exact_match` (all four statuses) |
+| M7-REWORK-F4 | async/job errors are FAIL | `harness.rs` — `record_once`/`safe_error`/`run_step`, step-wrapped `test`/`async_test`/`promise_test` (cleanup/double-done/throwing-callback FAIL); `runner.rs` — job-error flag, top-level throw fails every row | boundary: async assertion throw → FAIL (never TIMEOUT); `runner::tests` + strict corpus prove it |
+| M7-REWORK-F5 | process isolation + wall kill | `main.rs` — `--worker-file <index>` (validated ID only), `current_exe` spawn, bounded stdout/stderr, `Child::kill` at deadline → `TIMEOUT`, `run_file` kept as library mapping | boundary: self-scheduling file → TIMEOUT, parent continues next file; worker exit/output corruption → TIMEOUT |
+| M7-REWORK-F6 | threads N with ordered output | `main.rs` — `run_files_parallel` (min(N, files) slots, index-chunked isolated workers, `BTreeMap` re-sort); no `Context` crosses threads | boundary: `--strict --threads 2` exit 0 with SHA-256-identical JSON to `--threads 1` |
+| M7-REWORK-F7 | failure mapping without masking | `runner.rs`/`main.rs`/`report.rs` — launch error (manifest/path/hash/parser, prelude, readback) vs FAIL rows (top-level throw poisons file, job error poisons rows) vs TIMEOUT (pump budget, kill, overflow) vs NOTRUN (clean gap) | `strict_pass` enum comparison; empty results impossible (missing rows are TIMEOUT/FAIL, never skipped) |
+| M7-REWORK-F8 | manifest completeness + schema hardening | `manifest.rs` — required `corpus_root`, HTTPS WPT repository, group allow-list + all-six-groups gate, full per-subtest records, real calendar `review_by`, duplicate-key rejection, path/name/meta/corpus/timeout limits | `manifest::tests::*` (schema/hash/status/wildcard/reason/expiry/depth/surrogate/dup-path) |
+| M7-REWORK-F9 | report secrecy | `runner.rs` — `scrub_detail`/`scrub_token` (blob:/file/HTTP/drive/UNC/abs paths, controls, 480-scalar/48-token char-boundary cap); `report.rs` — XML 1.0 illegal-char filtering | `runner::tests::scrubber_*`, `report::tests::serializer_checks_*` (quote/amp/NUL/Unicode/blob-in-token/Win+Unix paths, JSON round-trip) |
+| M7-REWORK-F10 | no blanket clippy allow | `boa_fapi_wpt/src/lib.rs` — crate-wide `allow(clippy::expect_used)` removed; per-`#[cfg(test)]`-module allows only | `cargo clippy --workspace --all-targets --all-features -- -D warnings` green |
+| M7-REWORK-F11 | CI/nightly wiring | `ci.yml` — job renamed M7 validation, M7 order comment, full-manifest strict + threads-2 + JSON report check, artifacts after generation; `nightly.yml` — Ubuntu nightly+miri bounded lib run, fixed-seed fuzz with timeout, Windows compatible-only note, explicit SKIP reasons | CI Ubuntu + Windows (awaiting owner verification); nightly schedule |
+
+## M7-RW2 — rework-2 findings F12–F17 (`docs/reviews/M7-rework-2.md`)
+
+| ID | Fixed boundary | Code | Test |
+|---|---|---|---|
+| M7-REWORK-2-F12 | hard timeout for default CLI | `main.rs` — every CLI file execution (threads 1 included) via `run_file_isolated` with wall kill; `run_file` stays library-only mapping | boundary: full strict exit 0 via isolated children (38 passed); threads 1/2 identical SHA-256 JSON |
+| M7-REWORK-2-F13 | typed worker protocol | `main.rs` — `WORKER-OK` (verified row) / `WORKER-TIMEOUT` (reserved) / `WORKER-ERROR register\|prelude\|readback\|file-eval\|protocol`; kill/crash/overflow/corruption → `TIMEOUT`; register/prelude/readback → CLI launch error exit 2; file-eval → FAIL rows; single-line/UTF-8/size/ID verification | boundary: `--worker-file 99` → exit 2 index range; corrupt output → TIMEOUT |
+| M7-REWORK-2-F14 | duplicate JSON keys rejected | `manifest.rs` — recursive `DuplicateJsonKey(key)` (root/source/files/subtests; key name only) | `manifest::tests::rejects_duplicate_json_keys_recursive` (root/source/subtest, mixed types) |
+| M7-REWORK-2-F15 | embedded URL/path scrubbing | `runner.rs` — `scrub_token` matches `blob:`/`file:`/HTTP(S)/drive/UNC/abs-Unix anywhere in token, punctuation-preserving, host-kept HTTP(S) | `runner::tests::scrubber_redacts_paths_and_controls`, `report::tests::serializer_checks_*` (url=, parens, drive-comma, UNC-parens, 480-scalar Unicode, controls, round-trip) |
+| M7-REWORK-2-F16 | exact repository identity | `manifest.rs` — exact canonical URL equality (prefix-match retired) | `manifest::tests::rejects_malicious_repository_and_bad_subtest_collision` (wpt-malicious/path/query/fragment/userinfo/http/slash + canonical valid) |
+| M7-REWORK-2-F17 | subtest collision banned in file | `manifest.rs` — per-file `seen_names`, `DuplicateSubtest` (variant A, protocol unchanged) | same test: in-file collision → error, cross-file reuse → ok; stock manifest loads |
