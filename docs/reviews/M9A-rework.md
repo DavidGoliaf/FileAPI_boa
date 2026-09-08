@@ -1,134 +1,100 @@
-# M9-A rework handoff — conformance rework (P0-1/2/3 + iterator + FileList)
+# M9-A acceptance remediation report
 
 | Поле | Значение |
 |---|---|
-| ID | `M9-A-REWORK-CONFORMANCE` (дополнение к `M9-A-WEBIDL-REGISTRATION`) |
-| База | `master` at `1519c3c0edc6dcbac7330ef16ba410e3eb9ac564`, продолжение ветки `task/m9a` |
-| Нормативная база | File API WD 23.08.2026; Web IDL; Encoding Standard; `tasks/18_TASK_M9A_REWORK_CONFORMANCE.md` |
-| Web IDL snapshot | `boa_engine 0.22.0` + `encoding_rs 0.8.35` (vendored, `Encoding::for_label` + `new_decoder()` со sniffing); drift living standard после этой точки — новым решением в `spec-delta.md` |
+| ID | `M9-A-ACCEPTANCE-REMEDIATION` |
+| Branch | `task/m9a` |
+| Implementation baseline | `271af7552005d5543ae97cb908416c1258f4e57f` |
+| Scope | P0-A/P0-B/P0-C, P1-A/P1-B, traceability and stale-oracle cleanup |
+| Implementation commit | `d8d4dd7` — `Fix M9-A decoder and Web IDL conformance` |
+| Additional diff | `7 files changed, 615 insertions(+), 75 deletions(-)` from the implementation baseline |
 
-## Что исправлено (только границы rework-заказа)
+## Исправления
 
-- **P0-1 (M9A-RW-01).** `package::resolve_text_encoding` возвращает
-  `TextEncoding` (не `Option`): explicit label → MIME `charset` → UTF-8
-  через точный `get an encoding` (`Encoding::for_label`);
-  `replacement`-label резолвится и декодирует побайтово в U+FFFD.
-  Ранний `?` после неизвестного label удалён; fail-fast
-  `EncodingError`-ветки удалены из `filereader::read_as_text` и
-  `filereader_sync::read_bytes_sync`; async идёт обычным
-  start/read/load путём, sync возвращает строку.
-- **P0-2 (M9A-RW-02).** BOM-sniffing оставлен (`new_decoder()`, без
-  `without_bom_handling`, без provenance-флага, без ручного strip):
-  Decode заменяет любой fallback (explicit включительно) на UTF-8 /
-  UTF-16LE / UTF-16BE. Production-код не менялся; латентный пробел
-  закрыт sync+async тестами, включая split-BOM через 16 KiB chunk
-  границу FileReading jobs (sync/async byte-for-byte равны).
-- **P0-3 (M9A-RW-03/04).** Порядок `Blob(blobParts → options)`,
-  `File(fileBits → fileName → options)`; двухфазная модель
-  `ConvertedBlobPart { Bytes, Shared, Text }`: фаза 1 (открытый
-  итератор) — iterator walk + union conversion + conversion-time
-  snapshots BufferSource/USVString/brand + счётчик частей; фаза 2
-  (после всех аргументов) — `process_converted` с `endings` и итоговым
-  size-accounting. Сырые `JsValue` между фазами не хранятся.
-- **Iterator (M9A-RW-05).** `iterator_close_and_propagate` удалён из
-  normative path; никакого `return()` при abrupt `next`/`done`/
-  `value`/conversion и при quota-лимите. Negative-тесты: `return()`
-  не вызывается и не подменяет исходное исключение.
-- **FileList (M9A-RW-06).** `FileList.prototype[Symbol.iterator]` —
-  тот же function object, что `%Array.prototype.values%`
-  (`{writable:true, enumerable:false, configurable:true}`); borrowed
-  call — общая Array-семантика без FileList-бренда; `entries`/`keys`/
-  `values`/`forEach` не добавлены.
-- **Tracing.** Класс `encoding` сохранён только для завершившихся
-  `replacement`-label reads (sync+async `ok`→`encoding` на терминале);
-  fail-fast `EncodingError`-маппинг удалён. M8 oracle обновлены.
+1. `IncrementalDecoder` now loops over `CoderResult::OutputFull`, advances by
+   the decoder-reported input count, uses checked fallible output growth and
+   flushes pending output at EOF. Async and sync readers use the same result
+   path and map allocation failure to the existing controlled resource error.
+2. Packaging parses MIME type/subtype and parameters before using `charset`.
+   Token and quoted values, case-insensitive names and first duplicate policy
+   are covered. Label normalization removes only ASCII whitespace; lookup
+   failure falls through to MIME and UTF-8.
+3. `Blob` and `File` read `NewTarget.prototype` only after all argument
+   conversions. Sequence conversion tracks a checked conservative lower size
+   bound before the next iterator step and uses fallible vector growth; exact
+   accounting remains after options and line-ending processing.
+4. Regression tests assert actual BufferSource bytes, expanding UTF-16 and
+   large single-byte outputs, EOF replacement, MIME/event behavior, Proxy
+   order/precedence, exact quota boundaries and both UTF-8 split positions.
 
-## Переписанные oracle (нормативная причина каждого)
+## Trace rows
 
-- `m4_filereader_async::read_as_text_…`: unknown-label блок →
-  трёхкейсовый fallback-цикл (MIME→é, plain→A, bogus-MIME→é) с
-  `readyState===1` + `loadstart|progress|load|loadend` + `error===null`.
-  Причина: rework §3 — unknown label не исключение.
-- `::reentrant_error_handler_starts_new_read`: триггер — quota
-  `SecurityError` (64 filler + радикал), ожидание
-  `error:SecurityError|loadstart|progress|load|loadend`. Причина: тот же
-  fallback; `error`-реентрантность сохранена как путь.
-- `::bounded_operation_sequences_match_pure_model` + pure model:
-  `ReadBad`→`ReadAgain`, `TermKind::Error`/`ErrorRestart` удалены,
-  корпус `9×3×6`→`9×3×5`, coverage — load/abort (error-терминалы
-  покрыты quota/error suites). Причина: fail-fast пути больше нет.
-- `::dom_exception_names…`: `EncodingError` убран из конструкторного
-  списка (имя остаётся валидным для DOMException вообще). Причина:
-  ридеры его больше не производят.
-- `m4_filereader_sync::sync_text_matches…`: `assert_throws_dom` →
-  три fallback-assert'а. Причина: sync возвращает строку.
-- `m4_filereader_sync::throwing_label…`: комментарий «no EncodingError
-  exists anymore». Причина: инвариант rework.
-- `m8_observability` (2 теста): `encoding`-триггер — `csiso2022kr`
-  (replacement), `bogus-label-xyz` из секретов убран. Причина: класс
-  `encoding` теперь только для replacement-reads.
-- `m9_webidl_conformance`: IDL-02 переписан на `!closed`; quota-тест —
-  `!m9aClosed` + parts-first precedence; IDL-03 дубликат `{}` →
-  `toString:'\uD800'` (3 байта); TEXT — fallback + replacement asserts;
-  новые `m9a_rw_02` (×2), `m9a_rw_03`, `m9a_rw_04`; FLIST — value
-  iterator + `list[oob]===undefined` + дескриптор алиаса.
+`M9A-RW-07` through `M9A-RW-14` are listed with production and test/doc
+anchors in `docs/spec-matrix.md`. The MIME parser choice is recorded in
+ADR-0041. No new dependency was added.
 
-## Retrospective (rework)
+## Required commands and observed targeted results
 
-- Conversion order: аргументы слева направо до body; `endings`/MIME
-  только в processing; dictionary `endings`→`type` в Web IDL порядке;
-  BufferSource/USVString снапшотятся до side effects следующих
-  аргументов (тесты RW-03/04). Счётчик частей инкрементируется только
-  за принятую часть (throwing accessors счётчик не трогают — вся
-  конверсия всё равно падает).
-- Exception precedence: ранний аргумент финализирует ошибку; поздние
-  геттеры не читаются; `return()` не участвует ни в каком precedence.
-- Iterator closing: отсутствует по построению; quota — единый path.
-- GC roots: между фазами только `ConvertedBlobPart`
-  (`Bytes`/`Arc<BlobData>`/`String`) — без `JsObject`; итератор живёт
-  на стеке вызова.
-- Ошибочные старые oracle: `EncodingError`-fail-fast (M4×3, M8×2,
-  M9×1), `closed===true` (M9×6 asserts), «нет Symbol.iterator»
-  (M9 FLIST), options-first порядок (код) — все переписаны выше.
-
-## Demo (обязательная проверка rework §9)
+The following full and targeted commands completed successfully during this
+report:
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo test --package boa_fapi --test m9_webidl_conformance -- --nocapture
-cargo test --package boa_fapi --test m2_blob_file_filelist -- --nocapture
-cargo test --package boa_fapi --test m4_filereader_async -- --nocapture
-cargo test --package boa_fapi --test m4_filereader_sync -- --nocapture
-$env:RUSTDOCFLAGS='-Dwarnings'; cargo doc --workspace --no-deps
+cargo test -p boa_fapi --test m9_webidl_conformance -- --nocapture
+cargo test -p boa_fapi --test m4_filereader_async -- --nocapture
+cargo test -p boa_fapi --test m4_filereader_sync -- --nocapture
+$env:RUSTDOCFLAGS='-D warnings'; cargo doc --workspace --no-deps
 cargo deny check
 cargo hack check --feature-powerset --depth 2
-git diff --check
+git diff --check 271af7552005d5543ae97cb908416c1258f4e57f...HEAD
 ```
 
-Результаты — следующим прогоном перед передачей; targeted search
-(`EncodingError`-fail-fast, «FileList без Symbol.iterator»,
-«IteratorClose как requirement») — там же. M9-B не начат.
+The M9 suite reports 22 passing tests; M4 async reports 33 and M4 sync 21.
+The workspace test matrix, clippy, docs, cargo-deny, cargo-hack, formatting
+and diff checks all exited 0. Cargo-deny emitted only pre-existing warnings
+for missing crate license fields, duplicate transitive crates and one
+unmatched license allowance; its four check groups were `ok`. Cargo-hack
+emitted only pre-existing dead-code warnings for reduced feature sets.
 
-## Фактические результаты проверки (SHA рабочей ветки `task/m9a`)
+## Targeted-search classification
 
-- `cargo fmt --all -- --check` — чисто.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — чисто.
-- `cargo test --workspace --all-features` — все сюиты зелёные
-  (m9: 16 passed; m4a: 33; m4s: 21; m2: 51; m8 tracing: 5).
-- `m9_webidl_conformance -- --nocapture` / m2 / m4a / m4s — зелёные
-  по отдельности.
-- `cargo doc --workspace --no-deps` (`RUSTDOCFLAGS=-Dwarnings`) — чисто.
-- `cargo deny check` — advisories/bans/licenses/sources ok (только
-  pre-existing duplicate-version warnings).
-- `cargo hack check --feature-powerset --depth 2` — без errors
-  (только pre-existing dead_code warnings в урезанных комбинациях).
-- `git diff --check` — чисто (только CRLF-предупреждения Git).
-- Targeted search: `resolve_label` / `for_label_no_replacement` /
-  fail-fast-`EncodingError` / `iterator_close` / `IteratorClose`-как-
-  requirement / «FileList без Symbol.iterator» — отсутствуют
-  (остались только намеренные `!closed`-negative asserts и
-  исторические тексты в `tasks/` + superseded-пометки в ADR/spec-delta).
-- Совокупный M9-A diff: ~970 строк production+tests+docs (лимит 3000,
-  generated reports не учитываются).
+The required search was run over `crates docs tasks`. Any remaining matches
+are classified as follows:
+
+- `tasks/05_TASK_FILEREADER_ASYNC.md`, `tasks/06_TASK_FILEREADER_SYNC.md`,
+  `tasks/11_TASK_CONFORMANCE_REMEDIATION_PLAN.md` and related task files are
+  historical scope/plan text for earlier work orders, not current
+  implementation oracles.
+- `docs/m4a-final-audit.md` and older ADR entries in `docs/DECISIONS.md` are
+  historical audit/decision evidence, not the M9-A acceptance oracle.
+- `crates/boa_fapi/tests/m9_webidl_conformance.rs` uses iterator protocol
+  names as executable JavaScript and documents the required value iterator;
+  these are current tests, not stale requirements.
+- `crates/boa_fapi/src/streams.rs` and `crates/boa_fapi_wpt/src/manifest.rs`
+  contain unrelated current comments using `per byte`; they do not describe
+  the FileReader packaging decoder.
+- Current production comments and current tests describe fallback/decoder
+  semantics without asserting a superseded error path. No defect was found.
+
+No targeted stale assertion remains in `docs/reviews/M9A-handoff.md` or this
+report. This classification is intentionally not a claim that historical task
+documents contain no old wording.
+
+## Retrospective bug find
+
+Review of the changed paths checked output-full progress, EOF flushing,
+quoted/invalid MIME cases, non-ASCII label whitespace, constructor exception
+precedence, no iterator closing on conversion quota, exact-limit acceptance,
+line-ending lower-bound conservatism, byte snapshots and split-chunk output.
+The targeted suites passed after those checks. No implementation outside the
+listed M9-A remediation scope was started.
+
+## External acceptance evidence
+
+The required CI runs for both project platforms were not available from this
+workspace: the implementation commit was not pushed and no external run IDs
+or links can be recorded. This remains the sole acceptance blocker. The
+current implementation is otherwise ready for independent CI-backed
+re-acceptance; M9-B remains outside this work order.

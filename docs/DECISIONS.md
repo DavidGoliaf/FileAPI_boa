@@ -878,3 +878,21 @@ Web IDL snapshot для rework: `boa_engine 0.22.0` (sequence/iterator
 
 Последствия: trace rows M9A-RW-01…06; совокупный M9-A diff — см.
 rework-handoff.
+
+## ADR-0041 (M9-A acceptance remediation): local MIME parser
+
+Контекст: MIME `charset` нельзя извлекать ad hoc-разделением строки по
+`;`: сначала требуется успешный parse type/subtype и параметров, включая
+quoted values, case-insensitive names и duplicate policy. Новая внешняя
+зависимость не нужна для ограниченного packaging surface.
+
+Решение: использовать небольшой локальный parser в
+`crates/boa_fapi/src/package.rs`. Он проверяет ASCII MIME grammar,
+поддерживает token/quoted parameter values, выбирает первый duplicate
+parameter и возвращает charset только после успешного parse. `mime`/прочие
+crate не добавляются: они были бы шире текущего surface, не дают выигрыша
+для этой фиксированной операции и потребовали бы license/maintenance gate.
+
+Последствия: `Blob.type` по-прежнему нормализуется существующим M1 helper,
+а packaging отдельно валидирует MIME syntax перед charset fallback; Cargo
+граф и `cargo-deny` остаются без новых зависимостей.

@@ -1,123 +1,70 @@
-# M9-A handoff — Web IDL constructors, text packaging, registration identity
-
-> SUPERSEDED в части encoding/порядка/iterator/FileList документом
-> `docs/reviews/M9A-rework.md` и ADR-0040. Исторический текст ниже
-> сохранён без изменений, кроме этой пометки (требование rework-заказа
-> §8: исторические handoff не переписываются, неверные заявления
-> исправлены в rework-handoff).
+# M9-A handoff — current acceptance state
 
 | Поле | Значение |
 |---|---|
-| ID | `M9-A-WEBIDL-REGISTRATION` |
-| База | `master` at `1519c3c0edc6dcbac7330ef16ba410e3eb9ac564` |
+| ID | `M9-A-ACCEPTANCE-REMEDIATION` |
 | Ветка | `task/m9a` |
+| Implementation baseline | `271af7552005d5543ae97cb908416c1258f4e57f` |
+| Implementation commit | `d8d4dd7` — `Fix M9-A decoder and Web IDL conformance` |
+| Scope | decoder completeness, MIME parsing, Web IDL constructor order, bounded sequence preflight, snapshot/BOM regressions |
 
-## Что построено
+## Реализация
 
-- `webidl::convert_parts` — единый нормативный `sequence<BlobPart>`
-  конвертер для `Blob` и `File`: `GetMethod(V, @@iterator)` один раз,
-  primitive string — conversion error, boxed `String`/`TypedArray`-
-  as-sequence итерируются, `next` → `done` → `value` слева направо,
-  abrupt completion закрывает итератор (`return()`-precedence) без
-  подмены класса/сообщения, quota (`max_parts`/`max_blob_size`)
-  проверяется до накопления — бесконечный итератор закрывается
-  детерминированной quota-ошибкой. Старые `blob_parts`/`collect_parts`
-  (array-only) удалены; `blob.rs`/`file.rs` используют один путь.
-- `process_part` — точная union-развилка: BufferSource (видимый
-  диапазон), branded Blob/File (shared), всё остальное — USVString/
-  `ToString`; forged brand — fallback; throwing `toString` —
-  abrupt rules; Symbol бросает собственный `TypeError`, BigInt
-  stringifies. Порядок наблюдаем и одинаков для Blob/File.
-- `package::resolve_text_encoding(label, media_type)` — единственная
-  функция выбора (explicit label → MIME `charset` через `mime_charset`
-  → UTF-8; BOM-sniff через `new_decoder()` переопределяет fallback;
-  malformed → U+FFFD; неизвестный пользовательский label — `None` →
-  `EncodingError`). `FileReader` и `FileReaderSync` вызывают её;
-  `resolve_label` удалён.
-- `RegistrationIdentity(u64)` — opaque токен (`AtomicU64`, `build()`
-  mint'ит, `Clone` сохраняет); `RegisteredSpecs` хранит identity первой
-  регистрации. Повтор той же identity — idempotent (handle на уже
-  зарегистрированное состояние); другая identity —
-  `AlreadyRegistered` без мутации; после `shutdown` та же identity
-  возвращает существующий закрытый handle (не живой runtime); разные
-  Context независимы.
-- `crates/boa_fapi/tests/m9_webidl_conformance.rs` — 12 тестов, trace
-  rows `M9A-IDL-01/02/03`, `M9A-TEXT-01`, `M9A-REG-01`, `M9A-FLIST-01`;
-  JS-матрица: Array/Set/generator/custom iterator/String object/
-  Uint8Array-as-sequence/proxy getters/throwing next+done+value+part/
-  early quota close/nested Blob+File/lone surrogates/object `toString`.
-- `FileList`: нового surface нет; regression через host object
-  (`length`, `item`, indexed props, descriptors, порядок, out-of-range
-  `null`, brand, нет constructor/`Symbol.iterator`/`entries`/`keys`/
-  `values`/`forEach`).
+- `package::IncrementalDecoder` обрабатывает `OutputFull`, продвигает вход по
+  фактически прочитанным байтам, fallibly расширяет UTF-8 output и flush'ит
+  pending output до завершения.
+- MIME `charset` читается только после успешного локального MIME parse:
+  type/subtype и параметры валидируются, quoted values поддерживаются,
+  duplicate parameters используют first-parameter-wins. Encoding labels
+  очищаются только от ASCII whitespace; неизвестный label продолжает fallback
+  MIME → UTF-8.
+- `Blob` и `File` выполняют все argument conversions до observable
+  `NewTarget.prototype`; phase-1 sequence conversion ведёт checked нижнюю
+  size-bound и fallible `Vec` growth. Финальный exact accounting остаётся в
+  processing после `endings`.
+- Snapshot regressions читают фактические bytes через `FileReaderSync`, а
+  UTF-8 split cases проверяют независимое ожидаемое содержимое для обоих
+  boundary positions.
+- `filereader.rs` и `filereader_sync.rs` изменены только для подключения
+  общего fallible decoder path и сохранения существующей async/sync error
+  mapping.
 
-## Изменённые oracle (нормативная причина каждого)
+## Traceability
 
-- `m2_blob_file_filelist::string_parts_and_usv_replacement`: бывшие
-  `TypeError` для `[123]`/`[null]`/`[{}]` переписаны на USVString-размеры
-  (3/4/15) + добавлены `[undefined]` (9), `[true]` (4); Symbol оставлен
-  `TypeError`. Причина: Web IDL union fallback `(BufferSource or Blob
-  or USVString)` — только Symbol/BigInt-исключения `ToString` не
-  stringify; простое удаление assertion не применялось.
-- `m2_blob_file_filelist::hostile_values_never_panic`: `Proxy`/`Date`/
-  `{length}` убраны из must-throw (теперь USVString-fallback и бросают
-  только при недоступном `toString`); остались `Symbol` и
-  `File(name={toString:null})` (неконвертируемый `toString`). Причина:
-  та же union-развилка.
-- `guards::sync_surface_is_bounded` (`package.rs must contain`):
-  `resolve_label` → `resolve_text_encoding` + `mime_charset`. Причина:
-  переименование единой функции выбора.
+`M9A-RW-07`…`M9A-RW-14` имеют production и test anchors в
+`docs/spec-matrix.md`. Новых crate dependencies нет; MIME parser decision
+зафиксирован в ADR-0041.
 
-## DECISIONS.md
+## Локальная проверка
 
-ADR-0036 (sequence), ADR-0037 (union), ADR-0038 (packaging+MIME),
-ADR-0039 (identity+shutdown). Новых зависимостей нет.
-
-## spec-delta.md
-
-Добавлен change-control раздел про MIME `charset`-шаг (ссылка на W3C WD
-packaging-data) + пометка о supersede array-only пункта 1. Исторические
-handoff не изменены.
-
-## Retrospective
-
-- Conversion order: `@@iterator` читается один раз до создания
-  итератора; `next`/`done`/`value` — слева направо; options (`endings`,
-  `type`, `lastModified`) парсятся после `fileBits`/`fileName` в
-  существующем порядке словаря; label конвертируется после
-  brand/argument checks — throwing getters наблюдаются в нормативном
-  порядке (тесты `*_read_once_and_left_to_right`, `*_order`).
-- Exception precedence: abrupt `next`/`done`/`value`/`toString`/`return`
-  не подменяются; throwing `return()` во время close выигрывает только
-  над нормальным завершением, оригинальный throw — над нормальным
-  `return()` (`iterator_close_and_propagate`; тест `return-boom` vs
-  `conv-boom`).
-- Iterator closing: quota/range-ошибки конверсии закрывают открытый
-  итератор до escape; бесконечный итератор закрывается (`m9aClosed`)
-  детерминированной `RangeError`.
-- GC roots: конвертер не хранит `JsObject` в native state; части
-  копятся в `PartsCollector` (`Bytes`/`Arc<BlobData>`), итератор живёт
-  только на стеке вызова — `force_collect` не требуется, утечек корней
-  нет.
-- Ошибочные старые oracle: array-only `blob_parts`, `TypeError` для
-  `123`/`null`/`{}`, отсутствие MIME-шага, правило (b) «каждый второй
-  вызов» — все исправлены выше с тестами; `EncodingError` для
-  неизвестного пользовательского label сохранён (тест sync-throw).
-
-## Demo
+Локальная command matrix:
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo test --package boa_fapi --test m9_webidl_conformance -- --nocapture
-$env:RUSTDOCFLAGS='-Dwarnings'; cargo doc --workspace --no-deps
+cargo test -p boa_fapi --test m9_webidl_conformance -- --nocapture
+cargo test -p boa_fapi --test m4_filereader_async -- --nocapture
+cargo test -p boa_fapi --test m4_filereader_sync -- --nocapture
+$env:RUSTDOCFLAGS='-D warnings'; cargo doc --workspace --no-deps
 cargo deny check
 cargo hack check --feature-powerset --depth 2
-git diff --check
+git diff --check 271af7552005d5543ae97cb908416c1258f4e57f...HEAD
 ```
 
-Все команды зелёные на `task/m9a` (deny: advisories/bans/licenses/
-sources ok; powerset без errors). Остановлен перед M9-B: I/O модель,
-Promise settlement, FileReader state machine, Streams и WPT runner не
-тронуты.
+Все локальные команды завершились с exit code 0; targeted suites дали 22
+M9, 33 M4 async и 21 M4 sync. `cargo deny` сообщил только существующие
+warnings (license fields/duplicate transitive crates), при этом его checks
+`advisories`, `bans`, `licenses` и `sources` — `ok`. `cargo hack` также
+завершился успешно с pre-existing dead-code warnings в feature-reduced
+комбинациях. Incremental diff реализации: 7 файлов, 615 insertions(+),
+75 deletions; лимит 3000 строк не превышен.
+
+CI evidence для текущего implementation commit не получено: commit не
+публиковался, external runs и ссылки отсутствуют. Это единственный
+оставшийся acceptance blocker; локальные результаты не выдаются за CI.
+
+## Stop boundary
+
+M9-B не начинался. После независимой повторной приёмки дальнейшие изменения
+делаются отдельным work order.

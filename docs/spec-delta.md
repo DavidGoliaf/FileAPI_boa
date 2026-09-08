@@ -46,7 +46,8 @@ extension as change control: it narrows no normative requirement, it
 only makes the MIME-type input observable that the WD already
 references. `FileReader` and `FileReaderSync` share the single
 `package::resolve_text_encoding` selector, so both emit identical
-strings. Historical handoffs are unchanged.
+strings. MIME charset extraction is gated by a successful MIME parse;
+syntactically invalid types do not contribute a charset.
 
 ## Superseded by M9-A (sequence contract)
 
@@ -57,24 +58,18 @@ strings stay conversion errors). The item is kept for history; the
 current contract is `crates/boa_fapi/tests/m9_webidl_conformance.rs`
 (`M9A-IDL-01`/`M9A-IDL-02`) and the M9-A handoff.
 
-## Change control (M9-A rework): `readAsText` label fallback
+## Change control (M9-A acceptance remediation)
 
-Rework decision per `tasks/18_TASK_M9A_REWORK_CONFORMANCE.md` §2–§3
-(change-control over the M9-A section above and over TZ §6.4): the
-explicit label selects the fallback encoding through Encoding Standard
-"get an encoding" (`Encoding::for_label`); an *unknown* explicit label
-is failure that falls through to the MIME `charset` step and then to
-UTF-8 — never `EncodingError` in `FileReader` or `FileReaderSync`.
-Labels resolving to the `replacement` encoding decode per byte to
-U+FFFD. BOM sniffing ("Decode") may replace *any* selected fallback,
-including an explicit label
-(see https://encoding.spec.whatwg.org/#decode and the File API
-packaging-data Text steps,
-https://w3c.github.io/FileAPI/#readAsText). The M4 `EncodingError`
-fail-fast oracle is retired (rewritten, not deleted). Web IDL snapshot
-for the rework: `boa_engine 0.22.0` iterator/sequence semantics as
-vendored in `~/.cargo` at rework time; living-standard drift after this
-point needs a new decision here.
+The explicit label uses Encoding Standard `get an encoding` with only
+leading/trailing ASCII whitespace removed. Failure of that lookup falls
+through to the MIME `charset` parameter and then UTF-8; the readers do not
+turn this fallback into a read error. MIME parsing validates type/subtype and
+parameters, supports quoted values, and uses the first duplicate parameter.
+The decoder keeps the Encoding Standard BOM authority and must consume all
+input/output across `OutputFull` and EOF flushes. Web IDL constructor
+conversion completes before `NewTarget.prototype` is read. Sequence phase 1
+uses a checked conservative size lower bound; exact accounting still occurs
+after options and `endings`.
 
 ## NOTRUN gaps (not divergences)
 
