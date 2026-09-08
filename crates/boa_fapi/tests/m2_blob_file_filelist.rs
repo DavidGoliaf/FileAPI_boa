@@ -38,8 +38,20 @@ fn setup() -> (Context, FileApiHandle) {
 
 fn setup_with_limits(max_blob_size: u64) -> Context {
     let mut context = Context::default();
+    // Narrow per-operation fixture: only the blob ceiling is tightened.
+    // The remaining ceilings keep defaults that satisfy the whole-config
+    // `validate()` (sync <= materialize, chunk <= materialize,
+    // materialize <= blob), so registration succeeds and the blob-size
+    // limit is enforced per operation by `from_segments`/`slice`.
+    // (Requires max_blob_size >= 64 KiB so the default chunk fits.)
+    assert!(
+        max_blob_size >= 64 * 1024,
+        "fixture blob ceiling must fit the default chunk size"
+    );
     let limits = boa_fapi_core::limits::FileApiLimits {
         max_blob_size,
+        max_materialize_bytes: max_blob_size,
+        max_sync_read_bytes: max_blob_size.min(32 * 1024 * 1024),
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
     let extension = FileApiExtension::builder()
@@ -925,12 +937,12 @@ fn host_blob_from_bytes() {
 
 #[test]
 fn blob_size_limit_fails_synchronously() {
-    let mut context = setup_with_limits(8);
+    let mut context = setup_with_limits(64 * 1024);
     let result = context.eval(Source::from_bytes(
         r"
         (() => {
             try {
-                new Blob([new Uint8Array(16).buffer]);
+                new Blob([new Uint8Array(64 * 1024 + 1).buffer]);
                 return 'no-throw';
             } catch (error) {
                 return error instanceof RangeError ? 'range' : error.name;
@@ -971,7 +983,7 @@ fn hostile_values_never_panic() {
 
 #[test]
 fn slice_of_blob_limit_enforced() {
-    let mut context = setup_with_limits(4);
+    let mut context = setup_with_limits(64 * 1024);
     let result = context.eval(Source::from_bytes(
         r"
         (() => {

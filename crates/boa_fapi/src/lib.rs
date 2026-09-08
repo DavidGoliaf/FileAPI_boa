@@ -54,6 +54,8 @@ mod brand;
 mod file;
 mod file_list;
 mod promise_read;
+#[cfg(feature = "streams-shim")]
+mod streams;
 mod webidl;
 
 mod tests;

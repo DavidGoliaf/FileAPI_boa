@@ -9,8 +9,8 @@ env:
   CARGO_DENY_DB_PATH: target/cargo-deny-advisories
 
 jobs:
-  m3a-validation:
-    name: M3-A validation (${{ matrix.os }})
+  m3-validation:
+    name: M3 validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M3-A §7, in order.
+      # Work order M3-B §7, in order.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -44,6 +44,9 @@ jobs:
 
       - name: cargo test (M3-A promise reads)
         run: cargo test --package boa_fapi --test m3_promise_blob_reads
+
+      - name: cargo test (M3-B blob streams)
+        run: cargo test --package boa_fapi --test m3_blob_streams
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps

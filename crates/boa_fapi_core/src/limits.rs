@@ -46,7 +46,12 @@ impl FileApiLimits {
     /// Validates that the limits form a consistent configuration.
     ///
     /// Returns `Err(FileApiError::ResourceLimit(..))` if any limit is zero,
-    /// or if the ordering constraints are violated.
+    /// if the stream chunk-size range (`16 KiB..=1 MiB`) is violated, or if
+    /// the ordering constraints are violated.
+    ///
+    /// Ordering means: `sync <= materialize <= blob` and
+    /// `chunk <= materialize`. This function reports the whole
+    /// configuration; it does not clamp or repair it.
     pub fn validate(&self) -> Result<(), FileApiError> {
         if self.max_blob_size == 0 {
             return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobSize));
@@ -76,6 +81,11 @@ impl FileApiLimits {
             return Err(FileApiError::ResourceLimit(ResourceLimitKind::BlobUrls));
         }
         if self.default_chunk_size == 0 {
+            return Err(FileApiError::ResourceLimit(
+                ResourceLimitKind::MaterializeBytes,
+            ));
+        }
+        if !(16 * 1024..=1024 * 1024).contains(&self.default_chunk_size) {
             return Err(FileApiError::ResourceLimit(
                 ResourceLimitKind::MaterializeBytes,
             ));

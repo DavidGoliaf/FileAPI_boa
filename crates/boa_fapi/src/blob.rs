@@ -173,7 +173,8 @@ pub(crate) fn init_prototype(
         )?;
     }
 
-    // slice: writable, non-enumerable, configurable method.
+    // slice/text/arrayBuffer/bytes/stream: writable, non-enumerable,
+    // configurable methods.
     for (name, method) in [
         (js_string!("slice"), NativeFunction::from_fn_ptr(slice)),
         (
@@ -187,6 +188,16 @@ pub(crate) fn init_prototype(
         (
             js_string!("bytes"),
             NativeFunction::from_fn_ptr(crate::promise_read::bytes),
+        ),
+        #[cfg(feature = "streams-shim")]
+        (
+            js_string!("stream"),
+            NativeFunction::from_fn_ptr(crate::streams::stream),
+        ),
+        #[cfg(feature = "streams-shim")]
+        (
+            js_string!("textStream"),
+            NativeFunction::from_fn_ptr(crate::streams::text_stream),
         ),
     ] {
         let function = boa_engine::object::FunctionObjectBuilder::new(context.realm(), method)

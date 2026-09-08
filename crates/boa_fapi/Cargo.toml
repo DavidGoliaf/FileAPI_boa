@@ -16,5 +16,9 @@ boa_fapi_core = { path = "../boa_fapi_core", version = "0.1.0" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+default = ["streams-shim"]
+streams-shim = []
+
 [dev-dependencies]
 proptest = { workspace = true }
