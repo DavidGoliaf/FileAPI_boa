@@ -31,13 +31,13 @@ use boa_engine::object::builtins::JsArrayBuffer;
 use boa_engine::property::{PropertyDescriptor, PropertyKey};
 use boa_engine::{JsData, JsResult, JsString, JsSymbol, js_string};
 use boa_fapi_core::blob::{BlobData, BlobReader};
-use boa_fapi_core::error::ResourceLimitKind;
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_gc::{Finalize, Trace};
 
 use crate::brand;
 use crate::dom::{self, ListEntry};
 use crate::error::type_error;
+use crate::package::{IncrementalDecoder, TextEncoding, resolve_label};
 use crate::webidl::dom_string;
 
 /// Constructor/prototype pair installed as the `FileReader` global.
@@ -273,34 +273,6 @@ struct DispatchState {
     terminal: Option<TerminalKind>,
 }
 
-/// Supported text encodings for `readAsText`: the Encoding Standard label
-/// resolved through the fixed `encoding_rs` dependency.
-#[derive(Clone, Copy, Debug)]
-struct TextEncoding {
-    /// The resolved Encoding Standard encoding.
-    encoding: &'static encoding_rs::Encoding,
-    /// Whether the input starts with that encoding's BOM (UTF-8 only in
-    /// this shim: `encoding_rs` strips the BOM when sniffing is enabled).
-    strip_utf8_bom: bool,
-}
-
-/// Incremental decoder state for `readAsText`.
-///
-/// Wraps an `encoding_rs::Decoder`; `push` feeds one chunk and returns the
-/// decoded prefix, `finish` flushes with `last = true`. Malformed sequences
-/// decode with replacement, never as an exception. Split multibyte
-/// sequences stay buffered inside the decoder, never emitted as U+FFFD
-/// early. A leading UTF-8 BOM is stripped once (Encoding Standard BOM
-/// handling) when the operation uses UTF-8 decoding.
-struct IncrementalDecoder {
-    /// The underlying `encoding_rs` decoder.
-    decoder: Option<encoding_rs::Decoder>,
-    /// Whether the decoder already finished.
-    finished: bool,
-    /// Whether the leading UTF-8 BOM was already consumed.
-    bom_consumed: bool,
-}
-
 /// Per-`Context` FIFO FileReading task state: plain numbers only, no GC
 /// pointers, so no tracing is required.
 #[derive(Debug)]
@@ -401,34 +373,6 @@ fn blob_arg(args: &[JsValue]) -> JsResult<Arc<BlobData>> {
     brand::require_blob(&args[0])
 }
 
-/// Resolves an encoding label.
-///
-/// Returns `None` for an unknown or unsupported label: the caller fails the
-/// operation through the `error` path with `EncodingError` and no partial
-/// result. `None` (absent label) defaults to UTF-8.
-fn resolve_label(label: Option<&str>) -> Option<TextEncoding> {
-    let Some(label) = label else {
-        return Some(TextEncoding {
-            encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
-        });
-    };
-    if label.trim().is_empty() {
-        return Some(TextEncoding {
-            encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
-        });
-    }
-    // `for_label_no_replacement` maps unknown labels and the `replacement`
-    // encoding itself to `None`: both terminate with `EncodingError`.
-    encoding_rs::Encoding::for_label_no_replacement(label.trim().as_bytes()).map(|encoding| {
-        TextEncoding {
-            encoding,
-            strip_utf8_bom: encoding == encoding_rs::UTF_8,
-        }
-    })
-}
-
 /// Starts a read operation: the shared synchronous preamble.
 ///
 /// Validates the brand and the Blob argument first (failures leave the
@@ -520,11 +464,7 @@ fn start_read(
                 loadstart_sent: false,
                 buffered: Vec::new(),
                 text: String::new(),
-                decoder: IncrementalDecoder {
-                    decoder: None,
-                    finished: false,
-                    bom_consumed: false,
-                },
+                decoder: IncrementalDecoder::new(),
                 final_progress_sent: false,
             }),
         },
@@ -669,18 +609,12 @@ fn read_as_data_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> 
             context,
         );
     }
-    // Checked Data-URL length: `data:<type>;base64,<payload>` must fit
-    // `max_data_url_output` before any allocation. Base64 expands 3 bytes
-    // to 4 characters: `((size + 2) / 3) * 4`.
+    // Checked Data-URL length via the shared helper: the exact output
+    // must fit `max_data_url_output` before any allocation.
     let size = data.size();
-    let payload_len = size
-        .checked_add(2)
-        .and_then(|v| v.checked_div(3))
-        .and_then(|v| v.checked_mul(4));
-    let prefix_len = u64::try_from(media_type.len().saturating_add("data:;base64,".len())).ok();
-    let total_len =
-        payload_len.and_then(|payload| prefix_len.and_then(|prefix| payload.checked_add(prefix)));
-    if total_len.is_none_or(|total| total > limits.max_data_url_output) {
+    if crate::package::data_url_len(&media_type, size)
+        .is_none_or(|total| total > limits.max_data_url_output)
+    {
         return fail_fast(
             &object,
             size,
@@ -961,7 +895,7 @@ fn finish_at_eof(
     let result = match kind {
         ReadKind::ArrayBuffer => FileReaderResult::Bytes(buffered),
         ReadKind::BinaryString => {
-            FileReaderResult::BinaryString(buffered.iter().map(|byte| char::from(*byte)).collect())
+            FileReaderResult::BinaryString(crate::package::package_binary_string(&buffered))
         }
         ReadKind::Text => {
             let tail = decoder.finish(&encoding);
@@ -970,26 +904,12 @@ fn finish_at_eof(
             FileReaderResult::Text(text)
         }
         ReadKind::DataUrl => {
-            let payload =
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buffered);
-            let prefix = if media_type.is_empty() {
-                String::from("data:;base64,")
-            } else {
-                format!("data:{media_type};base64,")
-            };
-            let total_len = prefix.len().saturating_add(payload.len());
-            if total_len as u64 > data_url_limit {
-                return fail_operation(
-                    reader,
-                    generation,
-                    total,
-                    &FileApiError::ResourceLimit(ResourceLimitKind::DataUrlOutput),
-                    context,
-                );
+            match crate::package::package_data_url(&media_type, &buffered, data_url_limit) {
+                Ok(out) => FileReaderResult::Text(out),
+                Err(error) => {
+                    return fail_operation(reader, generation, total, &error, context);
+                }
             }
-            let mut out = prefix;
-            out.push_str(&payload);
-            FileReaderResult::Text(out)
         }
     };
     // Success: set DONE + result, release the slot once, then dispatch
@@ -1251,56 +1171,6 @@ fn enqueue_listener_error(context: &mut Context, message: String) {
         realm,
     );
     context.enqueue_job(Job::from(generic));
-}
-
-impl IncrementalDecoder {
-    /// Feeds one chunk and returns the decoded prefix.
-    fn push(&mut self, encoding: &TextEncoding, chunk: &[u8]) -> String {
-        if self.decoder.is_none() {
-            self.decoder = Some(encoding.encoding.new_decoder_without_bom_handling());
-        }
-        let Some(decoder) = self.decoder.as_mut() else {
-            return String::new();
-        };
-        // `decode_to_string` with `last = false`: split multibyte sequences
-        // stay buffered inside the decoder, never emitted as U+FFFD early.
-        // The output `String` must have spare capacity: `decode_to_string`
-        // treats capacity as the output limit and never reallocates.
-        let mut out = String::with_capacity(chunk.len().saturating_add(8));
-        let (_, _, _) = decoder.decode_to_string(chunk, &mut out, false);
-        strip_leading_bom_once(encoding, &mut self.bom_consumed, &mut out);
-        out
-    }
-
-    /// Flushes the decoder at EOF (`last = true`).
-    fn finish(&mut self, encoding: &TextEncoding) -> String {
-        if self.finished {
-            return String::new();
-        }
-        self.finished = true;
-        if self.decoder.is_none() {
-            self.decoder = Some(encoding.encoding.new_decoder_without_bom_handling());
-        }
-        let Some(decoder) = self.decoder.as_mut() else {
-            return String::new();
-        };
-        let mut out = String::with_capacity(8);
-        let (_, _, _) = decoder.decode_to_string(b"", &mut out, true);
-        strip_leading_bom_once(encoding, &mut self.bom_consumed, &mut out);
-        out
-    }
-}
-
-/// Strips one leading U+FEFF once per UTF-8 operation (Encoding Standard
-/// BOM handling for `readAsText`). Non-UTF-8 encodings keep the character.
-fn strip_leading_bom_once(encoding: &TextEncoding, consumed: &mut bool, out: &mut String) {
-    if *consumed || !encoding.strip_utf8_bom {
-        return;
-    }
-    *consumed = true;
-    if out.starts_with('\u{FEFF}') {
-        out.drain(..'\u{FEFF}'.len_utf8());
-    }
 }
 
 /// The `readyState` getter.

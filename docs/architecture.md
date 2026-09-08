@@ -114,9 +114,32 @@ asynchronous `FileReader` state machine:
   split sequences, BOM); `readAsDataURL` checks `max_data_url_output`
   with checked arithmetic before allocation; memory stays O(chunk + final
   result); M3 promise/stream errors migrated once to the same central
-  `DOMException` mapping;
-- explicitly omitted M4-B features: `FileReaderSync`, workers, filesystem
-  sources, blob URLs, structured clone, full DOM/HTML, WPT harness.
+  `DOMException` mapping; the four packagers live in the shared private
+  `package.rs` so sync/async representations cannot diverge.
+
+### Layer 2e: `boa_fapi` worker-only `FileReaderSync` (M4-B)
+`filereader_sync.rs` owns the synchronous binding; `package.rs` owns the
+packaging shared with the async reader:
+
+- `FileApiEnvironment` (`Window` default, `DedicatedWorker`,
+  `SharedWorker`, `ServiceWorker`) is explicit host config stored in the
+  registered specs and handle; only the two worker descriptors build and
+  install the single `FileReaderSync` global (atomically, with the same
+  preflight/rollback contract); `Window`/`ServiceWorker` leave the name
+  untouched, and the descriptor is never inferred from threads or
+  callbacks;
+- `FileReaderSync` is a stateless brand with exactly four prototype
+  methods (`length` 1 each) plus the tag — no state, no `abort`, no
+  handlers, no Promise/EventTarget surface; every call runs to completion
+  on the calling stack with no jobs enqueued and no async-quota contact;
+- fixed preflight order (brand → argument → label → sync-size limit →
+  source read), `size > max_sync_read_bytes` as `QuotaExceededError`,
+  checked data-URL length before reads/allocation, bounded
+  `BlobData::materialize`, central `DOMException` mapping, no partial
+  result;
+- explicitly still omitted: `FileReaderSync` in window/service workers,
+  filesystem-backed sources, snapshot validation, blob URLs, structured
+  clone, full DOM/Workers runtime, WPT harness, M5.
 
 ### Layer 3: Host adapters (future M5+)
 

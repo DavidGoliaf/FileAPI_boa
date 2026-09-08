@@ -355,3 +355,51 @@ for_label_no_replacement` + инкрементальный `Decoder::decode_to_s
 
 Последствия: `cargo-deny` allow-list не меняется (MIT/Apache-2.0 уже
 разрешены); дерево расширяется минимально (без транзитивных deps).
+
+## ADR-0022 (M4-B): worker environment descriptor and sync registration
+
+Контекст: `FileReaderSync` по ТЗ §5.6 существует только в
+`DedicatedWorker`/`SharedWorker`; в `Window` имени нет, в
+`ServiceWorker` capability запрещена. Хост не должен выводить режим из
+потока и включать его автоматически; дефолт не должен менять M4-A
+поведение существующих пользователей.
+
+Решение: публичный `FileApiEnvironment`
+(`Window` default, `DedicatedWorker`, `SharedWorker`, `ServiceWorker`) +
+`FileApiExtensionBuilder::environment()`; дескриптор хранится в
+`ExtensionConfig`/`RegisteredSpecs`/`FileApiHandle` (есть
+`FileApiHandle::environment()`), никогда не выводится из thread ID, типа
+`Context` или callback'ов. Регистрация строит sync-спеки, префлайтует имя
+и устанавливает global только для worker-дескрипторов; иначе имя не
+появляется даже как `undefined`-shim. Конфликт имени, нерасширяемый
+global, повторная регистрация и выключенный `dom-shim` идут через
+существующий fail-fast/rollback contract (`rollback_globals` принимает
+флаг sync-режима). Без feature `dom-shim` sync-модуль не компилируется, и
+powerset остаётся зелёным.
+
+Последствия: явный хост-контроль capability без workers runtime;
+`Window`-дефолт сохраняет M4-A поверхность бит-в-бит (все M4-A тесты
+зелёные без изменений).
+
+## ADR-0023 (M4-B): shared sync/async packaging boundary
+
+Контекст: четыре представления обязаны совпадать у async `FileReader` и
+sync `FileReaderSync`; копирование алгоритмов грозит расхождением.
+Новых dependencies нет (`encoding_rs`, `base64` и core primitives
+переиспользуются), поэтому отдельный dependency-ADR не нужен.
+
+Решение: приватный `package.rs` — единственное место для
+`TextEncoding`/`resolve_label`/`IncrementalDecoder` (включая BOM strip и
+replacement), `decode_text` (целый вход через тот же push+finish),
+`package_binary_string`, `data_url_len` (checked arithmetic) и
+`package_data_url` (повторная проверка перед аллокацией). Async
+`filereader.rs` использует их инкрементально по чанкам, sync
+`filereader_sync.rs` — целиком после bounded `materialize`. Sync
+preflight фиксирован: brand → аргумент → label → `size >
+max_sync_read_bytes` (`QuotaExceededError`) → длина data-URL → чтение;
+чтений и аллокаций до preflight нет, async quota не затрагивается,
+partial result невозможен.
+
+Последствия: M4-A поведение не изменилось (вся M4-A сюита зелёная без
+правок тестов); sync ошибки идут через тот же центральный
+`DOMException` mapping.

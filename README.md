@@ -7,7 +7,7 @@ A Rust implementation of the [File API](https://www.w3.org/TR/FileAPI/) for the 
 | Crate | Purpose |
 |---|---|
 | `boa_fapi_core` | Platform-independent data model and algorithms (no Boa dependency) |
-| `boa_fapi` | Boa bindings: `Blob`, `File`, `FileList` (M2), promise reads (M3-A), streams shim (M3-B), DOM shim + async `FileReader` (M4-A); Web IDL conversions, brands, GC-safe native data |
+| `boa_fapi` | Boa bindings: `Blob`, `File`, `FileList` (M2), promise reads (M3-A), streams shim (M3-B), DOM shim + async `FileReader` (M4-A), worker-only sync `FileReaderSync` (M4-B); Web IDL conversions, brands, GC-safe native data |
 | `boa_fapi_fs` | Future filesystem-backed sources (M5+) |
 | `boa_fapi_wpt` | Future WPT test harness (M7+) |
 
@@ -79,8 +79,23 @@ context.run_jobs().expect("jobs failed");
   `FileApiExtensionBuilder::dom_shim(false)` or `--no-default-features`
   (registration then fails with `RegisterError::DomShimDisabled` before
   any `globalThis` mutation, since no host DOM adapter exists).
+- **M4-B (`boa_fapi`)**: worker-only synchronous `FileReaderSync` for
+  memory-backed `Blob`/`File`. The host selects the environment
+  explicitly with
+  `FileApiExtensionBuilder::environment(FileApiEnvironment::DedicatedWorker
+  | SharedWorker)` (default `Window` installs nothing new); only the two
+  worker descriptors install the normative `FileReaderSync`
+  (`readAsArrayBuffer`, `readAsBinaryString`, `readAsText`,
+  `readAsDataURL`, each fully synchronous, no `Promise`/events/jobs).
+  Every call preflights brand, size (`size > max_sync_read_bytes` throws
+  `QuotaExceededError`), and the checked data-URL length before any
+  source read or output allocation, then materializes through the bounded
+  core path and packages with the same helpers as the async reader, so
+  sync/async representations cannot diverge. Source failures throw the
+  same mapped `DOMException` with no partial result; the async
+  `max_concurrent_reads_per_global` quota is never touched.
 
-Not yet implemented (M4-B–M7): `FileReaderSync`, worker environments,
+Not yet implemented (M5–M7): worker environments beyond the descriptor,
 filesystem-backed sources, blob URLs, structured clone, full DOM/HTML,
 full WHATWG Streams (`pipeTo`, `tee`, BYOB, transformers), WPT harness.
 ## Building
@@ -106,3 +121,5 @@ Streams likewise settle only through `context.run_jobs()`:
 `cargo test --package boa_fapi --test m3_blob_streams`.
 `FileReader` events likewise fire only through `context.run_jobs()`:
 `cargo test --package boa_fapi --test m4_filereader_async`.
+`FileReaderSync` returns synchronously with no jobs involved:
+`cargo test --package boa_fapi --test m4_filereader_sync`.

@@ -192,6 +192,8 @@ fn internal_binding_modules_expose_no_public_items() {
         "streams.rs",
         "dom.rs",
         "filereader.rs",
+        "filereader_sync.rs",
+        "package.rs",
         "webidl.rs",
     ] {
         let content = read(&src.join(module));
@@ -215,7 +217,12 @@ fn lib_rs_denies_unsafe_and_limits_re_exports() {
     for exposed in [
         "pub use clock::{Clock, SystemClock};",
         "pub use error::RegisterError;",
-        "pub use extension::{FileApiExtension, FileApiExtensionBuilder, FileApiHandle, HostFileOptions};",
+        "pub use extension::{",
+        "FileApiEnvironment",
+        "FileApiExtension",
+        "FileApiExtensionBuilder",
+        "FileApiHandle",
+        "HostFileOptions",
     ] {
         assert!(lib.contains(exposed), "lib.rs must contain `{exposed}`");
     }
@@ -363,27 +370,127 @@ fn filereader_and_dom_surface_is_bounded() {
 }
 
 #[test]
-fn no_filereader_sync_or_out_of_scope_surface() {
-    // M4-B+ APIs (sync readers, workers, fs, URL/clone/WPT, full DOM) never
-    // appear in production sources. `dom.rs`/`filereader.rs` are the only
-    // modules allowed to mention `FileReader`, `EventTarget`, or
-    // `DOMException` in code.
+fn sync_surface_is_bounded() {
+    // M4-B registers exactly: the `FileReaderSync` global (worker
+    // environments only), four prototype methods with `length = 1`, and
+    // the `FileReaderSync` tag. No async state (`readyState`, `result`,
+    // `error`), no `abort`, no `on*` handlers, no Promise/EventTarget/job
+    // machinery, and no filesystem/URL/clone/full-DOM surface may appear
+    // in `filereader_sync.rs`. Shared packaging lives in `package.rs`,
+    // which carries no registration or scheduling code.
+    let sync = read(&workspace_root().join("crates/boa_fapi/src/filereader_sync.rs"));
+    for required in [
+        "\"FileReaderSync\"",
+        "\"readAsArrayBuffer\"",
+        "\"readAsBinaryString\"",
+        "\"readAsText\"",
+        "\"readAsDataURL\"",
+    ] {
+        assert!(
+            sync.contains(required),
+            "filereader_sync.rs must contain {required}"
+        );
+    }
+    for forbidden in [
+        "\"readyState\"",
+        "\"result\"",
+        "\"error\"",
+        "\"abort\"",
+        "\"onload\"",
+        "Promise",
+        "EventTarget",
+        "addEventListener",
+        "enqueue_job",
+        "run_jobs",
+        "GenericJob",
+        "PromiseJob",
+        "max_concurrent_reads",
+        "FileReaderSyncSync",
+        "DedicatedWorker(",
+        "std::fs",
+        "std::path",
+        "createObjectURL",
+        "structuredClone",
+        "CustomEvent",
+        "AbortSignal",
+        "tokio",
+        "std::thread",
+    ] {
+        let mut hits = 0;
+        for line in sync.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "filereader_sync.rs must not contain {forbidden}");
+    }
+    let package = read(&workspace_root().join("crates/boa_fapi/src/package.rs"));
+    for required in [
+        "resolve_label",
+        "decode_text",
+        "package_binary_string",
+        "package_data_url",
+        "data_url_len",
+    ] {
+        assert!(
+            package.contains(required),
+            "package.rs must contain {required}"
+        );
+    }
+    for forbidden in [
+        "FileReaderSync",
+        "FileReader",
+        "enqueue_job",
+        "run_jobs",
+        "Context",
+        "JsObject",
+        "JsValue",
+    ] {
+        let mut hits = 0;
+        for line in package.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "package.rs must not contain {forbidden}");
+    }
+}
+
+#[test]
+fn no_out_of_scope_surface() {
+    // M5+ APIs (filesystem, URL, clone, WPT, full DOM/workers runtime)
+    // never appear in production sources. `FileReaderSync` and the worker
+    // descriptors live only in `filereader_sync.rs` (surface) and
+    // `extension.rs` (capability wiring); every other module must not
+    // mention them.
     let src = workspace_root().join("crates/boa_fapi/src");
     for entry in walk_rs(&src) {
         let name = entry
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if name == "dom.rs" || name == "filereader.rs" || name == "extension.rs" {
+        // The sync surface, the capability wiring, and the public
+        // re-exports legitimately name the descriptor.
+        if name == "filereader_sync.rs" || name == "extension.rs" || name == "lib.rs" {
             continue;
         }
         let content = read(&entry);
         for forbidden in [
-            "\"FileReader\"",
-            "\"EventTarget\"",
-            "\"DOMException\"",
-            "FileReaderNative",
-            "DomExceptionNative",
+            "\"FileReaderSync\"",
+            "FileReaderSync",
+            "FileReaderSyncNative",
+            "DedicatedWorker",
+            "SharedWorker",
+            "ServiceWorker",
+            "FileApiEnvironment",
         ] {
             let mut hits = 0;
             for line in content.lines() {
@@ -404,22 +511,21 @@ fn no_filereader_sync_or_out_of_scope_surface() {
         }
     }
     // Out-of-scope APIs are absent everywhere, including the new modules.
-    // (`extension.rs` wires the FileReader constructor, so the literal
-    // global name there is covered by the M4-A integration suite.)
     let mut all = String::new();
     for entry in walk_rs(&src) {
         all.push_str(&read(&entry));
         all.push('\n');
     }
     for forbidden in [
-        "\"FileReaderSync\"",
-        "FileReaderSync",
-        "DedicatedWorker",
-        "SharedWorker",
-        "\"URL\"",
+        "createObjectURL",
+        "revokeObjectURL",
         "structuredClone",
         "CustomEvent",
         "AbortSignal",
+        "std::fs",
+        "std::path",
+        "tokio",
+        "std::thread",
     ] {
         let mut hits = 0;
         for line in all.lines() {
@@ -435,8 +541,8 @@ fn no_filereader_sync_or_out_of_scope_surface() {
     }
     let extension = read(&src.join("extension.rs"));
     assert!(
-        extension.contains("dom_shim") || extension.contains("dom"),
-        "extension must register the DOM shim"
+        extension.contains("environment"),
+        "extension must register the environment capability"
     );
 }
 

@@ -36,6 +36,42 @@ pub(crate) struct ExtensionConfig {
     /// Whether the M4-A DOM shim (`EventTarget`, `Event`, `ProgressEvent`,
     /// `DOMException`, `FileReader`) is registered.
     pub(crate) dom_shim: bool,
+    /// The host-controlled environment descriptor. Only worker descriptors
+    /// install `FileReaderSync`.
+    pub(crate) environment: FileApiEnvironment,
+}
+
+/// The host-controlled environment descriptor selecting which globals the
+/// registration installs.
+///
+/// The descriptor is an explicit host choice: it is never derived from the
+/// thread ID, the `Context` type, or the presence of a host callback. The
+/// default is [`FileApiEnvironment::Window`], so existing M4-A users get no
+/// new global without changing their configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileApiEnvironment {
+    /// A window-like environment: no `FileReaderSync` global is installed.
+    #[default]
+    Window,
+    /// A dedicated worker: the normative `FileReaderSync` is installed.
+    DedicatedWorker,
+    /// A shared worker: the normative `FileReaderSync` is installed.
+    SharedWorker,
+    /// A service worker: no `FileReaderSync` global is installed (the
+    /// service-worker capability is explicitly forbidden).
+    ServiceWorker,
+}
+
+impl FileApiEnvironment {
+    /// Returns `true` for the two worker descriptors that install the
+    /// normative `FileReaderSync`.
+    ///
+    /// Only meaningful with the `dom-shim` feature: without it no sync
+    /// surface exists to gate.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn file_reader_sync_enabled(&self) -> bool {
+        matches!(self, Self::DedicatedWorker | Self::SharedWorker)
+    }
 }
 
 /// The registered classes and configuration of a context.
@@ -56,6 +92,10 @@ pub(crate) struct RegisteredSpecs {
     /// FileReader constructor/prototype (present when the DOM shim is on).
     #[cfg(feature = "dom-shim")]
     pub(crate) filereader: Option<crate::filereader::FileReaderSpecs>,
+    /// `FileReaderSync` constructor/prototype (present only for worker
+    /// environment descriptors with the DOM shim on).
+    #[cfg(feature = "dom-shim")]
+    pub(crate) sync_reader: Option<crate::filereader_sync::FileReaderSyncSpecs>,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
 }
@@ -132,10 +172,24 @@ impl RegisteredSpecs {
             .unwrap_or_else(|| self.blob_proto())
     }
 
+    /// Returns the `FileReaderSync` interface prototype.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn sync_reader_proto(&self) -> JsObject {
+        self.sync_reader
+            .as_ref()
+            .map(|spec| spec.sync.prototype())
+            .unwrap_or_else(|| self.blob_proto())
+    }
+
     /// Returns the cloned DOM specs when the shim is registered.
     #[cfg(feature = "dom-shim")]
     pub(crate) fn dom_specs(&self) -> Option<crate::dom::DomSpecs> {
         self.dom.clone()
+    }
+
+    /// Returns the environment descriptor this context was registered with.
+    pub(crate) fn environment(&self) -> FileApiEnvironment {
+        self.config.environment
     }
 }
 
@@ -157,6 +211,7 @@ pub struct FileApiExtensionBuilder {
     limits: Option<FileApiLimits>,
     streams_shim: Option<bool>,
     dom_shim: Option<bool>,
+    environment: Option<FileApiEnvironment>,
 }
 
 impl FileApiExtensionBuilder {
@@ -196,6 +251,19 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Selects the host-controlled environment descriptor.
+    ///
+    /// Defaults to [`FileApiEnvironment::Window`]. Only
+    /// [`FileApiEnvironment::DedicatedWorker`] and
+    /// [`FileApiEnvironment::SharedWorker`] install the normative
+    /// `FileReaderSync`; `Window` and `ServiceWorker` install no such
+    /// global (not even an `undefined` shim). The descriptor is an
+    /// explicit host choice and is never inferred.
+    pub fn environment(&mut self, environment: FileApiEnvironment) -> &mut Self {
+        self.environment = Some(environment);
+        self
+    }
+
     /// Creates the extension.
     #[must_use]
     pub fn build(&self) -> FileApiExtension {
@@ -205,6 +273,7 @@ impl FileApiExtensionBuilder {
                 limits: self.limits.clone().unwrap_or_default(),
                 streams_shim: self.streams_shim.unwrap_or(true),
                 dom_shim: self.dom_shim.unwrap_or(true),
+                environment: self.environment.unwrap_or_default(),
             },
         }
     }
@@ -280,6 +349,14 @@ impl FileApiExtension {
         #[cfg(feature = "dom-shim")]
         let filereader_specs =
             crate::filereader::build_filereader_specs(context, dom_specs.event_target.prototype())?;
+        // `FileReaderSync` is built only for worker descriptors; window
+        // and service-worker contexts install no such global at all.
+        #[cfg(feature = "dom-shim")]
+        let sync_specs = if self.config.environment.file_reader_sync_enabled() {
+            Some(crate::filereader_sync::build_sync_specs(context)?)
+        } else {
+            None
+        };
         // Preflight: extensibility and every own global name.
         let global = context.global_object();
         if !global.is_extensible(context).map_err(RegisterError::Js)? {
@@ -288,6 +365,10 @@ impl FileApiExtension {
         let keys = global
             .own_property_keys(context)
             .map_err(RegisterError::Js)?;
+        // `FileReaderSync` participates in the preflight only when the
+        // worker capability installs it; otherwise the name is untouched.
+        #[cfg(feature = "dom-shim")]
+        let sync_enabled = self.config.environment.file_reader_sync_enabled();
         for name in [
             "Blob",
             "File",
@@ -312,6 +393,13 @@ impl FileApiExtension {
                 return Err(RegisterError::NameConflict(name.to_owned()));
             }
         }
+        #[cfg(feature = "dom-shim")]
+        if sync_enabled {
+            let key = PropertyKey::from(js_string!("FileReaderSync"));
+            if keys.contains(&key) {
+                return Err(RegisterError::NameConflict("FileReaderSync".to_owned()));
+            }
+        }
 
         // Install phase with rollback.
         if let Err(error) = install_globals(
@@ -324,8 +412,14 @@ impl FileApiExtension {
             &dom_specs,
             #[cfg(feature = "dom-shim")]
             &filereader_specs,
+            #[cfg(feature = "dom-shim")]
+            sync_specs.as_ref(),
         ) {
-            rollback_globals(context)?;
+            rollback_globals(
+                context,
+                #[cfg(feature = "dom-shim")]
+                sync_specs.is_some(),
+            )?;
             return Err(RegisterError::Js(error));
         }
 
@@ -339,6 +433,8 @@ impl FileApiExtension {
             dom: Some(dom_specs),
             #[cfg(feature = "dom-shim")]
             filereader: Some(filereader_specs),
+            #[cfg(feature = "dom-shim")]
+            sync_reader: sync_specs,
             config: self.config.clone(),
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
@@ -398,7 +494,8 @@ struct OrdinaryPrototype;
 /// writable, non-enumerable, configurable). `FileList` installs nothing.
 /// The streams shim installs `ReadableStream` and
 /// `ReadableStreamDefaultReader` the same way; the DOM shim installs
-/// `EventTarget`, `Event`, `ProgressEvent`, `DOMException` and `FileReader`.
+/// `EventTarget`, `Event`, `ProgressEvent`, `DOMException` and `FileReader`;
+/// worker environments additionally install `FileReaderSync`.
 fn install_globals(
     context: &mut Context,
     blob_spec: &StandardConstructor,
@@ -406,6 +503,7 @@ fn install_globals(
     #[cfg(feature = "streams-shim")] stream_specs: &crate::streams::StreamSpecs,
     #[cfg(feature = "dom-shim")] dom_specs: &crate::dom::DomSpecs,
     #[cfg(feature = "dom-shim")] filereader_specs: &crate::filereader::FileReaderSpecs,
+    #[cfg(feature = "dom-shim")] sync_specs: Option<&crate::filereader_sync::FileReaderSyncSpecs>,
 ) -> JsResult<()> {
     let global = context.global_object();
     for (name, constructor) in [
@@ -458,11 +556,30 @@ fn install_globals(
             context,
         )?;
     }
+    #[cfg(feature = "dom-shim")]
+    if let Some(sync) = sync_specs {
+        global.define_property_or_throw(
+            js_string!("FileReaderSync"),
+            PropertyDescriptor::builder()
+                .value(sync.sync.constructor())
+                .writable(true)
+                .enumerable(false)
+                .configurable(true),
+            context,
+        )?;
+    }
     Ok(())
 }
 
 /// Removes partially installed globals after a failed install.
-fn rollback_globals(context: &mut Context) -> Result<(), RegisterError> {
+///
+/// `remove_sync` mirrors the worker capability: when the failed
+/// registration would have installed `FileReaderSync`, its name is rolled
+/// back as well; otherwise the name is left untouched.
+fn rollback_globals(
+    context: &mut Context,
+    #[cfg(feature = "dom-shim")] remove_sync: bool,
+) -> Result<(), RegisterError> {
     let global = context.global_object();
     for name in [
         "Blob",
@@ -487,6 +604,12 @@ fn rollback_globals(context: &mut Context) -> Result<(), RegisterError> {
         // reported error then reflects the rollback failure.
         global
             .delete_property_or_throw(js_string!(name), context)
+            .map_err(RegisterError::Js)?;
+    }
+    #[cfg(feature = "dom-shim")]
+    if remove_sync {
+        global
+            .delete_property_or_throw(js_string!("FileReaderSync"), context)
             .map_err(RegisterError::Js)?;
     }
     Ok(())
@@ -562,6 +685,14 @@ impl FileApiHandle {
             validated.push(file);
         }
         file_list::create(validated, &self.specs.file_list_proto, context)
+    }
+
+    /// Returns the environment descriptor this handle was registered with.
+    ///
+    /// Worker descriptors installed the normative `FileReaderSync`;
+    /// `Window` and `ServiceWorker` did not.
+    pub fn environment(&self) -> FileApiEnvironment {
+        self.specs.environment()
     }
 }
 
