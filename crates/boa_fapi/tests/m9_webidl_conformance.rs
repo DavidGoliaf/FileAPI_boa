@@ -704,7 +704,37 @@ fn m9a_rw_02_bom_override_matches_async_path() {
 }
 
 #[test]
-fn m9a_rw_13_utf8_bom_sequence_split_after_first_and_second_byte() {
+fn m9a_rw_13_utf8_bom_at_start_has_independent_expected_output() {
+    let context = &mut setup_chunked_worker();
+    assert_eval(
+        context,
+        r#"
+        (() => {
+            globalThis.m9aBomAtStart = { result: null, events: [] };
+            var expected = 'B';
+            var sync = new FileReaderSync();
+            var blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF, 0x42])]);
+            if (sync.readAsText(blob) !== expected) return false;
+            var reader = new FileReader();
+            reader.onload = function () {
+                m9aBomAtStart.events.push('load');
+                m9aBomAtStart.result = this.result;
+            };
+            reader.onerror = function () { m9aBomAtStart.result = 'ERROR'; };
+            reader.readAsText(blob);
+            return true;
+        })()
+        "#,
+    );
+    let _ = context.run_jobs();
+    assert_eval(
+        context,
+        "m9aBomAtStart.result === 'B' && m9aBomAtStart.events.join(',') === 'load'",
+    );
+}
+
+#[test]
+fn m9a_rw_13_public_reader_preserves_split_multibyte_content() {
     let context = &mut setup_chunked_worker();
     assert_eval(
         context,
@@ -713,24 +743,22 @@ fn m9a_rw_13_utf8_bom_sequence_split_after_first_and_second_byte() {
             function make(offset) {
                 var bytes = [];
                 for (var i = 0; i < offset; i++) bytes.push(0x41);
-                return bytes.concat([0xEF, 0xBB, 0xBF, 0x42]);
+                return bytes.concat([0xE2, 0x82, 0xAC, 0x42]);
             }
             globalThis.m9aSplitBoundary = { first: null, second: null, events: [] };
-            var expectedFirst = 'A'.repeat(16382) + '\uFEFFB';
-            var expectedSecond = 'A'.repeat(16383) + '\uFEFFB';
-            var sync = new FileReaderSync();
-            var first = new Blob([new Uint8Array(make(16382))]);
-            var second = new Blob([new Uint8Array(make(16383))]);
-            if (sync.readAsText(first) !== expectedFirst) return false;
-            if (sync.readAsText(second) !== expectedSecond) return false;
+            var expectedFirst = 'A'.repeat(16381) + '€B';
+            var expectedSecond = 'A'.repeat(16382) + '€B';
             function read(blob, key, expected) {
                 var reader = new FileReader();
-                reader.onload = function () { m9aSplitBoundary.events.push(key); m9aSplitBoundary[key] = this.result === expected; };
+                reader.onload = function () {
+                    m9aSplitBoundary.events.push(key);
+                    m9aSplitBoundary[key] = this.result === expected;
+                };
                 reader.onerror = function () { m9aSplitBoundary[key] = false; };
                 reader.readAsText(blob);
             }
-            read(first, 'first', expectedFirst);
-            read(second, 'second', expectedSecond);
+            read(new Blob([new Uint8Array(make(16381))]), 'first', expectedFirst);
+            read(new Blob([new Uint8Array(make(16382))]), 'second', expectedSecond);
             return true;
         })()
         "#,
@@ -965,6 +993,10 @@ fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
             if (sync.readAsText(new Blob([bytes], { type: 'not-a-mime;charset=windows-1252' }), 'unknown-label') !== '\uFFFD') return false;
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset=windows-1252' }), 'unknown-label') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset="windows-1252"' }), 'unknown-label') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset =windows-1252' }), 'unknown-label') !== '\uFFFD') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;foo="a;b";charset=windows-1252' }), 'unknown-label') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;foo;charset=windows-1252' }), 'unknown-label') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;foo="x"junk;charset=windows-1252' }), 'unknown-label') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes]), '\t windows-1252 \r\n') !== 'é') return false;
             if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset=utf-8' }), '\u00A0windows-1252\u00A0') !== '\uFFFD') return false;
             globalThis.m9aMimeAsync = { events: [], result: null, error: null };

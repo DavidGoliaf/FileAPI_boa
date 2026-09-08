@@ -141,6 +141,13 @@ fn is_ascii_whitespace(byte: u8) -> bool {
     matches!(byte, b'\t' | b'\n' | b'\x0C' | b'\r' | b' ')
 }
 
+fn is_http_whitespace(value: char) -> bool {
+    matches!(
+        value,
+        '\u{0009}' | '\u{000A}' | '\u{000C}' | '\u{000D}' | ' '
+    )
+}
+
 fn trim_ascii_whitespace(value: &str) -> &str {
     let bytes = value.as_bytes();
     let mut start = 0;
@@ -176,118 +183,165 @@ fn is_mime_token_byte(byte: u8) -> bool {
         )
 }
 
+fn is_mime_token_char(value: char) -> bool {
+    value.is_ascii() && is_mime_token_byte(value as u8)
+}
+
+fn is_http_quoted_string_char(value: char) -> bool {
+    value == '\u{0009}'
+        || ('\u{0020}'..='\u{007E}').contains(&value)
+        || ('\u{0080}'..='\u{00FF}').contains(&value)
+}
+
 /// Parses a Blob MIME type and returns its first `charset` parameter.
 ///
 /// This is the local MIME parser used by the packaging-data algorithm. It
-/// validates type/subtype tokens, parameter names, separators and quoted
-/// values before exposing a charset. Duplicate parameter names follow the
-/// MIME parser's first-parameter-wins rule. A malformed MIME type or charset
-/// parameter returns `None`, so the caller continues with UTF-8 fallback.
+/// validates the type/subtype record, then follows the permissive MIME parser
+/// algorithm for parameters: malformed individual parameters are skipped,
+/// quoted values may contain semicolons, and text after a closing quote is
+/// ignored until the next separator. Duplicate parameter names follow the
+/// ordered map's first-parameter-wins rule. Only a malformed type/subtype
+/// record prevents a charset from being exposed.
 pub(crate) fn mime_charset(media_type: &str) -> Option<String> {
-    let bytes = media_type.as_bytes();
-    if bytes
-        .iter()
-        .any(|byte| !(*byte).is_ascii() || !(0x20..=0x7E).contains(byte))
-    {
-        return None;
+    let input: Vec<char> = media_type.chars().collect();
+    let mut start = 0_usize;
+    let mut end = input.len();
+    while start < end && is_http_whitespace(input[start]) {
+        start += 1;
     }
-    let mut cursor = 0_usize;
-    while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
-        cursor += 1;
+    while end > start && is_http_whitespace(input[end - 1]) {
+        end -= 1;
     }
-    let type_start = cursor;
-    while cursor < bytes.len() && bytes[cursor] != b'/' {
-        cursor += 1;
+
+    let mut position = start;
+    let type_start = position;
+    while position < end && input[position] != '/' {
+        position += 1;
     }
-    if cursor == type_start
-        || cursor == bytes.len()
-        || !bytes[type_start..cursor]
+    if position == type_start
+        || position == end
+        || !input[type_start..position]
             .iter()
-            .all(|byte| is_mime_token_byte(*byte))
+            .copied()
+            .all(is_mime_token_char)
     {
         return None;
     }
-    cursor += 1;
-    let subtype_start = cursor;
-    while cursor < bytes.len() && bytes[cursor] != b';' && !is_ascii_whitespace(bytes[cursor]) {
-        cursor += 1;
+
+    position += 1;
+    let subtype_start = position;
+    while position < end && input[position] != ';' {
+        position += 1;
     }
-    if cursor == subtype_start
-        || !bytes[subtype_start..cursor]
+    let mut subtype_end = position;
+    while subtype_end > subtype_start && is_http_whitespace(input[subtype_end - 1]) {
+        subtype_end -= 1;
+    }
+    if subtype_end == subtype_start
+        || !input[subtype_start..subtype_end]
             .iter()
-            .all(|byte| is_mime_token_byte(*byte))
+            .copied()
+            .all(is_mime_token_char)
     {
         return None;
     }
-    while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
-        cursor += 1;
-    }
+
     let mut charset = None;
-    while cursor < bytes.len() {
-        if bytes[cursor] != b';' {
-            return None;
+    while position < end {
+        // The subtype loop leaves position at the next parameter separator.
+        if input[position] != ';' {
+            break;
         }
-        cursor += 1;
-        while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
-            cursor += 1;
+        position += 1;
+        while position < end && is_http_whitespace(input[position]) {
+            position += 1;
         }
-        let name_start = cursor;
-        while cursor < bytes.len() && bytes[cursor] != b'=' && bytes[cursor] != b';' {
-            cursor += 1;
+
+        let name_start = position;
+        while position < end && input[position] != ';' && input[position] != '=' {
+            position += 1;
         }
-        let name = trim_ascii_whitespace(&media_type[name_start..cursor]);
-        if name.is_empty()
-            || !name.bytes().all(is_mime_token_byte)
-            || cursor == bytes.len()
-            || bytes[cursor] != b'='
-        {
-            return None;
+        let name = &input[name_start..position];
+        if position < end && input[position] == ';' {
+            // A parameter without '=' is malformed, but does not invalidate
+            // the MIME record or prevent later parameters from being parsed.
+            continue;
         }
-        cursor += 1;
-        while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
-            cursor += 1;
+        if position == end {
+            break;
         }
-        let value = if cursor < bytes.len() && bytes[cursor] == b'"' {
-            cursor += 1;
-            let mut value = String::new();
+        position += 1; // Skip '='.
+        if position == end {
+            break;
+        }
+
+        let mut value = String::new();
+        let mut value_valid = true;
+        if input[position] == '"' {
+            position += 1;
             let mut closed = false;
-            while cursor < bytes.len() {
-                match bytes[cursor] {
-                    b'"' => {
-                        cursor += 1;
+            while position < end {
+                match input[position] {
+                    '"' => {
+                        position += 1;
                         closed = true;
                         break;
                     }
-                    b'\\' if cursor + 1 < bytes.len() => {
-                        cursor += 1;
-                        value.push(bytes[cursor] as char);
-                        cursor += 1;
+                    '\\' => {
+                        position += 1;
+                        if position == end {
+                            value_valid = false;
+                            break;
+                        }
+                        value.push(input[position]);
+                        position += 1;
                     }
-                    byte if (0x20..=0x7E).contains(&byte) && byte != b';' => {
-                        value.push(byte as char);
-                        cursor += 1;
+                    value_char if is_http_quoted_string_char(value_char) => {
+                        value.push(value_char);
+                        position += 1;
                     }
-                    _ => return None,
+                    _ => {
+                        value_valid = false;
+                        while position < end && input[position] != ';' {
+                            position += 1;
+                        }
+                        break;
+                    }
                 }
             }
             if !closed {
-                return None;
+                continue;
             }
-            while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
-                cursor += 1;
+            // WHATWG ignores text between the closing quote and the next
+            // semicolon, e.g. `charset="windows-1252"junk`.
+            while position < end && input[position] != ';' {
+                position += 1;
             }
-            value
         } else {
-            let value_start = cursor;
-            while cursor < bytes.len() && bytes[cursor] != b';' {
-                cursor += 1;
+            let value_start = position;
+            while position < end && input[position] != ';' {
+                position += 1;
             }
-            trim_ascii_whitespace(&media_type[value_start..cursor]).to_owned()
-        };
-        if name.eq_ignore_ascii_case("charset") && charset.is_none() {
-            if value.is_empty() {
-                return None;
+            let mut value_end = position;
+            while value_end > value_start && is_http_whitespace(input[value_end - 1]) {
+                value_end -= 1;
             }
+            if value_end == value_start {
+                continue;
+            }
+            value.extend(input[value_start..value_end].iter().copied());
+        }
+
+        let name_valid = !name.is_empty()
+            && name.iter().copied().all(is_mime_token_char)
+            && value_valid
+            && value.chars().all(is_http_quoted_string_char);
+        let is_charset = name
+            .iter()
+            .copied()
+            .collect::<String>()
+            .eq_ignore_ascii_case("charset");
+        if name_valid && is_charset && charset.is_none() {
             charset = Some(value);
         }
     }
@@ -395,4 +449,50 @@ pub(crate) fn package_data_url(
     let mut out = prefix;
     out.push_str(&payload);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_decoder_sniffs_bom_when_split_after_first_or_second_byte() {
+        let encoding = TextEncoding {
+            encoding: encoding_rs::UTF_8,
+        };
+        for (first, second) in [
+            (&[0xEF][..], &[0xBB, 0xBF, 0x42][..]),
+            (&[0xEF, 0xBB][..], &[0xBF, 0x42][..]),
+        ] {
+            let mut decoder = IncrementalDecoder::new();
+            let result = (|| {
+                let mut output = decoder.push(&encoding, first)?;
+                output.push_str(&decoder.push(&encoding, second)?);
+                output.push_str(&decoder.finish(&encoding)?);
+                Ok::<_, FileApiError>(output)
+            })();
+            assert!(
+                matches!(&result, Ok(output) if output == "B"),
+                "unexpected decoder result: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mime_parser_skips_malformed_parameters_and_preserves_later_charset() {
+        let expected = Some(String::from("windows-1252"));
+        assert_eq!(mime_charset("text/plain;charset =windows-1252"), None);
+        assert_eq!(
+            mime_charset("text/plain;foo=\"a;b\";charset=windows-1252"),
+            expected
+        );
+        assert_eq!(
+            mime_charset("text/plain;foo;charset=windows-1252"),
+            expected
+        );
+        assert_eq!(
+            mime_charset("text/plain;foo=\"x\"junk;charset=windows-1252"),
+            expected
+        );
+    }
 }
