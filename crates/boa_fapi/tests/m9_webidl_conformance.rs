@@ -13,7 +13,11 @@
 //! `M9A-RW-02` (BOM overrides any fallback), `M9A-RW-03` (argument
 //! order left to right), `M9A-RW-04` (conversion before processing),
 //! `M9A-RW-05` (no `return()` on abrupt completion), `M9A-RW-06`
-//! (FileList value iterator only).
+//! (FileList value iterator only), `M9A-RW-07` (decoder consumes and flushes
+//! all input), `M9A-RW-08` (MIME parse gates charset), `M9A-RW-09` (ASCII
+//! whitespace only), `M9A-RW-10` (prototype after argument conversion),
+//! `M9A-RW-11` (bounded phase-1 accumulation), `M9A-RW-12` (byte snapshots),
+//! `M9A-RW-13` (split boundary outputs), `M9A-RW-14` (current handoff oracle).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -699,6 +703,45 @@ fn m9a_rw_02_bom_override_matches_async_path() {
     assert_eval(context, "globalThis.m9aBomAsync === 'A'");
 }
 
+#[test]
+fn m9a_rw_13_utf8_bom_sequence_split_after_first_and_second_byte() {
+    let context = &mut setup_chunked_worker();
+    assert_eval(
+        context,
+        r#"
+        (() => {
+            function make(offset) {
+                var bytes = [];
+                for (var i = 0; i < offset; i++) bytes.push(0x41);
+                return bytes.concat([0xEF, 0xBB, 0xBF, 0x42]);
+            }
+            globalThis.m9aSplitBoundary = { first: null, second: null, events: [] };
+            var expectedFirst = 'A'.repeat(16382) + '\uFEFFB';
+            var expectedSecond = 'A'.repeat(16383) + '\uFEFFB';
+            var sync = new FileReaderSync();
+            var first = new Blob([new Uint8Array(make(16382))]);
+            var second = new Blob([new Uint8Array(make(16383))]);
+            if (sync.readAsText(first) !== expectedFirst) return false;
+            if (sync.readAsText(second) !== expectedSecond) return false;
+            function read(blob, key, expected) {
+                var reader = new FileReader();
+                reader.onload = function () { m9aSplitBoundary.events.push(key); m9aSplitBoundary[key] = this.result === expected; };
+                reader.onerror = function () { m9aSplitBoundary[key] = false; };
+                reader.readAsText(blob);
+            }
+            read(first, 'first', expectedFirst);
+            read(second, 'second', expectedSecond);
+            return true;
+        })()
+        "#,
+    );
+    let _ = context.run_jobs();
+    assert_eval(
+        context,
+        "m9aSplitBoundary.first === true && m9aSplitBoundary.second === true && m9aSplitBoundary.events.length === 2",
+    );
+}
+
 // ──────────────────────────────────────────────
 // M9A-RW-03/04: Web IDL argument conversion order
 // ──────────────────────────────────────────────
@@ -798,7 +841,7 @@ fn m9a_rw_03_arguments_convert_left_to_right() {
 
 #[test]
 fn m9a_rw_04_conversion_snapshots_before_later_side_effects() {
-    let context = &mut setup();
+    let context = &mut setup_worker();
     // BufferSource bytes are copied at element-conversion time: a
     // `fileName.toString` mutating the buffer cannot change them.
     // (FileReaderSync is worker-only, so the Window-context check from
@@ -812,7 +855,8 @@ fn m9a_rw_04_conversion_snapshots_before_later_side_effects() {
             var name = { toString() { view[0] = 99; return 'n.txt'; } };
             var file = new File(bits, name);
             if (file.size !== 3 || file.name !== 'n.txt') return false;
-            return file.slice(0, 1).size === 1;
+            var fileBytes = new Uint8Array(new FileReaderSync().readAsArrayBuffer(file));
+            return fileBytes[0] === 1;
         })()
         ",
     );
@@ -824,7 +868,8 @@ fn m9a_rw_04_conversion_snapshots_before_later_side_effects() {
             var view = new Uint8Array([4, 5]);
             var options = { get type() { view[0] = 99; return ''; } };
             var blob = new Blob([view], options);
-            return blob.size === 2;
+            var blobBytes = new Uint8Array(new FileReaderSync().readAsArrayBuffer(blob));
+            return blobBytes[0] === 4;
         })()
         ",
     );
@@ -844,6 +889,216 @@ fn m9a_rw_04_conversion_snapshots_before_later_side_effects() {
                 return e instanceof TypeError && e.message === 'endings-boom'
                     && log.join(',') === 'endings';
             }
+        })()
+        ",
+    );
+}
+
+// ──────────────────────────────────────────────
+// M9A-RW-07/08/09/13: complete decoder and encoding selection
+// ──────────────────────────────────────────────
+
+#[test]
+fn m9a_rw_07_decoder_consumes_expanding_and_incomplete_input() {
+    let context = &mut setup_worker();
+    assert_eval(
+        context,
+        r"
+        (() => {
+            function utf16(le) {
+                var bytes = le ? [0xFF, 0xFE] : [0xFE, 0xFF];
+                for (var i = 0; i < 20000; i++)
+                    bytes.push(...(le ? [0x00, 0x08] : [0x08, 0x00]));
+                return bytes;
+            }
+            var expected0800 = String.fromCharCode(0x0800).repeat(20000);
+            var sync = new FileReaderSync();
+            if (sync.readAsText(new Blob([new Uint8Array(utf16(true))]), 'windows-1252') !== expected0800) return false;
+            if (sync.readAsText(new Blob([new Uint8Array(utf16(false))]), 'windows-1252') !== expected0800) return false;
+            var cp = new Array(100000);
+            for (var j = 0; j < cp.length; j++) cp[j] = 0xE9;
+            if (sync.readAsText(new Blob([new Uint8Array(cp)]), 'windows-1252') !== 'é'.repeat(cp.length)) return false;
+            // Encoding Standard's EOF flush emits one replacement for this
+            // incomplete UTF-8 sequence; it must not silently drop the tail.
+            if (sync.readAsText(new Blob([new Uint8Array([0xE2, 0x82])]), 'utf-8') !== '\uFFFD') return false;
+            globalThis.m9aDecoderAsync = {};
+            function enqueue(key, bytes, label) {
+                var reader = new FileReader();
+                reader.onload = function () { globalThis.m9aDecoderAsync[key] = this.result; };
+                reader.onerror = function () { globalThis.m9aDecoderAsync[key] = 'ERROR'; };
+                reader.readAsText(new Blob([new Uint8Array(bytes)]), label);
+            }
+            enqueue('le', utf16(true), 'windows-1252');
+            enqueue('be', utf16(false), 'windows-1252');
+            enqueue('cp', cp, 'windows-1252');
+            enqueue('eof', [0xE2, 0x82], 'utf-8');
+            return true;
+        })()
+        ",
+    );
+    let _ = context.run_jobs();
+    assert_eval(
+        context,
+        "globalThis.m9aDecoderAsync.le === String.fromCharCode(0x0800).repeat(20000)",
+    );
+    assert_eval(
+        context,
+        "globalThis.m9aDecoderAsync.be === String.fromCharCode(0x0800).repeat(20000)",
+    );
+    assert_eval(context, "globalThis.m9aDecoderAsync.cp.length === 100000");
+    assert_eval(
+        context,
+        "globalThis.m9aDecoderAsync.cp.charCodeAt(0) === 0xE9",
+    );
+    assert_eval(context, "globalThis.m9aDecoderAsync.eof === '\\uFFFD'");
+}
+
+#[test]
+fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
+    let context = &mut setup_worker();
+    assert_eval(
+        context,
+        r#"
+        (() => {
+            var bytes = new Uint8Array([0xE9]);
+            var sync = new FileReaderSync();
+            if (sync.readAsText(new Blob([bytes], { type: 'not-a-mime;charset=windows-1252' }), 'unknown-label') !== '\uFFFD') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset=windows-1252' }), 'unknown-label') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset="windows-1252"' }), 'unknown-label') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes]), '\t windows-1252 \r\n') !== 'é') return false;
+            if (sync.readAsText(new Blob([bytes], { type: 'text/plain;charset=utf-8' }), '\u00A0windows-1252\u00A0') !== '\uFFFD') return false;
+            globalThis.m9aMimeAsync = { events: [], result: null, error: null };
+            var reader = new FileReader();
+            reader.onloadstart = function () { m9aMimeAsync.events.push('loadstart'); };
+            reader.onprogress = function () { m9aMimeAsync.events.push('progress'); };
+            reader.onload = function () { m9aMimeAsync.events.push('load'); m9aMimeAsync.result = this.result; };
+            reader.onerror = function () { m9aMimeAsync.events.push('error'); m9aMimeAsync.error = this.error; };
+            reader.onloadend = function () { m9aMimeAsync.events.push('loadend'); };
+            reader.readAsText(new Blob([bytes], { type: 'text/plain;charset="windows-1252"' }), 'unknown-label');
+            return true;
+        })()
+        "#,
+    );
+    let _ = context.run_jobs();
+    assert_eval(
+        context,
+        "m9aMimeAsync.events.join(',') === 'loadstart,progress,load,loadend' && m9aMimeAsync.result === 'é' && m9aMimeAsync.error === null",
+    );
+}
+
+// ──────────────────────────────────────────────
+// M9A-RW-10: complete Web IDL constructor order
+// ──────────────────────────────────────────────
+
+#[test]
+fn m9a_rw_10_prototype_lookup_follows_all_argument_conversions() {
+    let context = &mut setup();
+    assert_eval(
+        context,
+        r"
+        (() => {
+            function checkBlob() {
+                var log = [];
+                var parts = [{ toString() { log.push('parts'); return 'x'; } }];
+                var options = { get endings() { log.push('options'); return 'transparent'; } };
+                var target = new Proxy(Blob, { get(t, p, r) { if (p === 'prototype') log.push('prototype'); return Reflect.get(t, p, r); } });
+                Reflect.construct(Blob, [parts, options], target);
+                return log.join(',') === 'parts,options,prototype';
+            }
+            function checkFile() {
+                var log = [];
+                var bits = [{ toString() { log.push('bits'); return 'x'; } }];
+                var name = { toString() { log.push('name'); return 'n'; } };
+                var options = { get endings() { log.push('options'); return 'transparent'; } };
+                var target = new Proxy(File, { get(t, p, r) { if (p === 'prototype') log.push('prototype'); return Reflect.get(t, p, r); } });
+                Reflect.construct(File, [bits, name, options], target);
+                return log.join(',') === 'bits,name,options,prototype';
+            }
+            return checkBlob() && checkFile();
+        })()
+        ",
+    );
+}
+
+#[test]
+fn m9a_rw_10_prototype_is_not_read_after_earlier_conversion_throws() {
+    let context = &mut setup();
+    assert_eval(
+        context,
+        r"
+        (() => {
+            var reads = 0;
+            var target = new Proxy(Blob, { get(t, p, r) {
+                if (p === 'prototype') { reads++; throw new Error('prototype-boom'); }
+                return Reflect.get(t, p, r);
+            }});
+            var parts = { get [Symbol.iterator]() { throw new Error('parts-boom'); } };
+            try { Reflect.construct(Blob, [parts, {}], target); return false; }
+            catch (e) { return e.message === 'parts-boom' && reads === 0; }
+        })()
+        ",
+    );
+    assert_eval(
+        context,
+        r"
+        (() => {
+            var target = new Proxy(File, { get(t, p, r) {
+                if (p === 'prototype') throw new Error('prototype-boom');
+                return Reflect.get(t, p, r);
+            }});
+            try { Reflect.construct(File, [['x'], { toString() { throw new Error('name-boom'); } }], target); return false; }
+            catch (e) { return e.message === 'name-boom'; }
+        })()
+        ",
+    );
+    assert_eval(
+        context,
+        r"
+        (() => {
+            var target = new Proxy(Blob, { get(t, p, r) {
+                if (p === 'prototype') throw new Error('prototype-boom');
+                return Reflect.get(t, p, r);
+            }});
+            try { Reflect.construct(Blob, [['x'], {}], target); return false; }
+            catch (e) { return e.message === 'prototype-boom'; }
+        })()
+        ",
+    );
+}
+
+// ──────────────────────────────────────────────
+// M9A-RW-11: bounded phase-1 accumulation
+// ──────────────────────────────────────────────
+
+#[test]
+fn m9a_rw_11_sequence_lower_bound_stops_before_options_and_accepts_exact_limit() {
+    let context = &mut setup_quota(8, 64 * 1024);
+    assert_eval(
+        context,
+        r"
+        (() => {
+            var exact = new Blob([new Uint8Array(65536)]);
+            if (exact.size !== 65536) return false;
+            var closed = false;
+            var optionsRead = false;
+            var seq = { [Symbol.iterator]() {
+                var first = true;
+                return {
+                    next() {
+                        if (first) { first = false; return { done: false, value: new Uint8Array(65536) }; }
+                        return { done: false, value: new Uint8Array([1]) };
+                    },
+                    return() { closed = true; return {}; }
+                };
+            } };
+            try {
+                new Blob(seq, { get type() { optionsRead = true; return ''; } });
+                return false;
+            } catch (e) {
+                if (!(e instanceof RangeError) || closed || optionsRead) return false;
+            }
+            var mixed = new Blob([new Uint8Array([1, 2]), new Blob([new Uint8Array([3, 4])]), new File([new Uint8Array([5])], 'f'), 'é'], { endings: 'native' });
+            return mixed.size >= 7;
         })()
         ",
     );

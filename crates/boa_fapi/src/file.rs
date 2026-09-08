@@ -115,8 +115,6 @@ pub(crate) fn constructor(
             "File constructor requires at least two arguments",
         ));
     }
-    let prototype = constructor_prototype(&target, specs.file_proto(), context)?;
-
     // Web IDL argument order: `fileBits` sequence conversion first
     // (typed conversion with conversion-time snapshots, no `endings`
     // yet), then `fileName` USVString, then the options dictionary, then
@@ -128,6 +126,9 @@ pub(crate) fn constructor(
     let file_name = normalize_file_name(&file_name);
 
     let options = FileOptions::parse(&arg(args, 2), context)?;
+    // `NewTarget.prototype` is observable and therefore follows every
+    // argument conversion, including the options dictionary.
+    let prototype = constructor_prototype(&target, specs.file_proto(), context)?;
     let mut collector = PartsCollector::new(limits);
     process_converted(converted, options.blob.endings, &mut collector)?;
     let data = Arc::new(collector.into_blob_data(&options.blob.media_type)?);

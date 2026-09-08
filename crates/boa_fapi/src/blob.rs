@@ -100,8 +100,6 @@ pub(crate) fn constructor(
     let Some(target) = new_target.as_object() else {
         return Err(type_error("Blob constructor requires 'new'"));
     };
-    let prototype = constructor_prototype(&target, specs.blob_proto(), context)?;
-
     // Web IDL argument order: `blobParts` sequence conversion first
     // (typed conversion with conversion-time BufferSource/USVString
     // snapshots, no `endings` yet), then the options dictionary, then
@@ -109,6 +107,9 @@ pub(crate) fn constructor(
     let limits = specs.limits().clone();
     let converted = convert_sequence(&arg(args, 0), false, &limits, context)?;
     let options = BlobOptions::parse(&arg(args, 1), context)?;
+    // `NewTarget.prototype` is observable and therefore follows every
+    // argument conversion, including the options dictionary.
+    let prototype = constructor_prototype(&target, specs.blob_proto(), context)?;
     let mut collector = PartsCollector::new(limits);
     process_converted(converted, options.endings, &mut collector)?;
     let data = collector.into_blob_data(&options.media_type)?;

@@ -843,8 +843,22 @@ fn run_pump(
                     state.buffered.extend_from_slice(&chunk);
                 }
                 ReadKind::Text => {
-                    let piece = state.decoder.push(&state.encoding, &chunk);
-                    state.text.push_str(&piece);
+                    let piece = match state.decoder.push(&state.encoding, &chunk) {
+                        Ok(piece) => piece,
+                        Err(error) => {
+                            return fail_operation(
+                                reader,
+                                generation,
+                                state.total,
+                                &error,
+                                context,
+                            );
+                        }
+                    };
+                    if let Err(error) = crate::package::append_decoded_text(&mut state.text, &piece)
+                    {
+                        return fail_operation(reader, generation, state.total, &error, context);
+                    }
                 }
             }
             // Mirror progress into the native state for `abort()` events.
@@ -954,9 +968,14 @@ fn finish_at_eof(
             FileReaderResult::BinaryString(crate::package::package_binary_string(&buffered))
         }
         ReadKind::Text => {
-            let tail = decoder.finish(&encoding);
+            let tail = match decoder.finish(&encoding) {
+                Ok(tail) => tail,
+                Err(error) => return fail_operation(reader, generation, total, &error, context),
+            };
             let mut text = text;
-            text.push_str(&tail);
+            if let Err(error) = crate::package::append_decoded_text(&mut text, &tail) {
+                return fail_operation(reader, generation, total, &error, context);
+            }
             FileReaderResult::Text(text)
         }
         ReadKind::DataUrl => {

@@ -9,6 +9,7 @@
 
 use boa_fapi_core::error::ResourceLimitKind;
 use boa_fapi_core::file_api_error::FileApiError;
+use encoding_rs::CoderResult;
 
 /// Supported text encodings for `readAsText`: the Encoding Standard label
 /// resolved through the fixed `encoding_rs` dependency.
@@ -21,12 +22,12 @@ pub(crate) struct TextEncoding {
 /// Incremental decoder state for `readAsText`.
 ///
 /// Wraps an `encoding_rs::Decoder` created with BOM sniffing enabled;
-/// `push` feeds one chunk and returns the decoded prefix, `finish`
-/// flushes with `last = true`. Malformed sequences decode with
-/// replacement, never as an exception. Split multibyte sequences stay
-/// buffered inside the decoder, never emitted as U+FFFD early. A leading
-/// BOM selects the effective encoding once (Encoding Standard BOM
-/// handling): UTF-8/UTF-16LE/UTF-16BE sniffing wins over any fallback.
+/// `push` feeds one chunk and returns all decoded output, while `finish`
+/// flushes with `last = true`. Malformed sequences decode with replacement,
+/// never as an exception. Split multibyte sequences stay buffered inside the
+/// decoder, never emitted as U+FFFD early. A leading BOM selects the effective
+/// encoding once (Encoding Standard BOM handling): UTF-8/UTF-16LE/UTF-16BE
+/// sniffing wins over any fallback.
 pub(crate) struct IncrementalDecoder {
     /// The underlying `encoding_rs` decoder (BOM sniffing enabled).
     decoder: Option<encoding_rs::Decoder>,
@@ -43,38 +44,87 @@ impl IncrementalDecoder {
         }
     }
 
-    /// Feeds one chunk and returns the decoded prefix.
-    pub(crate) fn push(&mut self, encoding: &TextEncoding, chunk: &[u8]) -> String {
+    /// Feeds one chunk and returns all decoded output.
+    pub(crate) fn push(
+        &mut self,
+        encoding: &TextEncoding,
+        chunk: &[u8],
+    ) -> Result<String, FileApiError> {
         if self.decoder.is_none() {
             self.decoder = Some(encoding.encoding.new_decoder());
         }
         let Some(decoder) = self.decoder.as_mut() else {
-            return String::new();
+            return Err(FileApiError::Internal);
         };
-        // `decode_to_string` with `last = false`: split multibyte sequences
-        // stay buffered inside the decoder, never emitted as U+FFFD early.
-        // The output `String` must have spare capacity: `decode_to_string`
-        // treats capacity as the output limit and never reallocates.
-        let mut out = String::with_capacity(chunk.len().saturating_add(8));
-        let (_, _, _) = decoder.decode_to_string(chunk, &mut out, false);
-        out
+        decode_all(decoder, chunk, false)
     }
 
     /// Flushes the decoder at EOF (`last = true`).
-    pub(crate) fn finish(&mut self, encoding: &TextEncoding) -> String {
+    pub(crate) fn finish(&mut self, encoding: &TextEncoding) -> Result<String, FileApiError> {
         if self.finished {
-            return String::new();
+            return Ok(String::new());
         }
         self.finished = true;
         if self.decoder.is_none() {
             self.decoder = Some(encoding.encoding.new_decoder());
         }
         let Some(decoder) = self.decoder.as_mut() else {
-            return String::new();
+            return Err(FileApiError::Internal);
         };
-        let mut out = String::with_capacity(8);
-        let (_, _, _) = decoder.decode_to_string(b"", &mut out, true);
-        out
+        decode_all(decoder, b"", true)
+    }
+}
+
+/// Drives one `encoding_rs` call sequence until every input byte and every
+/// pending output byte has been consumed. `decode_to_string` never reallocates
+/// its receiver; `OutputFull` therefore requires explicit fallible growth.
+fn decode_all(
+    decoder: &mut encoding_rs::Decoder,
+    input: &[u8],
+    last: bool,
+) -> Result<String, FileApiError> {
+    let initial = input
+        .len()
+        .checked_mul(4)
+        .and_then(|size| size.checked_add(8))
+        .unwrap_or(8);
+    let mut output = String::new();
+    output
+        .try_reserve(initial)
+        .map_err(|_| FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes))?;
+    let mut offset = 0_usize;
+    loop {
+        let old_len = output.len();
+        let (result, read, _) = decoder.decode_to_string(&input[offset..], &mut output, last);
+        let new_offset = offset.checked_add(read).ok_or(FileApiError::ResourceLimit(
+            ResourceLimitKind::MaterializeBytes,
+        ))?;
+        if new_offset > input.len() {
+            return Err(FileApiError::Internal);
+        }
+        offset = new_offset;
+        match result {
+            CoderResult::InputEmpty if offset == input.len() => return Ok(output),
+            CoderResult::OutputFull => {
+                let previous_capacity = output.capacity();
+                let additional = previous_capacity.max(8);
+                output.try_reserve(additional).map_err(|_| {
+                    FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes)
+                })?;
+                if output.capacity() <= previous_capacity && output.len() == old_len {
+                    return Err(FileApiError::ResourceLimit(
+                        ResourceLimitKind::MaterializeBytes,
+                    ));
+                }
+            }
+            CoderResult::InputEmpty => {
+                // `last = false` may leave a decoder-internal partial
+                // sequence. It is intentionally retained until a later push.
+                if offset == input.len() {
+                    return Ok(output);
+                }
+            }
+        }
     }
 }
 
@@ -84,25 +134,164 @@ impl Default for IncrementalDecoder {
     }
 }
 
-/// Extracts a `charset` parameter from a Blob MIME type per the W3C
-/// packaging-data steps: split on `;`, take the first `charset=`
-/// parameter, strip quotes/whitespace. Returns `None` when absent.
-pub(crate) fn mime_charset(media_type: &str) -> Option<&str> {
-    for param in media_type.split(';').skip(1) {
-        let param = param.trim();
-        let Some((name, value)) = param.split_once('=') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("charset") {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim();
-        if value.is_empty() {
+/// Returns true for the ASCII whitespace code points used by the Encoding
+/// Standard and MIME parser. Rust's Unicode-aware `trim` is intentionally not
+/// used: NBSP and other Unicode whitespace are label data, not outer space.
+fn is_ascii_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\x0C' | b'\r' | b' ')
+}
+
+fn trim_ascii_whitespace(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && is_ascii_whitespace(bytes[start]) {
+        start += 1;
+    }
+    while end > start && is_ascii_whitespace(bytes[end - 1]) {
+        end -= 1;
+    }
+    // MIME types and encoding labels are ASCII at every successful call site.
+    &value[start..end]
+}
+
+fn is_mime_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Parses a Blob MIME type and returns its first `charset` parameter.
+///
+/// This is the local MIME parser used by the packaging-data algorithm. It
+/// validates type/subtype tokens, parameter names, separators and quoted
+/// values before exposing a charset. Duplicate parameter names follow the
+/// MIME parser's first-parameter-wins rule. A malformed MIME type or charset
+/// parameter returns `None`, so the caller continues with UTF-8 fallback.
+pub(crate) fn mime_charset(media_type: &str) -> Option<String> {
+    let bytes = media_type.as_bytes();
+    if bytes
+        .iter()
+        .any(|byte| !(*byte).is_ascii() || !(0x20..=0x7E).contains(byte))
+    {
+        return None;
+    }
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
+        cursor += 1;
+    }
+    let type_start = cursor;
+    while cursor < bytes.len() && bytes[cursor] != b'/' {
+        cursor += 1;
+    }
+    if cursor == type_start
+        || cursor == bytes.len()
+        || !bytes[type_start..cursor]
+            .iter()
+            .all(|byte| is_mime_token_byte(*byte))
+    {
+        return None;
+    }
+    cursor += 1;
+    let subtype_start = cursor;
+    while cursor < bytes.len() && bytes[cursor] != b';' && !is_ascii_whitespace(bytes[cursor]) {
+        cursor += 1;
+    }
+    if cursor == subtype_start
+        || !bytes[subtype_start..cursor]
+            .iter()
+            .all(|byte| is_mime_token_byte(*byte))
+    {
+        return None;
+    }
+    while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
+        cursor += 1;
+    }
+    let mut charset = None;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b';' {
             return None;
         }
-        return Some(value);
+        cursor += 1;
+        while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
+            cursor += 1;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len() && bytes[cursor] != b'=' && bytes[cursor] != b';' {
+            cursor += 1;
+        }
+        let name = trim_ascii_whitespace(&media_type[name_start..cursor]);
+        if name.is_empty()
+            || !name.bytes().all(is_mime_token_byte)
+            || cursor == bytes.len()
+            || bytes[cursor] != b'='
+        {
+            return None;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
+            cursor += 1;
+        }
+        let value = if cursor < bytes.len() && bytes[cursor] == b'"' {
+            cursor += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'"' => {
+                        cursor += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\\' if cursor + 1 < bytes.len() => {
+                        cursor += 1;
+                        value.push(bytes[cursor] as char);
+                        cursor += 1;
+                    }
+                    byte if (0x20..=0x7E).contains(&byte) && byte != b';' => {
+                        value.push(byte as char);
+                        cursor += 1;
+                    }
+                    _ => return None,
+                }
+            }
+            if !closed {
+                return None;
+            }
+            while cursor < bytes.len() && is_ascii_whitespace(bytes[cursor]) {
+                cursor += 1;
+            }
+            value
+        } else {
+            let value_start = cursor;
+            while cursor < bytes.len() && bytes[cursor] != b';' {
+                cursor += 1;
+            }
+            trim_ascii_whitespace(&media_type[value_start..cursor]).to_owned()
+        };
+        if name.eq_ignore_ascii_case("charset") && charset.is_none() {
+            if value.is_empty() {
+                return None;
+            }
+            charset = Some(value);
+        }
     }
-    None
+    charset
 }
 
 /// Shared `readAsText` encoding selection (async `FileReader` and sync
@@ -119,19 +308,19 @@ pub(crate) fn mime_charset(media_type: &str) -> Option<&str> {
 ///    UTF-16LE or UTF-16BE;
 /// 5. malformed sequences decode to U+FFFD.
 ///
-/// Exact `get an encoding` semantics (`Encoding::for_label`): labels
-/// that map to the `replacement` encoding resolve to it (decoding then
-/// yields U+FFFD per byte) instead of falling through. `None` is never
-/// returned: there is no `EncodingError` path for labels.
+/// Exact `get an encoding` semantics (`Encoding::for_label`): labels that map
+/// to the `replacement` encoding resolve to it instead of falling through.
+/// `None` is never returned: there is no `EncodingError` path for labels.
 pub(crate) fn resolve_text_encoding(label: Option<&str>, media_type: &str) -> TextEncoding {
     if let Some(label) = label
-        && !label.trim().is_empty()
-        && let Some(encoding) = encoding_rs::Encoding::for_label(label.trim().as_bytes())
+        && let Some(encoding) =
+            encoding_rs::Encoding::for_label(trim_ascii_whitespace(label).as_bytes())
     {
         return TextEncoding { encoding };
     }
     if let Some(charset) = mime_charset(media_type)
-        && let Some(encoding) = encoding_rs::Encoding::for_label(charset.trim().as_bytes())
+        && let Some(encoding) =
+            encoding_rs::Encoding::for_label(trim_ascii_whitespace(&charset).as_bytes())
     {
         return TextEncoding { encoding };
     }
@@ -144,11 +333,24 @@ pub(crate) fn resolve_text_encoding(label: Option<&str>, media_type: &str) -> Te
 ///
 /// one `push` of the whole input followed by `finish`. Malformed sequences
 /// decode with replacement; the BOM sniff selects the effective encoding.
-pub(crate) fn decode_text(encoding: &TextEncoding, bytes: &[u8]) -> String {
+pub(crate) fn decode_text(encoding: &TextEncoding, bytes: &[u8]) -> Result<String, FileApiError> {
     let mut decoder = IncrementalDecoder::new();
-    let mut out = decoder.push(encoding, bytes);
-    out.push_str(&decoder.finish(encoding));
-    out
+    let mut out = decoder.push(encoding, bytes)?;
+    let tail = decoder.finish(encoding)?;
+    append_decoded_text(&mut out, &tail)?;
+    Ok(out)
+}
+
+/// Appends decoded UTF-8 with fallible capacity growth at the JS boundary.
+pub(crate) fn append_decoded_text(
+    destination: &mut String,
+    piece: &str,
+) -> Result<(), FileApiError> {
+    destination
+        .try_reserve(piece.len())
+        .map_err(|_| FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes))?;
+    destination.push_str(piece);
+    Ok(())
 }
 
 /// Packages bytes as a binary string: one code unit `U+0000..U+00FF` per

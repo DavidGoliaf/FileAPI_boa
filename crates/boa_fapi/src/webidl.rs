@@ -347,12 +347,14 @@ pub(crate) enum ConvertedBlobPart {
 /// copies the visible range now; branded `Blob`/`File` keeps the shared
 /// backing; every other value takes the USVString `ToString` path now. A
 /// forged Blob/File-shaped object fails the brand and falls to `ToString`;
-/// a throwing `toString` propagates as the abrupt completion. Part-count
-/// pressure is enforced here (before unbounded accumulation); byte-size
-/// pressure stays in the processing step, which owns the limits.
+/// a throwing `toString` propagates as the abrupt completion. Part-count and a
+/// checked lower-bound byte-size pressure are enforced here, before the
+/// converted sequence can grow beyond the configured ceiling. The final exact
+/// accounting remains in the processing step.
 fn convert_part(
     value: &JsValue,
     parts: &mut usize,
+    lower_bound: &mut u64,
     limits: &FileApiLimits,
     context: &mut Context,
 ) -> JsResult<ConvertedBlobPart> {
@@ -366,11 +368,13 @@ fn convert_part(
         // unchanged (the whole conversion fails anyway), and a detached
         // buffer's empty sequence still counts as one part.
         if let Ok(buffer) = JsArrayBuffer::from_object(object.clone()) {
+            account_lower_bound(buffer.byte_length() as u64, lower_bound, limits)?;
             let bytes = array_buffer_bytes(&buffer);
             *parts += 1;
             return Ok(ConvertedBlobPart::Bytes(bytes));
         }
         if let Ok(shared) = JsSharedArrayBuffer::from_object(object.clone()) {
+            account_lower_bound(shared.byte_length() as u64, lower_bound, limits)?;
             let bytes = Bytes::from(shared.to_vec());
             *parts += 1;
             return Ok(ConvertedBlobPart::Bytes(bytes));
@@ -378,6 +382,7 @@ fn convert_part(
         if let Ok(typed) = JsTypedArray::from_object(object.clone()) {
             let offset = typed.byte_offset(context)?;
             let length = typed.byte_length(context)?;
+            account_lower_bound(length as u64, lower_bound, limits)?;
             let buffer = typed.buffer(context)?;
             let bytes = view_bytes(&buffer, offset, length)?;
             *parts += 1;
@@ -391,15 +396,18 @@ fn convert_part(
                 .map_err(|_| type_error("the view offset exceeds the addressable range"))?;
             let length = usize::try_from(length)
                 .map_err(|_| type_error("the view length exceeds the addressable range"))?;
+            account_lower_bound(length as u64, lower_bound, limits)?;
             let bytes = view_bytes(&buffer, offset, length)?;
             *parts += 1;
             return Ok(ConvertedBlobPart::Bytes(bytes));
         }
         if let Some(native) = object.downcast_ref::<BlobNative>() {
+            account_lower_bound(native.blob_data().size(), lower_bound, limits)?;
             *parts += 1;
             return Ok(ConvertedBlobPart::Shared(native.blob_data().clone()));
         }
         if let Some(native) = object.downcast_ref::<FileNative>() {
+            account_lower_bound(native.blob_data().size(), lower_bound, limits)?;
             *parts += 1;
             return Ok(ConvertedBlobPart::Shared(native.blob_data().clone()));
         }
@@ -412,8 +420,58 @@ fn convert_part(
     // primitive strings): USVString `ToString`; Symbol throws its own
     // `TypeError` unchanged, everything else stringifies.
     let text = usv_string(value, context)?;
+    let transparent_len = u64::try_from(text.len())
+        .map_err(|_| range_error("blob part size exceeds the configured limit"))?;
+    let native_len = line_ending_byte_len(&text)?;
+    account_lower_bound(transparent_len.min(native_len), lower_bound, limits)?;
     *parts += 1;
     Ok(ConvertedBlobPart::Text(text))
+}
+
+/// Adds one phase-1 lower bound without applying `endings` or allocating a
+/// normalized text copy. The bound is deliberately conservative: native line
+/// ending conversion can only select the shorter transparent/native result.
+fn account_lower_bound(
+    part_size: u64,
+    lower_bound: &mut u64,
+    limits: &FileApiLimits,
+) -> JsResult<()> {
+    *lower_bound = lower_bound
+        .checked_add(part_size)
+        .ok_or_else(|| range_error("blob size exceeds the configured limit"))?;
+    if *lower_bound > limits.max_blob_size {
+        return Err(range_error("blob size exceeds the configured limit"));
+    }
+    Ok(())
+}
+
+/// Computes the UTF-8 byte length after native line-ending normalization in a
+/// single pass over an already materialized USVString. No second full String is
+/// created during phase-1 preflight.
+fn line_ending_byte_len(text: &str) -> JsResult<u64> {
+    let target_len: u64 = match platform_native_ending() {
+        NativeLineEnding::Lf => 1,
+        NativeLineEnding::Crlf => 2,
+    };
+    let mut length = 0_u64;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let add = match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                target_len
+            }
+            '\n' => target_len,
+            other => u64::try_from(other.len_utf8())
+                .map_err(|_| range_error("blob part size exceeds the configured limit"))?,
+        };
+        length = length
+            .checked_add(add)
+            .ok_or_else(|| range_error("blob part size exceeds the configured limit"))?;
+    }
+    Ok(length)
 }
 
 /// Applies `endings` and accumulates converted parts into `BlobData`.
@@ -478,8 +536,8 @@ fn get_iterator_method(value: &JsValue, context: &mut Context) -> JsResult<Optio
 /// The sequence converter performs only typed conversion: BufferSource
 /// bytes are copied at element-conversion time, USVString is
 /// materialized at element-conversion time, `Blob`/`File` backings are
-/// retained, and the part count is bounded before unbounded
-/// accumulation. It applies no `endings`, no MIME normalization and no
+/// retained, and the part count and conservative byte-size lower bound are
+/// bounded before unbounded accumulation. It applies no `endings`, no MIME normalization and no
 /// final blob-size accounting — options are not converted yet. Callers
 /// run [`process_converted`] after the remaining arguments are
 /// converted.
@@ -510,11 +568,12 @@ pub(crate) fn convert_sequence(
     let Some(next) = next_value.as_callable() else {
         return Err(type_error("the iterator next method is not callable"));
     };
-    // Part-count pressure is enforced per element inside `convert_part`,
-    // before unbounded accumulation; an infinite iterator therefore ends
-    // deterministically in a quota error. No `return()` runs on any
-    // abrupt completion: errors propagate unchanged.
+    // Part-count and lower-bound size pressure are enforced per element inside
+    // `convert_part`, before unbounded accumulation. An infinite iterator
+    // therefore ends deterministically in a quota error. No `return()` runs
+    // on any abrupt completion: errors propagate unchanged.
     let mut parts = 0_usize;
+    let mut lower_bound = 0_u64;
     let mut converted = Vec::new();
     loop {
         let result_value = next.call(&iterator.clone().into(), &[], context)?;
@@ -526,7 +585,11 @@ pub(crate) fn convert_sequence(
             return Ok(converted);
         }
         let element = result_object.get(js_string!("value"), context)?;
-        converted.push(convert_part(&element, &mut parts, limits, context)?);
+        let part = convert_part(&element, &mut parts, &mut lower_bound, limits, context)?;
+        converted
+            .try_reserve(1)
+            .map_err(|_| range_error("too many blob parts"))?;
+        converted.push(part);
     }
 }
 

@@ -300,8 +300,8 @@ fn read_as_text_sync(this: &JsValue, args: &[JsValue], context: &mut Context) ->
             .unwrap_or(0);
         let size = bytes.len() as u64;
         let chunks = if size == 0 { 0 } else { 1 };
-        // A `replacement`-encoding label decodes every byte to U+FFFD;
-        // the terminal class stays observable without an error path.
+        // A `replacement`-encoding label uses the decoder's replacement
+        // semantics; the terminal class stays observable without an error path.
         let class = if encoding.encoding == encoding_rs::REPLACEMENT {
             "encoding"
         } else {
@@ -316,9 +316,8 @@ fn read_as_text_sync(this: &JsValue, args: &[JsValue], context: &mut Context) ->
             env,
         );
     }
-    Ok(JsValue::from(JsString::from(package::decode_text(
-        &encoding, &bytes,
-    ))))
+    let text = package::decode_text(&encoding, &bytes).map_err(crate::error::js_from_core)?;
+    Ok(JsValue::from(JsString::from(text)))
 }
 
 /// `readAsDataURL(blob)`: exact data URL, or a same-realm `DOMException`.
