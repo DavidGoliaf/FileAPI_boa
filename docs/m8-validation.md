@@ -3,7 +3,7 @@
 Date: 2026-09-08. Branch `task/m8`, base `92192927d8bf9d6ebf3ed4e6ca60c9966e3c4dff` (M7 baseline).
 Local platform: Windows x86_64 MSVC (weak-identity target — live-handle tests are Unix-only by construction).
 Toolchain: cargo 1.91.0, rustc 1.91.0, `wasm32-unknown-unknown` std installed.
-Commit SHA: recorded in `docs/reviews/M8-handoff.md` at commit time (working tree below).
+Commit SHA: `d3e432f` (`Fix M8 release blockers`).
 
 ## Commands (all exit 0 unless noted)
 

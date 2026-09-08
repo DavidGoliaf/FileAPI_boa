@@ -2,7 +2,7 @@
 
 Branch: `task/m8`, base `92192927d8bf9d6ebf3ed4e6ca60c9966e3c4dff` (M7 baseline).
 Status: AWAITING CI — local M8 gates are green; external platform CI has not yet been run on the final commit. Handoff is evidence, not acceptance.
-Implementation commit: PENDING (recorded here at commit time).
+Implementation commit: `d3e432f` (`Fix M8 release blockers`).
 
 ## Implemented
 
@@ -53,7 +53,7 @@ Implementation commit: PENDING (recorded here at commit time).
 ## Demo commands (exit codes on Windows, this tree)
 
 ```powershell
-git rev-parse HEAD # pending commit
+git rev-parse HEAD # d3e432f
 git status --short --branch # 0 after commit
 cargo fmt --all -- --check # 0
 cargo clippy --workspace --all-targets --all-features -- -D warnings # 0
