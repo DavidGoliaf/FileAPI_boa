@@ -762,52 +762,76 @@ pub(crate) fn create_url_for_specs(
     specs: &RegisteredSpecs,
     data: &Arc<BlobData>,
 ) -> Result<String, BlobUrlError> {
-    if specs.shutdown.is_shutdown() {
-        return Err(BlobUrlError::Shutdown);
-    }
-    let descriptor = specs
-        .environment_descriptor()
-        .map_err(|_| BlobUrlError::Malformed)?;
-    if descriptor.creation_forbidden() {
-        return Err(BlobUrlError::Forbidden);
-    }
-    let owner: EnvironmentKey = descriptor.key();
-    let cap = specs.config.limits.max_blob_urls_per_global;
-    if cap == 0 {
-        return Err(BlobUrlError::LimitExceeded);
-    }
-    #[cfg(feature = "url-shim")]
-    {
-        crate::url_shim::insert_url(
-            &specs.url_store,
-            descriptor.serialized_origin(),
-            &owner,
-            data,
-            specs.config.entropy.as_ref(),
-            cap,
-        )
-    }
-    #[cfg(not(feature = "url-shim"))]
-    {
-        use boa_fapi_core::blob_url::{format_blob_url, format_uuid_v4};
-        for _ in 0..8 {
-            let raw = specs.config.entropy.fill_16();
-            if raw == [0_u8; 16] {
-                return Err(BlobUrlError::EntropyUnavailable);
-            }
-            let uuid = format_uuid_v4(raw);
-            let url = format_blob_url(descriptor.serialized_origin(), &uuid);
-            match specs
-                .url_store
-                .insert_capped(url.clone(), owner.clone(), Arc::clone(data), cap)
-            {
-                Ok(()) => return Ok(url),
-                Err(BlobUrlError::Collision) => continue,
-                Err(other) => return Err(other),
-            }
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
+    #[cfg(feature = "tracing")]
+    let trace_env = crate::observability::environment_hash_for_specs(specs);
+    let outcome: Result<String, BlobUrlError> = (|| {
+        if specs.shutdown.is_shutdown() {
+            return Err(BlobUrlError::Shutdown);
         }
-        Err(BlobUrlError::Collision)
+        let descriptor = specs
+            .environment_descriptor()
+            .map_err(|_| BlobUrlError::Malformed)?;
+        if descriptor.creation_forbidden() {
+            return Err(BlobUrlError::Forbidden);
+        }
+        let owner: EnvironmentKey = descriptor.key();
+        let cap = specs.config.limits.max_blob_urls_per_global;
+        if cap == 0 {
+            return Err(BlobUrlError::LimitExceeded);
+        }
+        #[cfg(feature = "url-shim")]
+        {
+            crate::url_shim::insert_url(
+                &specs.url_store,
+                descriptor.serialized_origin(),
+                &owner,
+                data,
+                specs.config.entropy.as_ref(),
+                cap,
+            )
+        }
+        #[cfg(not(feature = "url-shim"))]
+        {
+            use boa_fapi_core::blob_url::{format_blob_url, format_uuid_v4};
+            for _ in 0..8 {
+                let raw = specs.config.entropy.fill_16();
+                if raw == [0_u8; 16] {
+                    return Err(BlobUrlError::EntropyUnavailable);
+                }
+                let uuid = format_uuid_v4(raw);
+                let url = format_blob_url(descriptor.serialized_origin(), &uuid);
+                match specs.url_store.insert_capped(
+                    url.clone(),
+                    owner.clone(),
+                    Arc::clone(data),
+                    cap,
+                ) {
+                    Ok(()) => return Ok(url),
+                    Err(BlobUrlError::Collision) => continue,
+                    Err(other) => return Err(other),
+                }
+            }
+            Err(BlobUrlError::Collision)
+        }
+    })();
+    #[cfg(feature = "tracing")]
+    {
+        let class = match &outcome {
+            Ok(_) => crate::observability::result_class_for_blob_url(None),
+            Err(error) => crate::observability::result_class_for_blob_url(Some(error)),
+        };
+        crate::observability::emit(
+            "blob_url_create",
+            0,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            class,
+            trace_env,
+        );
     }
+    outcome
 }
 
 /// Builds the `Blob` constructor/prototype pair.
@@ -1192,6 +1216,15 @@ impl FileApiHandle {
         // several imports share one registry.
         let tracked = registry.clone();
         self.shutdown.track(move || tracked.close_all());
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        #[cfg(feature = "tracing")]
+        let adapter: Arc<dyn boa_fapi_core::source::ByteSource> = Arc::new(ArcResourceSource::new(
+            resource,
+            self.shutdown.clone(),
+            trace_env,
+        ));
+        #[cfg(not(feature = "tracing"))]
         let adapter: Arc<dyn boa_fapi_core::source::ByteSource> =
             Arc::new(ArcResourceSource::new(resource, self.shutdown.clone()));
         let data = blob::data_from_fs_source(adapter, &options.media_type, self.specs.limits())
@@ -1282,12 +1315,40 @@ impl FileApiHandle {
         &self,
         url: &str,
     ) -> Result<boa_fapi_core::blob_url::ResolvedBlob, BlobUrlError> {
-        let key = self
-            .specs
-            .environment_descriptor()
-            .map(|d| d.key())
-            .map_err(|_| BlobUrlError::Malformed)?;
-        self.specs.url_store.resolve(url, &key)
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome = (|| {
+            let key = self
+                .specs
+                .environment_descriptor()
+                .map(|d| d.key())
+                .map_err(|_| BlobUrlError::Malformed)?;
+            self.specs.url_store.resolve(url, &key)
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, class) = match &outcome {
+                Ok(resolved) => (
+                    resolved.size(),
+                    crate::observability::result_class_for_blob_url(None),
+                ),
+                Err(error) => (
+                    0,
+                    crate::observability::result_class_for_blob_url(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "blob_url_resolve",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                class,
+                trace_env,
+            );
+        }
+        outcome
     }
 
     /// Revokes a Blob URL idempotently.
@@ -1311,19 +1372,53 @@ impl FileApiHandle {
     /// OS handle or snapshot identity. After `shutdown` the call fails
     /// before touching any state.
     pub fn clone_blob(&self, object: &JsObject) -> Result<FileApiClonePayload, CloneError> {
-        if self.is_shutdown() {
-            return Err(CloneError::Shutdown);
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<FileApiClonePayload, CloneError> = (|| {
+            if self.is_shutdown() {
+                return Err(CloneError::Shutdown);
+            }
+            let data = brand::require_blob(&boa_engine::JsValue::from(object.clone()))
+                .map_err(|_| CloneError::InvalidObject)?;
+            let bytes = data
+                .materialize(
+                    self.specs.limits(),
+                    &boa_fapi_core::cancellation::CancellationToken::new(),
+                )
+                .map_err(clone_error_from_core)?;
+            boa_fapi_core::clone::serialized_blob(bytes, data.media_type())
+                .map(FileApiClonePayload::Blob)
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(FileApiClonePayload::Blob(blob)) => {
+                    let size = blob.bytes.len() as u64;
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Ok(_) => (0, 1, crate::observability::result_class_for_clone(None)),
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_encode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
         }
-        let data = brand::require_blob(&boa_engine::JsValue::from(object.clone()))
-            .map_err(|_| CloneError::InvalidObject)?;
-        let bytes = data
-            .materialize(
-                self.specs.limits(),
-                &boa_fapi_core::cancellation::CancellationToken::new(),
-            )
-            .map_err(clone_error_from_core)?;
-        boa_fapi_core::clone::serialized_blob(bytes, data.media_type())
-            .map(FileApiClonePayload::Blob)
+        outcome
     }
 
     /// Encodes a live `File` object into its clone payload.
@@ -1332,20 +1427,54 @@ impl FileApiHandle {
     /// `name` is the already-sanitized display name and `lastModified` the
     /// stored timestamp — no clock is read here.
     pub fn clone_file(&self, object: &JsObject) -> Result<FileApiClonePayload, CloneError> {
-        if self.is_shutdown() {
-            return Err(CloneError::Shutdown);
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<FileApiClonePayload, CloneError> = (|| {
+            if self.is_shutdown() {
+                return Err(CloneError::Shutdown);
+            }
+            let (data, name, last_modified) =
+                brand::require_file(&boa_engine::JsValue::from(object.clone()))
+                    .map_err(|_| CloneError::InvalidObject)?;
+            let bytes = data
+                .materialize(
+                    self.specs.limits(),
+                    &boa_fapi_core::cancellation::CancellationToken::new(),
+                )
+                .map_err(clone_error_from_core)?;
+            boa_fapi_core::clone::serialized_file(bytes, data.media_type(), &name, last_modified)
+                .map(FileApiClonePayload::File)
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(FileApiClonePayload::File(file)) => {
+                    let size = file.bytes.len() as u64;
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Ok(_) => (0, 1, crate::observability::result_class_for_clone(None)),
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_encode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
         }
-        let (data, name, last_modified) =
-            brand::require_file(&boa_engine::JsValue::from(object.clone()))
-                .map_err(|_| CloneError::InvalidObject)?;
-        let bytes = data
-            .materialize(
-                self.specs.limits(),
-                &boa_fapi_core::cancellation::CancellationToken::new(),
-            )
-            .map_err(clone_error_from_core)?;
-        boa_fapi_core::clone::serialized_file(bytes, data.media_type(), &name, last_modified)
-            .map(FileApiClonePayload::File)
+        outcome
     }
 
     /// Encodes a live `FileList` object into its clone payload.
@@ -1362,44 +1491,78 @@ impl FileApiHandle {
         context: &mut Context,
     ) -> Result<FileApiClonePayload, CloneError> {
         use boa_engine::property::PropertyKey;
-        if self.is_shutdown() {
-            return Err(CloneError::Shutdown);
-        }
-        let value = boa_engine::JsValue::from(object.clone());
-        let len = brand::require_file_list(&value).map_err(|_| CloneError::InvalidObject)?;
-        if len > boa_fapi_core::clone::MAX_ENCODE_FILES {
-            return Err(CloneError::LimitExceeded);
-        }
-        // The indexed slots are non-configurable own properties (see
-        // `file_list::create`), so a brand-valid list always yields exactly
-        // `len` elements; a missing slot is a corrupted list, not a short
-        // one — fail rather than emit a partial payload.
-        let mut files = Vec::new();
-        for index in 0..len {
-            let index_u32 = u32::try_from(index).map_err(|_| CloneError::LimitExceeded)?;
-            let element = object
-                .get(PropertyKey::from(index_u32), context)
-                .map_err(|_| CloneError::InvalidObject)?;
-            let Some(element) = element.as_object() else {
-                return Err(CloneError::InvalidObject);
-            };
-            let (data, name, last_modified) =
-                brand::require_file(&boa_engine::JsValue::from(element.clone()))
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<FileApiClonePayload, CloneError> = (|| {
+            if self.is_shutdown() {
+                return Err(CloneError::Shutdown);
+            }
+            let value = boa_engine::JsValue::from(object.clone());
+            let len = brand::require_file_list(&value).map_err(|_| CloneError::InvalidObject)?;
+            if len > boa_fapi_core::clone::MAX_ENCODE_FILES {
+                return Err(CloneError::LimitExceeded);
+            }
+            // The indexed slots are non-configurable own properties (see
+            // `file_list::create`), so a brand-valid list always yields exactly
+            // `len` elements; a missing slot is a corrupted list, not a short
+            // one — fail rather than emit a partial payload.
+            let mut files = Vec::new();
+            for index in 0..len {
+                let index_u32 = u32::try_from(index).map_err(|_| CloneError::LimitExceeded)?;
+                let element = object
+                    .get(PropertyKey::from(index_u32), context)
                     .map_err(|_| CloneError::InvalidObject)?;
-            let bytes = data
-                .materialize(
-                    self.specs.limits(),
-                    &boa_fapi_core::cancellation::CancellationToken::new(),
-                )
-                .map_err(clone_error_from_core)?;
-            files.push(boa_fapi_core::clone::serialized_file(
-                bytes,
-                data.media_type(),
-                &name,
-                last_modified,
-            )?);
+                let Some(element) = element.as_object() else {
+                    return Err(CloneError::InvalidObject);
+                };
+                let (data, name, last_modified) =
+                    brand::require_file(&boa_engine::JsValue::from(element.clone()))
+                        .map_err(|_| CloneError::InvalidObject)?;
+                let bytes = data
+                    .materialize(
+                        self.specs.limits(),
+                        &boa_fapi_core::cancellation::CancellationToken::new(),
+                    )
+                    .map_err(clone_error_from_core)?;
+                files.push(boa_fapi_core::clone::serialized_file(
+                    bytes,
+                    data.media_type(),
+                    &name,
+                    last_modified,
+                )?);
+            }
+            Ok(FileApiClonePayload::FileList(files))
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(FileApiClonePayload::FileList(files)) => {
+                    let size: u64 = files.iter().map(|f| f.bytes.len() as u64).sum();
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Ok(_) => (0, 1, crate::observability::result_class_for_clone(None)),
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_encode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
         }
-        Ok(FileApiClonePayload::FileList(files))
+        outcome
     }
 
     /// Decodes a clone payload into a live `Blob` object.
@@ -1414,17 +1577,54 @@ impl FileApiHandle {
         payload: &FileApiClonePayload,
         context: &mut Context,
     ) -> Result<JsObject, CloneError> {
-        self.reject_clone_if_shutdown()?;
-        let FileApiClonePayload::Blob(blob) = payload else {
-            return Err(CloneError::UnexpectedKind);
-        };
-        let data = blob::data_from_bytes(blob.bytes.clone(), &blob.media_type, self.specs.limits())
-            .map_err(clone_error_from_core)?;
-        let _ = context;
-        Ok(blob::create_instance(
-            BlobNative::new(data),
-            self.specs.blob_proto().clone(),
-        ))
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<JsObject, CloneError> = (|| {
+            self.reject_clone_if_shutdown()?;
+            let FileApiClonePayload::Blob(blob) = payload else {
+                return Err(CloneError::UnexpectedKind);
+            };
+            let data =
+                blob::data_from_bytes(blob.bytes.clone(), &blob.media_type, self.specs.limits())
+                    .map_err(clone_error_from_core)?;
+            let _ = context;
+            Ok(blob::create_instance(
+                BlobNative::new(data),
+                self.specs.blob_proto().clone(),
+            ))
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(_) => {
+                    let size = match payload {
+                        FileApiClonePayload::Blob(blob) => blob.bytes.len() as u64,
+                        _ => 0,
+                    };
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_decode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
+        }
+        outcome
     }
 
     /// Decodes a clone payload into a live `File` object.
@@ -1437,21 +1637,58 @@ impl FileApiHandle {
         payload: &FileApiClonePayload,
         context: &mut Context,
     ) -> Result<JsObject, CloneError> {
-        self.reject_clone_if_shutdown()?;
-        let FileApiClonePayload::File(file) = payload else {
-            return Err(CloneError::UnexpectedKind);
-        };
-        let data = blob::data_from_bytes(file.bytes.clone(), &file.media_type, self.specs.limits())
-            .map_err(clone_error_from_core)?;
-        let _ = context;
-        Ok(JsObject::from_proto_and_data(
-            self.specs.file_proto().clone(),
-            file::FileNative::new(
-                data,
-                file::normalize_file_name(&file.name),
-                file.last_modified,
-            ),
-        ))
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<JsObject, CloneError> = (|| {
+            self.reject_clone_if_shutdown()?;
+            let FileApiClonePayload::File(file) = payload else {
+                return Err(CloneError::UnexpectedKind);
+            };
+            let data =
+                blob::data_from_bytes(file.bytes.clone(), &file.media_type, self.specs.limits())
+                    .map_err(clone_error_from_core)?;
+            let _ = context;
+            Ok(JsObject::from_proto_and_data(
+                self.specs.file_proto().clone(),
+                file::FileNative::new(
+                    data,
+                    file::normalize_file_name(&file.name),
+                    file.last_modified,
+                ),
+            ))
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(_) => {
+                    let size = match payload {
+                        FileApiClonePayload::File(file) => file.bytes.len() as u64,
+                        _ => 0,
+                    };
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_decode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
+        }
+        outcome
     }
 
     /// Decodes a clone payload into a live `FileList` object.
@@ -1466,29 +1703,70 @@ impl FileApiHandle {
         payload: &FileApiClonePayload,
         context: &mut Context,
     ) -> Result<JsObject, CloneError> {
-        self.reject_clone_if_shutdown()?;
-        let FileApiClonePayload::FileList(files) = payload else {
-            return Err(CloneError::UnexpectedKind);
-        };
-        if files.len() > boa_fapi_core::clone::MAX_ENCODE_FILES {
-            return Err(CloneError::LimitExceeded);
-        }
-        let mut objects = Vec::new();
-        for file in files {
-            let data =
-                blob::data_from_bytes(file.bytes.clone(), &file.media_type, self.specs.limits())
-                    .map_err(clone_error_from_core)?;
-            objects.push(JsObject::from_proto_and_data(
-                self.specs.file_proto().clone(),
-                file::FileNative::new(
-                    data,
-                    file::normalize_file_name(&file.name),
-                    file.last_modified,
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<JsObject, CloneError> = (|| {
+            self.reject_clone_if_shutdown()?;
+            let FileApiClonePayload::FileList(files) = payload else {
+                return Err(CloneError::UnexpectedKind);
+            };
+            if files.len() > boa_fapi_core::clone::MAX_ENCODE_FILES {
+                return Err(CloneError::LimitExceeded);
+            }
+            let mut objects = Vec::new();
+            for file in files {
+                let data = blob::data_from_bytes(
+                    file.bytes.clone(),
+                    &file.media_type,
+                    self.specs.limits(),
+                )
+                .map_err(clone_error_from_core)?;
+                objects.push(JsObject::from_proto_and_data(
+                    self.specs.file_proto().clone(),
+                    file::FileNative::new(
+                        data,
+                        file::normalize_file_name(&file.name),
+                        file.last_modified,
+                    ),
+                ));
+            }
+            file_list::create(objects, &self.specs.file_list_proto, context)
+                .map_err(|_| CloneError::Internal)
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(_) => {
+                    let size: u64 = match payload {
+                        FileApiClonePayload::FileList(files) => {
+                            files.iter().map(|f| f.bytes.len() as u64).sum()
+                        }
+                        _ => 0,
+                    };
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
                 ),
-            ));
+            };
+            crate::observability::emit(
+                "clone_decode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
         }
-        file_list::create(objects, &self.specs.file_list_proto, context)
-            .map_err(|_| CloneError::Internal)
+        outcome
     }
 
     /// Encodes a payload through the registered host bridge.
@@ -1501,16 +1779,49 @@ impl FileApiHandle {
         &self,
         payload: &FileApiClonePayload,
     ) -> Result<Vec<u8>, CloneError> {
-        if self.is_shutdown() {
-            return Err(CloneError::Shutdown);
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<Vec<u8>, CloneError> = (|| {
+            if self.is_shutdown() {
+                return Err(CloneError::Shutdown);
+            }
+            let Some(adapter) = self.specs.config.clone_adapter.as_ref() else {
+                return Err(CloneError::NoBridge);
+            };
+            if adapter.descriptor().version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
+                return Err(CloneError::UnsupportedVersion);
+            }
+            adapter.encode(payload)
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(bytes) => {
+                    let size = bytes.len() as u64;
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_encode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
         }
-        let Some(adapter) = self.specs.config.clone_adapter.as_ref() else {
-            return Err(CloneError::NoBridge);
-        };
-        if adapter.descriptor().version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
-            return Err(CloneError::UnsupportedVersion);
-        }
-        adapter.encode(payload)
+        outcome
     }
 
     /// Decodes bridge bytes into a payload.
@@ -1519,16 +1830,55 @@ impl FileApiHandle {
     /// [`Self::clone_encode_via_bridge`]; decoding itself enforces the
     /// version and the checked bounds.
     pub fn clone_decode_via_bridge(&self, bytes: &[u8]) -> Result<FileApiClonePayload, CloneError> {
-        if self.is_shutdown() {
-            return Err(CloneError::Shutdown);
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_env = crate::observability::environment_hash_for_specs(&self.specs);
+        let outcome: Result<FileApiClonePayload, CloneError> = (|| {
+            if self.is_shutdown() {
+                return Err(CloneError::Shutdown);
+            }
+            let Some(adapter) = self.specs.config.clone_adapter.as_ref() else {
+                return Err(CloneError::NoBridge);
+            };
+            if adapter.descriptor().version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
+                return Err(CloneError::UnsupportedVersion);
+            }
+            adapter.decode(bytes)
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (size, chunks, class) = match &outcome {
+                Ok(payload) => {
+                    let size: u64 = match payload {
+                        FileApiClonePayload::Blob(blob) => blob.bytes.len() as u64,
+                        FileApiClonePayload::File(file) => file.bytes.len() as u64,
+                        FileApiClonePayload::FileList(files) => {
+                            files.iter().map(|f| f.bytes.len() as u64).sum()
+                        }
+                    };
+                    (
+                        size,
+                        if size == 0 { 0 } else { 1 },
+                        crate::observability::result_class_for_clone(None),
+                    )
+                }
+                Err(error) => (
+                    0,
+                    0,
+                    crate::observability::result_class_for_clone(Some(error)),
+                ),
+            };
+            crate::observability::emit(
+                "clone_decode",
+                size,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                trace_env,
+            );
         }
-        let Some(adapter) = self.specs.config.clone_adapter.as_ref() else {
-            return Err(CloneError::NoBridge);
-        };
-        if adapter.descriptor().version != boa_fapi_core::clone::CLONE_ENCODING_VERSION {
-            return Err(CloneError::UnsupportedVersion);
-        }
-        adapter.decode(bytes)
+        outcome
     }
 
     /// Fails with [`CloneError::Shutdown`] when the runtime is shut down.
@@ -1586,9 +1936,11 @@ struct ArcResourceSource {
     import_snapshot: boa_fapi_core::snapshot::SnapshotState,
     len: u64,
     shutdown: crate::lifecycle::ShutdownFlag,
+    #[cfg(feature = "tracing")]
+    trace_env: u64,
 }
 
-#[cfg(feature = "fs")]
+#[cfg(all(feature = "fs", not(feature = "tracing")))]
 impl ArcResourceSource {
     /// Captures the import snapshot and length without creating JS state.
     fn new(
@@ -1609,6 +1961,29 @@ impl ArcResourceSource {
     }
 }
 
+#[cfg(all(feature = "fs", feature = "tracing"))]
+impl ArcResourceSource {
+    /// Captures the import snapshot and length without creating JS state.
+    fn new(
+        resource: std::sync::Arc<dyn boa_fapi_core::policy::FileResource>,
+        shutdown: crate::lifecycle::ShutdownFlag,
+        trace_env: u64,
+    ) -> Self {
+        let import_snapshot = resource.import_snapshot();
+        let len = match &import_snapshot {
+            boa_fapi_core::snapshot::SnapshotState::Filesystem(state) => state.size(),
+            _ => 0,
+        };
+        Self {
+            resource,
+            import_snapshot,
+            len,
+            shutdown,
+            trace_env,
+        }
+    }
+}
+
 #[cfg(feature = "fs")]
 impl boa_fapi_core::source::ByteSource for ArcResourceSource {
     fn len(&self) -> u64 {
@@ -1625,48 +2000,84 @@ impl boa_fapi_core::source::ByteSource for ArcResourceSource {
         cancel: &boa_fapi_core::cancellation::CancellationToken,
     ) -> Result<bytes::Bytes, boa_fapi_core::file_api_error::FileApiError> {
         use boa_fapi_core::file_api_error::FileApiError;
-        if cancel.is_cancelled() || self.shutdown.cancel_token().is_cancelled() {
-            return Err(FileApiError::Cancelled);
+        #[cfg(feature = "tracing")]
+        let trace_start = crate::observability::now();
+        #[cfg(feature = "tracing")]
+        let trace_len = range.end.saturating_sub(range.start);
+        let outcome: Result<bytes::Bytes, FileApiError> = (|| {
+            if cancel.is_cancelled() || self.shutdown.cancel_token().is_cancelled() {
+                return Err(FileApiError::Cancelled);
+            }
+            if self.shutdown.is_shutdown() {
+                return Err(FileApiError::Cancelled);
+            }
+            if range.start > range.end {
+                return Err(FileApiError::InvalidRange);
+            }
+            let len_u64 = range
+                .end
+                .checked_sub(range.start)
+                .ok_or(FileApiError::InvalidRange)?;
+            if range.end > self.len {
+                return Err(FileApiError::InvalidRange);
+            }
+            let len = usize::try_from(len_u64).map_err(|_| {
+                FileApiError::ResourceLimit(
+                    boa_fapi_core::error::ResourceLimitKind::MaterializeBytes,
+                )
+            })?;
+            if len == 0 {
+                return Ok(bytes::Bytes::new());
+            }
+            // Snapshot validation before the read: replacement, truncation,
+            // deletion, or permission change fails here with no bytes out.
+            let live = self.resource.current_snapshot()?;
+            if live != self.import_snapshot {
+                return Err(FileApiError::SnapshotChanged);
+            }
+            if cancel.is_cancelled() || self.shutdown.cancel_token().is_cancelled() {
+                return Err(FileApiError::Cancelled);
+            }
+            let bytes = self.resource.read_at(range.start, len)?;
+            if bytes.len() != len {
+                return Err(FileApiError::InvalidRange);
+            }
+            // Post-read identity confirmation: a replacement racing the read
+            // surfaces here (or on the next chunk), never as partial old bytes.
+            let after = self.resource.current_snapshot()?;
+            if after != self.import_snapshot {
+                return Err(FileApiError::SnapshotChanged);
+            }
+            Ok(bytes::Bytes::from(bytes))
+        })();
+        #[cfg(feature = "tracing")]
+        {
+            let (chunks, class) = match &outcome {
+                Ok(bytes) => {
+                    let chunks = if bytes.is_empty() { 0 } else { 1 };
+                    (chunks, crate::observability::result_class_for_core(None))
+                }
+                Err(error) => {
+                    let class = if self.shutdown.is_shutdown()
+                        && matches!(error, FileApiError::Cancelled)
+                    {
+                        "shutdown"
+                    } else {
+                        crate::observability::result_class_for_core(Some(error))
+                    };
+                    (0, class)
+                }
+            };
+            crate::observability::emit(
+                "fs_read",
+                trace_len,
+                crate::observability::elapsed_ms(trace_start),
+                chunks,
+                class,
+                self.trace_env,
+            );
         }
-        if self.shutdown.is_shutdown() {
-            return Err(FileApiError::Cancelled);
-        }
-        if range.start > range.end {
-            return Err(FileApiError::InvalidRange);
-        }
-        let len_u64 = range
-            .end
-            .checked_sub(range.start)
-            .ok_or(FileApiError::InvalidRange)?;
-        if range.end > self.len {
-            return Err(FileApiError::InvalidRange);
-        }
-        let len = usize::try_from(len_u64).map_err(|_| {
-            FileApiError::ResourceLimit(boa_fapi_core::error::ResourceLimitKind::MaterializeBytes)
-        })?;
-        if len == 0 {
-            return Ok(bytes::Bytes::new());
-        }
-        // Snapshot validation before the read: replacement, truncation,
-        // deletion, or permission change fails here with no bytes out.
-        let live = self.resource.current_snapshot()?;
-        if live != self.import_snapshot {
-            return Err(FileApiError::SnapshotChanged);
-        }
-        if cancel.is_cancelled() || self.shutdown.cancel_token().is_cancelled() {
-            return Err(FileApiError::Cancelled);
-        }
-        let bytes = self.resource.read_at(range.start, len)?;
-        if bytes.len() != len {
-            return Err(FileApiError::InvalidRange);
-        }
-        // Post-read identity confirmation: a replacement racing the read
-        // surfaces here (or on the next chunk), never as partial old bytes.
-        let after = self.resource.current_snapshot()?;
-        if after != self.import_snapshot {
-            return Err(FileApiError::SnapshotChanged);
-        }
-        Ok(bytes::Bytes::from(bytes))
+        outcome
     }
 }
 

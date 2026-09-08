@@ -117,11 +117,15 @@ fn settle_read(
     resolvers: &ResolvingFunctions,
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     #[cfg(feature = "fs")]
     if crate::extension::snapshot(context)
         .map(|specs| specs.shutdown.is_shutdown())
         .unwrap_or(false)
     {
+        // Shutdown late completion: settle the rejection for ordering but
+        // publish no telemetry event.
         reject_with(&FileApiError::Cancelled, &resolvers.reject, context)?;
         return Ok(JsValue::undefined());
     }
@@ -135,6 +139,21 @@ fn settle_read(
     let bytes = match request.data.materialize(&request.limits, &cancel) {
         Ok(bytes) => bytes,
         Err(error) => {
+            #[cfg(feature = "tracing")]
+            {
+                let specs_hash = crate::extension::snapshot(context)
+                    .ok()
+                    .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+                    .unwrap_or(0);
+                crate::observability::emit(
+                    "promise_read",
+                    request.data.size(),
+                    crate::observability::elapsed_ms(trace_start),
+                    0,
+                    crate::observability::result_class_for_core(Some(&error)),
+                    specs_hash,
+                );
+            }
             reject_with(&error, &resolvers.reject, context)?;
             return Ok(JsValue::undefined());
         }
@@ -142,6 +161,22 @@ fn settle_read(
     let value = match package_bytes(request.mode, &bytes, context) {
         Ok(value) => value,
         Err(error) => {
+            #[cfg(feature = "tracing")]
+            {
+                let specs_hash = crate::extension::snapshot(context)
+                    .ok()
+                    .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+                    .unwrap_or(0);
+                let chunks = if bytes.is_empty() { 0 } else { 1 };
+                crate::observability::emit(
+                    "promise_read",
+                    request.data.size(),
+                    crate::observability::elapsed_ms(trace_start),
+                    chunks,
+                    "error",
+                    specs_hash,
+                );
+            }
             resolvers.reject.call(
                 &JsValue::undefined(),
                 &[error_to_value(error, context)],
@@ -150,6 +185,22 @@ fn settle_read(
             return Ok(JsValue::undefined());
         }
     };
+    #[cfg(feature = "tracing")]
+    {
+        let specs_hash = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        let chunks = if request.data.size() == 0 { 0 } else { 1 };
+        crate::observability::emit(
+            "promise_read",
+            request.data.size(),
+            crate::observability::elapsed_ms(trace_start),
+            chunks,
+            "ok",
+            specs_hash,
+        );
+    }
     resolvers
         .resolve
         .call(&JsValue::undefined(), &[value], context)?;

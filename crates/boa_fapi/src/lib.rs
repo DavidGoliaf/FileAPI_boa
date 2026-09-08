@@ -94,6 +94,8 @@ mod filereader;
 #[cfg(feature = "dom-shim")]
 mod filereader_sync;
 mod lifecycle;
+#[cfg(feature = "tracing")]
+mod observability;
 #[cfg(feature = "dom-shim")]
 mod package;
 mod promise_read;

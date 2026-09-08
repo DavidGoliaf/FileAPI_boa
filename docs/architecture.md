@@ -262,6 +262,21 @@ boa_fapi_fs → boa_fapi_core + bytes + thiserror + std::fs
 boa_fapi_wpt → boa_fapi + boa_engine + thiserror (M7 harness: manifest, runner, reports, CLI; zero new deps)
 ```
 
+### Layer 5: `boa_fapi` terminal-only `tracing` observer (M8)
+
+`observability.rs` (compiled only with the default-off `tracing` feature)
+is a terminal-only observer with no JS/IO coupling: one
+`boa_fapi::file_api.operation` event per completion (`promise_read`,
+`stream_read`, `filereader_read`, `filereader_sync`, `fs_read`,
+`blob_url_create`, `blob_url_resolve`, `clone_encode`, `clone_decode`)
+carrying exactly `operation`, `size`, `duration_ms`, `chunk_count`,
+`result_class`, `environment_hash`. Timing uses a Rust monotonic clock for
+`duration_ms` only; the environment hash covers the existing internal key
+with a safe-Rust hasher. Stale FileReader completions and shutdown late
+completions emit nothing. Feature-off builds contain no timer/trace call
+on production paths. M8 adds no runtime-interoperability layer: no new
+globals, handles, adapters, threads, or JS callbacks.
+
 ### Layer 4: `boa_fapi_wpt` conformance harness (M7)
 
 The harness adds no JS API and changes no binding: it drives the

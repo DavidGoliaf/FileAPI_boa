@@ -219,3 +219,15 @@ integration suites live in `crates/boa_fapi_core/tests/`.
 | M7-REWORK-2-F15 | embedded URL/path scrubbing | `runner.rs` — `scrub_token` matches `blob:`/`file:`/HTTP(S)/drive/UNC/abs-Unix anywhere in token, punctuation-preserving, host-kept HTTP(S) | `runner::tests::scrubber_redacts_paths_and_controls`, `report::tests::serializer_checks_*` (url=, parens, drive-comma, UNC-parens, 480-scalar Unicode, controls, round-trip) |
 | M7-REWORK-2-F16 | exact repository identity | `manifest.rs` — exact canonical URL equality (prefix-match retired) | `manifest::tests::rejects_malicious_repository_and_bad_subtest_collision` (wpt-malicious/path/query/fragment/userinfo/http/slash + canonical valid) |
 | M7-REWORK-2-F17 | subtest collision banned in file | `manifest.rs` — per-file `seen_names`, `DuplicateSubtest` (variant A, protocol unchanged) | same test: in-file collision → error, cross-file reuse → ok; stock manifest loads |
+
+## M8-REL — release closure and observability (`boa_fapi`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M8-REL-01 | `tracing` optional, default-off, no JS/API/job behavior change | `crates/boa_fapi/Cargo.toml`, `src/observability.rs` | `m8_observability::tracing_feature_off_has_no_trace_surface`, `cargo hack check --feature-powerset --depth 2` |
+| M8-REL-02 | allow-listed terminal telemetry fields and result classes | `crates/boa_fapi/src/observability.rs` plus exact call sites | `m8_observability::tracing_emits_only_allowlisted_fields`, `::tracing_emits_terminal_result_classes` |
+| M8-SEC-01 | paths, URLs, handles, origin, partition, bytes and error details never enter telemetry | `src/observability.rs`, `docs/security.md` | `m8_observability::tracing_never_leaks_sensitive_values` |
+| M8-RACE-01 | stale completion/shutdown cannot publish late telemetry or alter ordering | `src/filereader.rs`, `src/lifecycle.rs`, `src/observability.rs` | `m8_observability::tracing_preserves_async_order_and_stale_suppression`, existing M7 race suites |
+| M8-REL-03 | core coverage >=85%, boa_fapi coverage >=80% | CI workflow coverage steps | package-specific `cargo llvm-cov` commands and `docs/m8-validation.md` |
+| M8-REL-04 | Linux/macOS/Windows validation and wasm memory-only compilation | `.github/workflows/ci.yml` | CI matrix, wasm steps, `docs/m8-validation.md` |
+| M8-REL-05 | crate README/package metadata/license and fresh-clone package gate | crate READMEs, root `Cargo.toml`, `LICENSE-MIT` | `cargo package --workspace --all-features`, `cargo doc`, `docs/m8-validation.md` |

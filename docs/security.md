@@ -50,6 +50,22 @@
 Full Workers runtime and the WPT harness are separate extension points
 and are not implemented here.
 
+## M8 — telemetry secrecy (optional `tracing`, default off)
+
+- **Allow-list only.** Events carry exactly `operation` (nine fixed
+  names), `size` (`u64`), `duration_ms` (`u64`), `chunk_count` (`u64`),
+  `result_class` (`ok`, `cancelled`, `quota`, `not_found`, `permission`,
+  `snapshot_changed`, `invalid_range`, `encoding`, `shutdown`, `error`),
+  and `environment_hash` (`u64`). No `event` name field exists; the target
+  `boa_fapi::file_api.operation` is the only event identity.
+- **Never logged.** Bytes, bodies, `display_name`, absolute/canonical
+  paths, OS handles, snapshot identities, full blob URLs, UUIDs, origins,
+  partitions, nonces, error messages, and arbitrary `Debug` output never
+  enter telemetry. `environment_hash` is an opaque safe-Rust hash of the
+  existing internal key; sources are never logged separately.
+- **No behavior change.** Tracing never alters JS surface, job ordering,
+  error mapping, or lifetimes; stale/shutdown completions emit nothing.
+
 ## M6 — Blob URL isolation and clone payload secrecy
 
 - **URL guessing/enumeration.** UUIDs are 128-bit OS CSPRNG

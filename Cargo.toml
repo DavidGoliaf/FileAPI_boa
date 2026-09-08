@@ -11,7 +11,7 @@ members = [
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT"
-repository = "https://github.com/nickel-org/boa-fapi"
+repository = "https://github.com/DavidGoliaf/FileAPI_boa"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -34,6 +34,7 @@ boa_gc = "0.22"
 encoding_rs = "0.8"
 base64 = "0.22"
 getrandom = "0.3"
+tracing = "0.1"
 
 [profile.dev]
 opt-level = 0
