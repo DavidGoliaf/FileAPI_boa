@@ -987,7 +987,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::read_pipe;
+    use super::{Args, read_pipe, sha256_hex};
     use std::io::Cursor;
 
     #[test]
@@ -996,5 +996,72 @@ mod tests {
         assert_eq!(capture.bytes, b"12345");
         assert!(capture.overflow);
         assert!(!capture.read_failed);
+    }
+
+    #[test]
+    fn cli_parser_accepts_all_file_run_options() {
+        let argv = [
+            "boa_fapi_wpt",
+            "--manifest",
+            "wpt-manifest.json",
+            "--strict",
+            "--threads",
+            "2",
+            "--filter",
+            "corpus/blob",
+            "--json",
+            "target/report.json",
+            "--junit",
+            "target/report.xml",
+            "--timeout-ms",
+            "42",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let parsed = Args::parse(&argv);
+        assert!(parsed.is_ok());
+        if let Ok(args) = parsed {
+            assert_eq!(args.manifest, "wpt-manifest.json");
+            assert!(args.strict);
+            assert_eq!(args.threads, 2);
+            assert_eq!(args.filter.as_deref(), Some("corpus/blob"));
+            assert_eq!(args.json.as_deref(), Some("target/report.json"));
+            assert_eq!(args.junit.as_deref(), Some("target/report.xml"));
+            assert_eq!(args.timeout_ms, Some(42));
+        }
+    }
+
+    #[test]
+    fn cli_parser_rejects_invalid_or_missing_options() {
+        let missing_manifest = vec!["boa_fapi_wpt".to_owned()];
+        assert!(Args::parse(&missing_manifest).is_err());
+        let invalid_threads = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--threads".to_owned(),
+            "0".to_owned(),
+        ];
+        assert!(Args::parse(&invalid_threads).is_err());
+        let unknown_flag = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--unknown".to_owned(),
+        ];
+        assert!(Args::parse(&unknown_flag).is_err());
+    }
+
+    #[test]
+    fn sha256_helper_matches_standard_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

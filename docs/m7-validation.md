@@ -15,14 +15,14 @@ Local platform: Windows (weak-identity target — live-handle tests are Unix-onl
 | 6 | `cargo test --package boa_fapi --test abort_races -- --nocapture` | 0 | PASS (8) |
 | 7 | `cargo test --package boa_fapi --test abort_races_fs -- --nocapture` | 0 | PASS (1; Unix live path `#[cfg(unix)]`, copy path elsewhere) |
 | 8 | `cargo test --package boa_fapi --test hardening_hooks -- --nocapture` | 0 | PASS (4: differential/fuzz/bench/leak, bounded) |
-| 9 | `cargo test --package boa_fapi_wpt -- --nocapture` | 0 | PASS (18 library + 1 binary test) |
+| 9 | `cargo test --package boa_fapi_wpt -- --nocapture` | 0 | PASS (18 library + 4 binary tests) |
 | 10 | `cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict` | 0 | PASS (38 passed, 0 notrun, 0 unexpected, 7 files; strict_pass=true) |
 | 11 | `cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --threads 2 --json target/wpt-report.json --junit target/wpt-report.xml` | 0 | PASS (SHA-256 `4D5CEC74…9B9CD` — identical to `--threads 1`; artifacts written to `target/`, never committed) |
 | 12 | `cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --filter corpus/blob` | 0 | PASS (22 passed, 0 notrun, 0 unexpected, 3 files — diagnostic subset) |
 | 13 | `cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --filter corpus/blob` | 2 | EXPECTED LAUNCH ERROR (`--filter cannot be combined with --strict`) |
 | 14 | `cargo doc --workspace --no-deps` (`RUSTDOCFLAGS=-Dwarnings`) | 0 | PASS |
 | 15 | `cargo test --package boa_fapi --doc` | 0 | PASS (1) |
-| 16 | `cargo llvm-cov --workspace --all-features --fail-under-lines 80` | 0 | PASS (TOTAL 80.72% lines; harness lib covered, `main.rs` CLI covered only via strict runs) |
+| 16 | `cargo llvm-cov --workspace --all-features --fail-under-lines 80` | 0 | PASS (TOTAL 81.23% lines; CLI parser/SHA-256/bounded-pipe unit paths covered) |
 | 17 | `cargo hack check --feature-powerset --depth 2` | 0 | PASS (20/20 incl. `fs`/`url-shim`/`structured-clone` on/off + wpt crate) |
 | 18 | `cargo deny check` | 0 | PASS (advisories ok, bans ok, licenses ok, sources ok; only pre-existing duplicate-version warnings; zero new deps — SBOM confirms) |
 | 19 | `cargo tree --workspace --all-features --prefix none > target/sbom.txt` | 0 | PASS (SBOM artifact, never committed) |
