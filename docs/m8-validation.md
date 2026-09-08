@@ -65,4 +65,4 @@ Strict run: 38 passed, 0 notrun, 0 unexpected (7 files) — identical corpus and
 ## External CI
 
 - CI workflow updated (`.github/workflows/ci.yml`): matrix `windows-latest`/`ubuntu-latest`/`macos-14`, wasm memory-only steps, per-package coverage gates, both M8 feature-on/feature-off test steps, and `cargo package` step.
-- External CI run URLs: recorded in `docs/reviews/M8-handoff.md` after push (local validation above is Windows-only; Ubuntu/macOS/Windows jobs are AWAITING CI at handoff time).
+- External CI: [run 34209314813](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34209314813) — SUCCESS on `windows-latest`, `ubuntu-latest`, and `macos-14`.

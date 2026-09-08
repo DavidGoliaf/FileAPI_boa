@@ -1,7 +1,7 @@
 # M8 Handoff — release closure and observability (tracing default-off)
 
 Branch: `task/m8`, base `92192927d8bf9d6ebf3ed4e6ca60c9966e3c4dff` (M7 baseline).
-Status: AWAITING CI — local M8 gates are green; external platform CI has not yet been run on the final commit. Handoff is evidence, not acceptance.
+Status: CI GREEN — local and external M8 gates are green on the implementation commit. Handoff is evidence, not acceptance.
 Implementation commit: `d3e432f` (`Fix M8 release blockers`).
 
 ## Implemented
@@ -72,7 +72,7 @@ git diff --check # 0
 
 Coverage totals: core 89.94% lines (gate 85), boa_fapi 87.20% (gate 80),
 workspace 81.08% (gate 80).
-External CI run URLs (Ubuntu/macOS/Windows): AWAITING CI — no run claimed here.
+External CI run: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34209314813 — SUCCESS on Ubuntu/macOS/Windows.
 Changed files: `.github/workflows/ci.yml`, `CHANGELOG.md`, `Cargo.lock`,
 `Cargo.toml`, `QUESTIONS.md`, `README.md`, `LICENSE-MIT`, `.cargo/config.toml`,
 `crates/boa_fapi/Cargo.toml`, four crate READMEs, `src/observability.rs`,
