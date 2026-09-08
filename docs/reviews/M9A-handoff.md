@@ -64,6 +64,18 @@ CI evidence для текущего implementation commit не получено:
 публиковался, external runs и ссылки отсутствуют. Это единственный
 оставшийся acceptance blocker; локальные результаты не выдаются за CI.
 
+## Targeted-search classification
+
+В обязательном `rg`-поиске совпадения классифицированы так: `tasks/19` —
+текущий acceptance task и его поисковая команда; `tasks/05`, `tasks/06`,
+`tasks/11`, `tasks/18` и связанные task-файлы — исторические планы/решения,
+не runtime-oracle; старые записи `docs/m4a-final-audit.md` и
+`docs/DECISIONS.md` — исторические evidence. `Symbol.iterator` в текущих
+M9-тестах и FileList-коде — актуальный protocol surface, а `per byte` в
+`streams.rs`/WPT manifest — несвязанные текущие комментарии. Остальные
+production/test совпадения описывают актуальный fallback/decoder behavior;
+дефектных stale assertions не найдено.
+
 ## Stop boundary
 
 M9-B не начинался. После независимой повторной приёмки дальнейшие изменения
