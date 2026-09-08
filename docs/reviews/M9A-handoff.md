@@ -5,7 +5,7 @@
 | ID | `M9-A-ACCEPTANCE-REMEDIATION` |
 | Ветка | `task/m9a` |
 | Implementation baseline | `271af7552005d5543ae97cb908416c1258f4e57f` |
-| Implementation commit | `8d07e6a` — `Fix permissive MIME and BOM split handling` |
+| Implementation commit | `edb8bb2` — `Accept EOF-terminated MIME quoted strings` |
 | Scope | decoder completeness, MIME parsing, Web IDL constructor order, bounded sequence preflight, snapshot/BOM regressions |
 
 ## Реализация
@@ -15,8 +15,9 @@
   pending output до завершения.
 - MIME `charset` читается только после успешного локального MIME parse:
   type/subtype валидируются, а отдельные malformed parameters пропускаются;
-  quoted values поддерживают `;`, suffix после закрывающей кавычки
-  игнорируется, duplicate parameters используют first-parameter-wins.
+  quoted values поддерживают `;` и завершаются накопленным значением на EOF;
+  suffix после закрывающей кавычки игнорируется, duplicate parameters
+  используют first-parameter-wins.
   Encoding labels очищаются только от ASCII whitespace; неизвестный label
   продолжает fallback MIME → UTF-8.
 - `Blob` и `File` выполняют все argument conversions до observable
@@ -59,14 +60,11 @@ M9, 33 M4 async и 21 M4 sync. `cargo deny` сообщил только суще
 warnings (license fields/duplicate transitive crates), при этом его checks
 `advisories`, `bans`, `licenses` и `sources` — `ok`. `cargo hack` также
 завершился успешно с pre-existing dead-code warnings в feature-reduced
-комбинациях. Incremental remediation diff реализации: 2 файла, 220
-insertions(+), 88 deletions; лимит 3000 строк не превышен.
+комбинациях. Follow-up P0 diff реализации: 2 файла, 9 insertions(+), 18
+deletions; лимит 3000 строк не превышен.
 
-CI evidence получено для remediation-коммита `14bc8b4`:
-[run 34262671553](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34262671553)
-завершился `success`; Windows job `102184263576`, macOS job `102184263749`,
-Ubuntu job `102184263844` — все `success`. В CI прошли workspace tests, WPT
-strict runs, coverage, cargo-hack, cargo-deny, package, docs и diff check.
+CI evidence для follow-up P0 будет добавлено после завершения нового
+workflow run для коммита `edb8bb2`.
 
 ## Targeted-search classification
 

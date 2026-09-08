@@ -49,8 +49,8 @@ references. `FileReader` and `FileReaderSync` share the single
 strings. MIME charset extraction is gated by a successful type/subtype parse;
 malformed individual parameters are skipped as required by the WHATWG MIME
 parser, so later valid parameters remain visible. Quoted values may contain
-semicolons and suffix text after a closing quote is ignored to the next
-separator.
+semicolons, terminate with their accumulated value at EOF, and suffix text
+after a closing quote is ignored to the next separator.
 
 ## Superseded by M9-A (sequence contract)
 
@@ -67,7 +67,8 @@ The explicit label uses Encoding Standard `get an encoding` with only
 leading/trailing ASCII whitespace removed. Failure of that lookup falls
 through to the MIME `charset` parameter and then UTF-8; the readers do not
 turn this fallback into a read error. MIME parsing validates type/subtype and
-parameters, supports quoted values, and uses the first duplicate parameter.
+parameters, supports quoted values including EOF termination, and uses the
+first duplicate parameter.
 The decoder keeps the Encoding Standard BOM authority and must consume all
 input/output across `OutputFull` and EOF flushes. Web IDL constructor
 conversion completes before `NewTarget.prototype` is read. Sequence phase 1
