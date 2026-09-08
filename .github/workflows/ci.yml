@@ -10,12 +10,12 @@ env:
 
 jobs:
   m3-validation:
-    name: M7 validation (${{ matrix.os }})
+    name: M8 validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M7 §11, in order (M1–M6 order preserved, then M7).
+      # Work order M8 §5 (M1–M7 order preserved, then M8).
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -38,6 +38,9 @@ jobs:
 
       - name: cargo test (workspace)
         run: cargo test --workspace --all-features
+
+      - name: cargo test (M8 tracing feature-off guard)
+        run: cargo test --package boa_fapi --test m8_feature_off -- --nocapture
 
       - name: cargo test (M2 JS integration)
         run: cargo test --package boa_fapi --test m2_blob_file_filelist -- --nocapture
@@ -83,6 +86,9 @@ jobs:
 
       - name: cargo test (M7 WPT harness units)
         run: cargo test --package boa_fapi_wpt -- --nocapture
+
+      - name: cargo test (M8 observability)
+        run: cargo test --package boa_fapi --test m8_observability --all-features -- --nocapture
 
       - name: WPT strict run
         run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --json target/wpt-report.json --junit target/wpt-report.xml
@@ -132,11 +138,35 @@ jobs:
       - name: cargo test --doc
         run: cargo test --package boa_fapi --doc
 
+      - name: Install wasm32 target (Ubuntu memory-only gate)
+        if: matrix.os == 'ubuntu-latest'
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: wasm memory-only check (boa_fapi_core)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --target wasm32-unknown-unknown --package boa_fapi_core
+
+      - name: wasm memory-only check (boa_fapi no-default lib)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --target wasm32-unknown-unknown --package boa_fapi --no-default-features --lib
+
+      - name: cargo llvm-cov (boa_fapi_core >= 85)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo llvm-cov --package boa_fapi_core --all-features --fail-under-lines 85
+
+      - name: cargo llvm-cov (boa_fapi >= 80)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 80
+
       - name: cargo llvm-cov
         run: cargo llvm-cov --workspace --all-features --fail-under-lines 80
 
-      - name: cargo hack (feature powerset)
+      - name: cargo hack (feature powerset, incl. tracing)
         run: cargo hack check --feature-powerset --depth 2
+
+      - name: cargo package (workspace)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo package --workspace --all-features
 
       - name: cargo deny fetch db
         run: cargo deny fetch db

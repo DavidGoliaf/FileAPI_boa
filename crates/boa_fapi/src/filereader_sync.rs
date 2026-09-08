@@ -137,6 +137,8 @@ fn read_bytes_sync(
     label_arg: Option<&JsValue>,
     context: &mut Context,
 ) -> JsResult<(bytes::Bytes, DomSpecs, TextEncoding)> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     let _ = require_sync(this)?;
     let data = blob_arg(args)?;
     let specs = crate::extension::snapshot(context)?;
@@ -144,6 +146,10 @@ fn read_bytes_sync(
         .dom_specs()
         .ok_or_else(|| type_error("the DOM shim is not registered"))?;
     let limits = specs.limits().clone();
+    #[cfg(feature = "tracing")]
+    let trace_env = crate::observability::environment_hash_for_specs(&specs);
+    #[cfg(feature = "tracing")]
+    let trace_size = data.size();
     // Encoding label conversion and resolution come after the brand and
     // argument checks, but before the size preflight (same order as the
     // async `readAsText`): an unknown label throws `EncodingError` even
@@ -154,19 +160,49 @@ fn read_bytes_sync(
         Some(value) => Some(dom_string(value, context)?),
     };
     let Some(encoding) = package::resolve_label(label.as_deref()) else {
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "filereader_sync",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "encoding",
+            trace_env,
+        );
         return Err(throw_named(&dom, "EncodingError", "unknown text encoding"));
     };
     // Sync-size preflight before any source read or output allocation.
     if data.size() > limits.max_sync_read_bytes {
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "filereader_sync",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "quota",
+            trace_env,
+        );
         return Err(throw_named(
             &dom,
             "QuotaExceededError",
             "the read exceeds the synchronous read limit",
         ));
     }
-    let bytes = data
-        .materialize(&limits, &CancellationToken::new())
-        .map_err(|error| throw_mapped(&dom, &error))?;
+    let bytes = match data.materialize(&limits, &CancellationToken::new()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "filereader_sync",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                crate::observability::result_class_for_core(Some(&error)),
+                trace_env,
+            );
+            return Err(throw_mapped(&dom, &error));
+        }
+    };
     Ok((bytes, dom, encoding))
 }
 
@@ -177,13 +213,52 @@ fn read_as_array_buffer_sync(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     let (bytes, _, _) = read_bytes_sync(this, args, None, context)?;
-    let buffer = JsArrayBuffer::new(bytes.len(), context)?;
+    let buffer = match JsArrayBuffer::new(bytes.len(), context) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            #[cfg(feature = "tracing")]
+            {
+                let env = crate::extension::snapshot(context)
+                    .ok()
+                    .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+                    .unwrap_or(0);
+                crate::observability::emit(
+                    "filereader_sync",
+                    bytes.len() as u64,
+                    crate::observability::elapsed_ms(trace_start),
+                    0,
+                    crate::observability::ENGINE_ERROR_CLASS,
+                    env,
+                );
+            }
+            return Err(error);
+        }
+    };
     buffer
         .data_mut()
         .as_deref_mut()
         .ok_or_else(|| type_error("fresh ArrayBuffer is detached"))?
         .copy_from_slice(&bytes);
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        let size = bytes.len() as u64;
+        let chunks = if size == 0 { 0 } else { 1 };
+        crate::observability::emit(
+            "filereader_sync",
+            size,
+            crate::observability::elapsed_ms(trace_start),
+            chunks,
+            "ok",
+            env,
+        );
+    }
     Ok(buffer.into())
 }
 
@@ -194,7 +269,26 @@ fn read_as_binary_string_sync(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     let (bytes, _, _) = read_bytes_sync(this, args, None, context)?;
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        let size = bytes.len() as u64;
+        let chunks = if size == 0 { 0 } else { 1 };
+        crate::observability::emit(
+            "filereader_sync",
+            size,
+            crate::observability::elapsed_ms(trace_start),
+            chunks,
+            "ok",
+            env,
+        );
+    }
     Ok(JsValue::from(JsString::from(
         package::package_binary_string(&bytes),
     )))
@@ -203,9 +297,28 @@ fn read_as_binary_string_sync(
 /// `readAsText(blob, encoding?)`: decoded text, or a same-realm
 /// `DOMException`. `length = 1` (the encoding is optional).
 fn read_as_text_sync(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     // The raw label value travels into the shared preamble untouched: its
     // conversion happens there, after the brand and argument checks.
     let (bytes, _, encoding) = read_bytes_sync(this, args, args.get(1), context)?;
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        let size = bytes.len() as u64;
+        let chunks = if size == 0 { 0 } else { 1 };
+        crate::observability::emit(
+            "filereader_sync",
+            size,
+            crate::observability::elapsed_ms(trace_start),
+            chunks,
+            "ok",
+            env,
+        );
+    }
     Ok(JsValue::from(JsString::from(package::decode_text(
         &encoding, &bytes,
     ))))
@@ -218,6 +331,8 @@ fn read_as_data_url_sync(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     let _ = require_sync(this)?;
     let data = blob_arg(args)?;
     let specs = crate::extension::snapshot(context)?;
@@ -225,7 +340,20 @@ fn read_as_data_url_sync(
         .dom_specs()
         .ok_or_else(|| type_error("the DOM shim is not registered"))?;
     let limits = specs.limits().clone();
+    #[cfg(feature = "tracing")]
+    let trace_env = crate::observability::environment_hash_for_specs(&specs);
+    #[cfg(feature = "tracing")]
+    let trace_size = data.size();
     if data.size() > limits.max_sync_read_bytes {
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "filereader_sync",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "quota",
+            trace_env,
+        );
         return Err(throw_named(
             &dom,
             "QuotaExceededError",
@@ -237,17 +365,64 @@ fn read_as_data_url_sync(
     if package::data_url_len(&media_type, data.size())
         .is_none_or(|total| total > limits.max_data_url_output)
     {
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "filereader_sync",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "quota",
+            trace_env,
+        );
         return Err(throw_named(
             &dom,
             "QuotaExceededError",
             "data URL output exceeds the configured limit",
         ));
     }
-    let bytes = data
-        .materialize(&limits, &CancellationToken::new())
-        .map_err(|error| throw_mapped(&dom, &error))?;
-    let url = package::package_data_url(&media_type, &bytes, limits.max_data_url_output)
-        .map_err(|error| throw_mapped(&dom, &error))?;
+    let bytes = match data.materialize(&limits, &CancellationToken::new()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "filereader_sync",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                crate::observability::result_class_for_core(Some(&error)),
+                trace_env,
+            );
+            return Err(throw_mapped(&dom, &error));
+        }
+    };
+    let url = match package::package_data_url(&media_type, &bytes, limits.max_data_url_output) {
+        Ok(url) => url,
+        Err(error) => {
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "filereader_sync",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                crate::observability::result_class_for_core(Some(&error)),
+                trace_env,
+            );
+            return Err(throw_mapped(&dom, &error));
+        }
+    };
+    #[cfg(feature = "tracing")]
+    {
+        let size = bytes.len() as u64;
+        let chunks = if size == 0 { 0 } else { 1 };
+        crate::observability::emit(
+            "filereader_sync",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            chunks,
+            "ok",
+            trace_env,
+        );
+    }
     Ok(JsValue::from(JsString::from(url)))
 }
 

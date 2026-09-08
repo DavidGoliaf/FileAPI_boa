@@ -3,7 +3,7 @@ name = "boa_fapi_core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Platform-independent File API data model and algorithms for Boa"
 documentation = "https://docs.rs/boa_fapi_core"
 

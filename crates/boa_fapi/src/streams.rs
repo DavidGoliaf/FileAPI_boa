@@ -118,6 +118,9 @@ pub(crate) struct StreamShared {
     pending: usize,
     /// Next FIFO sequence number for a queued `read()`.
     next_seq: u64,
+    /// Logical Blob size at stream creation (telemetry `size` only).
+    #[cfg(feature = "tracing")]
+    total_size: u64,
 }
 
 /// One queued `read()` request: its sequence number.
@@ -310,6 +313,8 @@ fn create_stream(
         }
         other => crate::error::js_from_core(other),
     })?;
+    #[cfg(feature = "tracing")]
+    let total_size = data.size();
     let shared = Rc::new(RefCell::new(StreamShared {
         reader: Some(reader),
         mode,
@@ -319,6 +324,8 @@ fn create_stream(
         errored: None,
         pending: 0,
         next_seq: 0,
+        #[cfg(feature = "tracing")]
+        total_size,
     }));
     let specs = crate::extension::snapshot(context)?;
     #[cfg(feature = "streams-shim")]
@@ -514,9 +521,12 @@ fn pump_one(
     resolvers: &ResolvingFunctions,
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     // Shutdown: settle nothing further against a destroyed context. Pending
     // reads already hold their resolvers, but resolving them would deliver
     // callbacks after shutdown, so late completions are dropped silently.
+    // No telemetry event is published for a shutdown late completion.
     #[cfg(feature = "fs")]
     if crate::extension::snapshot(context)
         .map(|specs| specs.shutdown.is_shutdown())
@@ -524,6 +534,15 @@ fn pump_one(
     {
         return Ok(JsValue::undefined());
     }
+    #[cfg(feature = "tracing")]
+    let (trace_size, trace_env) = {
+        let size = shared.borrow().total_size;
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        (size, env)
+    };
     {
         let mut state = shared.borrow_mut();
         state.pending = state.pending.saturating_sub(1);
@@ -542,12 +561,30 @@ fn pump_one(
     };
     if let Some(is_error) = terminal {
         if is_error {
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "stream_read",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                crate::observability::result_class_for_core(Some(&FileApiError::Internal)),
+                trace_env,
+            );
             let reason = stream_error_reason(context, &FileApiError::Internal);
             resolvers
                 .reject
                 .call(&JsValue::undefined(), &[reason], context)?;
             return Ok(JsValue::undefined());
         }
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "stream_read",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "cancelled",
+            trace_env,
+        );
         let done = iter_result(JsValue::undefined(), true, context)?;
         resolvers
             .resolve
@@ -560,6 +597,15 @@ fn pump_one(
         let mut state = shared.borrow_mut();
         let Some(reader) = state.reader.as_mut() else {
             drop(state);
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "stream_read",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                "ok",
+                trace_env,
+            );
             let done = iter_result(JsValue::undefined(), true, context)?;
             resolvers
                 .resolve
@@ -569,6 +615,15 @@ fn pump_one(
         match reader.read_next() {
             Ok(chunk) => chunk,
             Err(error) => {
+                #[cfg(feature = "tracing")]
+                crate::observability::emit(
+                    "stream_read",
+                    trace_size,
+                    crate::observability::elapsed_ms(trace_start),
+                    0,
+                    crate::observability::result_class_for_core(Some(&error)),
+                    trace_env,
+                );
                 let reason = stream_error_reason(context, &error);
                 state.errored = Some(StreamErrorClass::ReadFailed);
                 state.reader = None;
@@ -588,12 +643,22 @@ fn pump_one(
         None => {
             // EOF: flush the text decoder (exact replacement semantics),
             // then resolve done. A non-empty flush is a final value chunk,
-            // never an empty `done:false` string.
+            // never an empty `done:false` string. EOF itself carries no
+            // data chunk.
             let mut state = shared.borrow_mut();
             if request.mode == StreamMode::Text {
                 let tail = state.decoder.flush();
                 if !tail.is_empty() {
                     drop(state);
+                    #[cfg(feature = "tracing")]
+                    crate::observability::emit(
+                        "stream_read",
+                        trace_size,
+                        crate::observability::elapsed_ms(trace_start),
+                        1,
+                        "ok",
+                        trace_env,
+                    );
                     let done = iter_result(JsValue::from(JsString::from(tail)), false, context)?;
                     resolvers
                         .resolve
@@ -602,6 +667,15 @@ fn pump_one(
                 }
             }
             drop(state);
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "stream_read",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                0,
+                "ok",
+                trace_env,
+            );
             let done = iter_result(JsValue::undefined(), true, context)?;
             resolvers
                 .resolve
@@ -622,6 +696,15 @@ fn pump_one(
                         PumpChunk::Eof => {
                             let tail = shared.borrow_mut().decoder.flush();
                             if tail.is_empty() {
+                                #[cfg(feature = "tracing")]
+                                crate::observability::emit(
+                                    "stream_read",
+                                    trace_size,
+                                    crate::observability::elapsed_ms(trace_start),
+                                    0,
+                                    "ok",
+                                    trace_env,
+                                );
                                 let done = iter_result(JsValue::undefined(), true, context)?;
                                 resolvers
                                     .resolve
@@ -632,6 +715,17 @@ fn pump_one(
                             break;
                         }
                         PumpChunk::Failed => {
+                            #[cfg(feature = "tracing")]
+                            crate::observability::emit(
+                                "stream_read",
+                                trace_size,
+                                crate::observability::elapsed_ms(trace_start),
+                                0,
+                                crate::observability::result_class_for_core(Some(
+                                    &FileApiError::Internal,
+                                )),
+                                trace_env,
+                            );
                             mark_errored(shared);
                             let reason = stream_error_reason(context, &FileApiError::Internal);
                             resolvers
@@ -641,13 +735,45 @@ fn pump_one(
                         }
                     }
                 }
+                #[cfg(feature = "tracing")]
+                crate::observability::emit(
+                    "stream_read",
+                    trace_size,
+                    crate::observability::elapsed_ms(trace_start),
+                    1,
+                    "ok",
+                    trace_env,
+                );
                 let done = iter_result(JsValue::from(JsString::from(text)), false, context)?;
                 resolvers
                     .resolve
                     .call(&JsValue::undefined(), &[done], context)?;
                 return Ok(JsValue::undefined());
             }
-            let value = package_bytes_chunk(&bytes, context)?;
+            let value = match package_bytes_chunk(&bytes, context) {
+                Ok(value) => value,
+                Err(error) => {
+                    #[cfg(feature = "tracing")]
+                    crate::observability::emit(
+                        "stream_read",
+                        trace_size,
+                        crate::observability::elapsed_ms(trace_start),
+                        0,
+                        "error",
+                        trace_env,
+                    );
+                    return Err(error);
+                }
+            };
+            #[cfg(feature = "tracing")]
+            crate::observability::emit(
+                "stream_read",
+                trace_size,
+                crate::observability::elapsed_ms(trace_start),
+                1,
+                "ok",
+                trace_env,
+            );
             let done = iter_result(value, false, context)?;
             resolvers
                 .resolve

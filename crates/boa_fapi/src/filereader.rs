@@ -491,6 +491,8 @@ fn fail_fast(
     message: &str,
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     let generation = queue_mut(context).map(next_generation)?;
     {
         let mut native = object
@@ -506,6 +508,30 @@ fn fail_fast(
         native.terminal_dispatched = false;
         native.total = total;
         native.loaded = 0;
+    }
+    #[cfg(feature = "tracing")]
+    {
+        let result_class = match name {
+            "EncodingError" => "encoding",
+            "QuotaExceededError" => "quota",
+            // `SecurityError` here is only the concurrent-reads quota path.
+            "SecurityError" => "quota",
+            // `AbortError` here is only the post-shutdown fast path.
+            "AbortError" => "shutdown",
+            _ => "error",
+        };
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        crate::observability::emit(
+            "filereader_read",
+            total,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            result_class,
+            env,
+        );
     }
     enqueue_reading_job(
         context,
@@ -653,6 +679,8 @@ fn read_as_data_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> 
 /// releases the quota slot once, sets `(DONE, null, null)`, then queues
 /// `abort` followed conditionally by `loadend`.
 fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     let object = require_reader(this)?;
     let loading = object
         .downcast_ref::<FileReaderNative>()
@@ -686,6 +714,21 @@ fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<J
         native.terminal_dispatched = false;
         native.total = total;
         native.loaded = loaded;
+    }
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        crate::observability::emit(
+            "filereader_read",
+            total,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "cancelled",
+            env,
+        );
     }
     enqueue_reading_job(
         context,
@@ -881,6 +924,8 @@ fn finish_at_eof(
     now: i64,
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     if !generation_current(reader, generation) {
         return Ok(JsValue::undefined());
     }
@@ -953,6 +998,22 @@ fn finish_at_eof(
         native.terminal_dispatched = false;
         native.loaded = total;
     }
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        let chunks = if total == 0 { 0 } else { 1 };
+        crate::observability::emit(
+            "filereader_read",
+            total,
+            crate::observability::elapsed_ms(trace_start),
+            chunks,
+            "ok",
+            env,
+        );
+    }
     release_slot(context)?;
     enqueue_reading_job(
         context,
@@ -980,9 +1041,13 @@ fn fail_operation(
     error: &FileApiError,
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
     if !generation_current(reader, generation) {
         return Ok(JsValue::undefined());
     }
+    #[cfg(feature = "tracing")]
+    let trace_class = crate::observability::result_class_for_core(Some(error));
     let (name, message) = dom::map_core_error(error);
     {
         let mut native = reader
@@ -998,6 +1063,21 @@ fn fail_operation(
             message: message.to_owned(),
         });
         native.terminal_dispatched = false;
+    }
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        crate::observability::emit(
+            "filereader_read",
+            total,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            trace_class,
+            env,
+        );
     }
     release_slot(context)?;
     enqueue_reading_job(

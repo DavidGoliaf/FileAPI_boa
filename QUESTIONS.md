@@ -36,3 +36,17 @@ toolchain.
 
 Блокеров нет для адаптированного набора. Полный upstream pass —
 `NOTRUN` по capability gaps (точные записи в expectations), не PASS.
+
+## Q4 (M8): wasm memory-only `cargo check` для `boa_fapi --no-default-features --lib`
+
+**Решено в M8.** Для `wasm32-unknown-unknown` включены штатная feature
+`boa_engine::js`, `getrandom/wasm_js` для прямой зависимости `boa_fapi` и
+cfg `getrandom_backend="wasm_js"` в `.cargo/config.toml`. Native targets
+этим изменением не затрагиваются; новых dependencies и public API нет.
+
+- Команда: `cargo check --target wasm32-unknown-unknown --package boa_fapi
+  --no-default-features --lib`
+- Результат после исправления: exit 0; остаются только pre-existing
+  dead-code warnings для отключённых host-only helpers.
+- `cargo check --target wasm32-unknown-unknown --package boa_fapi_core` также
+  проходит.

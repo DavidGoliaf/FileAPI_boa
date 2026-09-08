@@ -716,3 +716,54 @@ std threads в порядке manifest (без `rayon`); время — `std::ti
 Последствия: `boa_fapi_wpt` зависит только от уже принятых крейтов;
 SBOM-артефакт CI подтверждает отсутствие новых лицензий; отдельный
 dependency-ADR не нужен сверх этой записи.
+
+## ADR-0034 (M8): единственная optional `tracing`-зависимость для terminal telemetry
+
+Контекст: M8 требует terminal-only наблюдаемость девяти операций с
+фиксированным allow-list из шести полей (§11.3), default-off, без
+изменения JS API, порядка jobs, ошибок и lifetime. Нужен зрелый
+инструментарий событий вместо ручного логгера; `tracing-subscriber`,
+`tokio`, `futures`, `serde` и любые другие зависимости запрещены заказом.
+
+Решение: `tracing = "0.1"` — workspace dependency, в `boa_fapi` только
+optional (`tracing = ["dep:tracing"]`, не в `default`). Мотивация:
+tokio-ecosystem стандарт де-факто для structured events (активно
+поддерживается tokio-rs, десятки миллионов загрузок), пермиссивная
+лицензия MIT (allow-list `deny.toml` не меняется), MSRV 1.63 (ниже нашего
+1.91), `no_std`-совместима в нужном профиле, без `unsafe` в нашем коде
+(только `info!`/`event!` макросы с шестью типизированными полями).
+Транзитивно тянет только `tracing-core` + `tracing-attributes` (обе MIT).
+Более узкого решения нет: `log`/`env_logger` не дают типизированных
+полей и target-идентичности события; ручной subscriber-фасад дублировал
+бы `tracing::Subscriber` без выигрыша в secrecy-контроле. Схема события
+фиксирована: target `boa_fapi::file_api.operation` — единственный
+идентификатор (отдельного поля `event` нет); `operation` (9 имён),
+`size`/`duration_ms`/`chunk_count`/`environment_hash` (`u64`),
+`result_class` (10 классов). Тестовый collector — только
+`tracing::Subscriber` + std (без `tracing-subscriber`).
+
+Последствия: feature-off сборки не содержат dependency в графе
+(`cargo hack --feature-powerset` зелёный, `cargo tree` без tracing без
+фичи); `cargo-deny` чист (только pre-existing duplicate-version
+warnings); telemetry-слой — внутренний instrumentation без публичных
+адаптеров и без вызовов JS.
+
+## ADR-0035 (M8): wasm backend для уже существующей Boa entropy-зависимости
+
+Контекст: обязательный memory-only gate M8 собирает `boa_fapi` на
+`wasm32-unknown-unknown` с отключёнными File API features. `boa_engine` и
+`boa_fapi` используют уже существующие `getrandom` 0.4 и 0.3; без web
+backend upstream crates намеренно завершаются `compile_error!`. Добавлять
+новый runtime, JS API или новый crate для этого gate нельзя.
+
+Решение: для wasm target включать существующую feature `boa_engine::js`,
+которая подключает его штатный `getrandom/wasm_js` backend, и
+`getrandom/wasm_js` для прямой зависимости `boa_fapi`. В корневом
+`.cargo/config.toml` зафиксировать требуемый для `getrandom` 0.3 cfg
+`getrandom_backend="wasm_js"`. На native targets dependency features и
+rustflags не меняются; новых зависимостей и public API нет.
+
+Последствия: оба обязательных wasm `cargo check` проходят воспроизводимо,
+а web entropy implementation остаётся штатной реализацией upstream. Runtime
+использование File API на wasm по-прежнему не расширяется: M8 проверяет
+только memory-only compilation gate.

@@ -141,6 +141,28 @@ full WHATWG Streams (`pipeTo`, `tee`, BYOB, transformers).
   Reports are written with `--json`/`--junit` (CI artifacts, never
   committed). Full DOM/HTML/Workers/Fetch/full Streams stay explicitly
   out of scope (exact capability gaps in expectations, never PASS).
+- **M8 (release closure, no new JS API)**: reproducible quality gate —
+  per-package coverage (`boa_fapi_core` ≥ 85%, `boa_fapi` ≥ 80%),
+  Linux/macOS/Windows CI plus `wasm32-unknown-unknown` memory-only checks,
+  and an optional default-off `tracing` observer with six fixed fields.
+  `tracing` never changes JS surface, job ordering, errors, or lifetimes.
+
+## Release closure (M8)
+
+```sh
+cargo llvm-cov --package boa_fapi_core --all-features --fail-under-lines 85
+cargo llvm-cov --package boa_fapi --all-features --fail-under-lines 80
+cargo check --target wasm32-unknown-unknown --package boa_fapi_core
+cargo check --target wasm32-unknown-unknown --package boa_fapi --no-default-features --lib
+cargo test --package boa_fapi --test m8_observability --all-features -- --nocapture
+cargo package --workspace --all-features
+```
+
+`tracing` is default-off: without `--all-features`/`--features tracing`
+no `tracing` dependency is compiled in and M1–M7 behavior is unchanged.
+With the feature on, one `boa_fapi::file_api.operation` event fires per
+terminal completion; see `crates/boa_fapi/README.md` and `docs/security.md`.
+
 ## Building
 
 ```sh
