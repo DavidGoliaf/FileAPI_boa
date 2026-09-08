@@ -264,7 +264,7 @@ fn dom_exception_names_and_error_inheritance() {
     assert_eval(
         &mut context,
         r"
-        ['InvalidStateError', 'NotReadableError', 'AbortError', 'EncodingError',
+        ['InvalidStateError', 'NotReadableError', 'AbortError',
          'SecurityError', 'NotFoundError', 'QuotaExceededError'].every(name => {
             var e = new DOMException('m', name);
             return (e instanceof DOMException) && (e instanceof Error)
@@ -717,33 +717,57 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
     );
     drain_jobs(&mut context);
     assert_eval(&mut context, "globalThis.latin === 'é'");
-    // Unknown label terminates with `EncodingError` and no partial
-    // result. The failure is fail-fast: `error` is set synchronously and
-    // the `error` event follows after jobs.
-    assert_eval(
-        &mut context,
-        r"
-        (() => {
-            globalThis.failed = null;
+    // Unknown explicit label falls through to MIME/UTF-8 (never
+    // `EncodingError`): success path with the full event sequence, the
+    // MIME charset winning when present, UTF-8 otherwise, and no partial
+    // result concerns since the read itself succeeds.
+    for (label, media, bytes, expected) in [
+        (
+            "not-an-encoding",
+            "text/plain;charset=windows-1252",
+            "[0xE9]",
+            "'é'",
+        ),
+        ("not-an-encoding", "text/plain", "[0x41]", "'A'"),
+        (
+            "not-an-encoding",
+            "text/plain;charset=bogus-charset",
+            "[0xC3, 0xA9]",
+            "'é'",
+        ),
+    ] {
+        assert_eval(
+            &mut context,
+            &format!(
+                r"
+        (() => {{
+            globalThis.failed = 'unset';
+            globalThis.events = [];
             var reader = new FileReader();
-            reader._events = [];
-            reader.onerror = function () { globalThis.failed = this.error; };
-            reader.onload = function () { globalThis.failed = 'unexpected-load'; };
-            reader.readAsText(new Blob(['abc']), 'not-an-encoding');
-            return reader.readyState === 2
-                && (reader.error instanceof DOMException)
-                && reader.error.name === 'EncodingError';
-        })()
-        ",
-    );
-    drain_jobs(&mut context);
-    assert_eval(
-        &mut context,
-        r"
-        (globalThis.failed instanceof DOMException)
-        && globalThis.failed.name === 'EncodingError'
-        ",
-    );
+            for (var type of ['loadstart', 'progress', 'load', 'error', 'loadend']) {{
+                reader.addEventListener(type, (function (t) {{
+                    return function () {{ globalThis.events.push(t); }};
+                }})(type));
+            }}
+            reader.onload = function () {{ globalThis.failed = this.result; }};
+            reader.onerror = function () {{ globalThis.failed = 'unexpected-error'; }};
+            reader.readAsText(new Blob([new Uint8Array({bytes})], {{ type: '{media}' }}), '{label}');
+            return reader.readyState === 1 && reader.error === null;
+        }})()
+        "
+            ),
+        );
+        drain_jobs(&mut context);
+        assert_eval(
+            &mut context,
+            &format!(
+                r"
+        globalThis.failed === {expected}
+        && globalThis.events.join('|') === 'loadstart|progress|load|loadend'
+        "
+            ),
+        );
+    }
 }
 
 #[test]
@@ -1065,10 +1089,12 @@ fn abort_between_chunks_suppresses_stale_events() {
 
 #[test]
 fn reentrant_error_handler_starts_new_read() {
-    // Reentrant `error` case through a public trigger (unknown encoding →
-    // `EncodingError` fail-fast): the `error` handler starts a new read.
-    // Only the old `loadend` is suppressed; the new operation completes
-    // intact with its full event sequence.
+    // Reentrant `error` case through a public trigger (a short source
+    // response → `NotReadableError` via the unit-tested core path is not
+    // reachable from JS, so the error path is driven by the quota guard:
+    // the `error` handler starts a new read). Only the old `loadend` is
+    // suppressed; the new operation completes intact with its full event
+    // sequence.
     let mut context = setup();
     assert_eval(
         &mut context,
@@ -1085,8 +1111,16 @@ fn reentrant_error_handler_starts_new_read() {
                     return function () { globalThis.log.push(t); };
                 })(type));
             }
-            globalThis.reader.readAsText(new Blob(['abc']), 'not-an-encoding');
-            // Fail-fast: DONE with the mapped error already synchronously.
+            // Saturate the concurrent-read quota, then fail fast with
+            // `SecurityError` through the normal error path.
+            globalThis.fillers = [];
+            for (var i = 0; i < 64; i++) {
+                var filler = new FileReader();
+                filler.onerror = function () {};
+                filler.readAsText(new Blob(['x']));
+                globalThis.fillers.push(filler);
+            }
+            globalThis.reader.readAsText(new Blob(['abc']));
             return globalThis.reader.readyState === 2
                 && (globalThis.reader.error instanceof DOMException);
         })()
@@ -1097,7 +1131,7 @@ fn reentrant_error_handler_starts_new_read() {
     assert_eval(
         &mut context,
         r"
-        globalThis.log.join('|') === 'error:EncodingError|loadstart|progress|load|loadend'
+        globalThis.log.join('|') === 'error:SecurityError|loadstart|progress|load|loadend'
         && globalThis.reader.readyState === 2
         && globalThis.reader.result === 'recovered'
         && globalThis.reader.error === null
@@ -1399,6 +1433,9 @@ fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
 // ──────────────────────────────────────────────
 
 /// Reentrant handler mode installed for a scenario.
+///
+/// (`error` never fires in the unknown-label-free corpus, so there is no
+/// `ErrorRestart` mode: every start path succeeds or aborts.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HandlerMode {
     /// No reentrant handler.
@@ -1409,8 +1446,6 @@ enum HandlerMode {
     ProgressAbort,
     /// `load` handler starts a new text read.
     LoadRestart,
-    /// `error` handler starts a new text read.
-    ErrorRestart,
     /// `abort` handler starts a new text read.
     AbortRestart,
 }
@@ -1420,9 +1455,9 @@ enum HandlerMode {
 enum Action {
     /// `readAsText(blob)` — succeeds unless LOADING (throws).
     ReadOk,
-    /// `readAsText(blob, bad-label)` — fail-fast `EncodingError`, or throws
-    /// when LOADING.
-    ReadBad,
+    /// A second successful start used for double-start coverage; behaves
+    /// exactly like `ReadOk` (throws when LOADING, starts otherwise).
+    ReadAgain,
     /// `abort()` — silent unless LOADING.
     Abort,
 }
@@ -1431,7 +1466,6 @@ enum Action {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TermKind {
     Load,
-    Error,
     Abort,
 }
 
@@ -1446,11 +1480,11 @@ enum ModelJob {
 
 /// Small pure model of the single-chunk FileReader state machine.
 ///
-/// Mirrors the normative transitions only: sync guards, fail-fast encoding
-/// errors, generation replacement on `abort()`/new reads, stale-job
-/// no-ops, the single final `progress` before `load`, and conditional
-/// `loadend` suppression on reentrant replacement. It deliberately knows
-/// nothing about chunks, throttling, or packaging.
+/// Mirrors the normative transitions only: sync guards, generation
+/// replacement on `abort()`/new reads, stale-job no-ops, the single
+/// final `progress` before `load`, and conditional `loadend`
+/// suppression on reentrant replacement. It deliberately knows nothing
+/// about chunks, throttling, encodings, or packaging.
 struct PureModel {
     ready: u8,
     generation: u64,
@@ -1512,28 +1546,11 @@ impl PureModel {
     /// Applies one synchronous driver action, recording sync throws.
     fn act(&mut self, action: Action) {
         match action {
-            Action::ReadOk => {
+            Action::ReadOk | Action::ReadAgain => {
                 if self.ready == 1 {
                     self.events.push("throw:InvalidStateError".to_owned());
                 } else {
                     self.start_ok();
-                }
-            }
-            Action::ReadBad => {
-                if self.ready == 1 {
-                    self.events.push("throw:InvalidStateError".to_owned());
-                } else {
-                    // Fail-fast `EncodingError`: DONE + queued `error`.
-                    self.generation += 1;
-                    self.ready = 2;
-                    self.result = None;
-                    self.error = Some("EncodingError".to_owned());
-                    self.terminal = false;
-                    let generation = self.generation;
-                    self.queue.push_back(ModelJob::Term {
-                        generation,
-                        kind: TermKind::Error,
-                    });
                 }
             }
             Action::Abort => {
@@ -1586,17 +1603,17 @@ impl PureModel {
                     }
                     let name = match kind {
                         TermKind::Load => "load",
-                        TermKind::Error => "error",
                         TermKind::Abort => "abort",
                     };
                     self.emit(name);
                     self.terminal = true;
                     // Restart handlers are one-shot per scenario.
+                    // (`error` never fires in the unknown-label-free
+                    // corpus: every start path succeeds or aborts.)
                     let restart = !self.restarted
                         && matches!(
                             (kind, self.handler),
                             (TermKind::Load, HandlerMode::LoadRestart)
-                                | (TermKind::Error, HandlerMode::ErrorRestart)
                                 | (TermKind::Abort, HandlerMode::AbortRestart)
                         );
                     if restart {
@@ -1641,9 +1658,6 @@ fn handler_js(mode: HandlerMode) -> &'static str {
         HandlerMode::LoadRestart => {
             "reader.addEventListener('load', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
         }
-        HandlerMode::ErrorRestart => {
-            "reader.addEventListener('error', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
-        }
         HandlerMode::AbortRestart => {
             "reader.addEventListener('abort', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
         }
@@ -1653,11 +1667,8 @@ fn handler_js(mode: HandlerMode) -> &'static str {
 /// JavaScript snippet for one driver action (sync throws are logged).
 fn action_js(action: Action) -> &'static str {
     match action {
-        Action::ReadOk => {
+        Action::ReadOk | Action::ReadAgain => {
             "try { reader.readAsText(blob); } catch (e) { log.push('throw:' + e.name); }"
-        }
-        Action::ReadBad => {
-            "try { reader.readAsText(blob, 'not-an-encoding'); } catch (e) { log.push('throw:' + e.name); }"
         }
         Action::Abort => "reader.abort();",
     }
@@ -1666,20 +1677,20 @@ fn action_js(action: Action) -> &'static str {
 #[test]
 fn bounded_operation_sequences_match_pure_model() {
     // Bounded enumerated corpus: every phase-1 sync prefix (start,
-    // fail-fast error, abort-before-first-job, double start, error-then-ok,
-    // abort-then-ok, read-abort-read) x every phase-2 follow-up (none,
-    // abort, restart) x every reentrant handler mode. Each scenario runs
-    // real JS in a fresh Context and its observed state/event log must
-    // equal the pure model summary exactly — any divergence (extra or
-    // missing event, wrong state, leaked generation) fails the assertion.
+    // abort-before-first-job, double start, abort-then-ok,
+    // read-abort-read) x every phase-2 follow-up (none, abort, restart)
+    // x every reentrant handler mode. Each scenario runs real JS in a
+    // fresh Context and its observed state/event log must equal the pure
+    // model summary exactly — any divergence (extra or missing event,
+    // wrong state, leaked generation) fails the assertion.
     let phases: &[&[Action]] = &[
         &[],
         &[Action::ReadOk],
-        &[Action::ReadBad],
+        &[Action::ReadAgain],
         &[Action::Abort],
         &[Action::ReadOk, Action::Abort],
         &[Action::ReadOk, Action::ReadOk],
-        &[Action::ReadBad, Action::ReadOk],
+        &[Action::ReadAgain, Action::ReadOk],
         &[Action::Abort, Action::ReadOk],
         &[Action::ReadOk, Action::Abort, Action::ReadOk],
     ];
@@ -1689,13 +1700,11 @@ fn bounded_operation_sequences_match_pure_model() {
         HandlerMode::LoadstartAbort,
         HandlerMode::ProgressAbort,
         HandlerMode::LoadRestart,
-        HandlerMode::ErrorRestart,
         HandlerMode::AbortRestart,
     ];
     let mut scenarios = 0usize;
     let mut model_stale_total = 0usize;
     let mut js_saw_load = false;
-    let mut js_saw_error = false;
     let mut js_saw_abort = false;
     let mut js_saw_loadend = false;
     let mut js_saw_throw = false;
@@ -1767,8 +1776,6 @@ fn bounded_operation_sequences_match_pure_model() {
                 for entry in events_section.split(',') {
                     if entry.starts_with("load:") {
                         js_saw_load = true;
-                    } else if entry.starts_with("error:") {
-                        js_saw_error = true;
                     } else if entry.starts_with("abort:") {
                         js_saw_abort = true;
                     } else if entry.starts_with("loadend:") {
@@ -1783,19 +1790,22 @@ fn bounded_operation_sequences_match_pure_model() {
             }
         }
     }
-    assert_eq!(scenarios, 9 * 3 * 6, "corpus must not shrink");
-    // The corpus must really exercise every terminal kind, sync throws,
-    // generation replacement, and stale completions — otherwise the
-    // comparison above would be vacuous. Mutation probes performed during
-    // development (removing the LOADING guard, the `loadstart` generation
-    // recheck, or the conditional-`loadend` suppression) each fail at
-    // least one assertion in this file: the guard probe fails the
-    // `throw:InvalidStateError` comparison here, the recheck probe fails
+    assert_eq!(scenarios, 9 * 3 * 5, "corpus must not shrink");
+    // The corpus must really exercise load/abort terminals, sync
+    // throws, generation replacement, and stale completions — otherwise
+    // the comparison above would be vacuous. (`error` terminals stay
+    // covered by the quota/error-path suites; the unknown-label
+    // fail-fast path no longer exists.) Mutation probes performed
+    // during development (removing the LOADING guard, the `loadstart`
+    // generation recheck, or the conditional-`loadend` suppression)
+    // each fail at least one assertion in this file: the guard probe
+    // fails the `throw:InvalidStateError` comparison here, the recheck
+    // probe fails
     // `filereader::tests::loadstart_abort_performs_no_source_read`, so the
     // coverage is not fabricated.
     assert!(
-        js_saw_load && js_saw_error && js_saw_abort && js_saw_loadend,
-        "every terminal kind must be observed in JS logs"
+        js_saw_load && js_saw_abort && js_saw_loadend,
+        "load/abort terminals must be observed in JS logs"
     );
     assert!(js_saw_throw, "sync LOADING-guard throws must be observed");
     assert!(

@@ -453,7 +453,8 @@ fn sync_surface_is_bounded() {
     }
     let package = read(&workspace_root().join("crates/boa_fapi/src/package.rs"));
     for required in [
-        "resolve_label",
+        "resolve_text_encoding",
+        "mime_charset",
         "decode_text",
         "package_binary_string",
         "package_data_url",

@@ -767,3 +767,114 @@ rustflags не меняются; новых зависимостей и public A
 а web entropy implementation остаётся штатной реализацией upstream. Runtime
 использование File API на wasm по-прежнему не расширяется: M8 проверяет
 только memory-only compilation gate.
+
+## ADR-0036 (M9-A, rework-superseded in part): `sequence<BlobPart>` conversion
+
+Контекст: M2 фиксировал array-only контракт (`JsArray`-проверка); ТЗ
+M9-A §2 требует общую Web IDL sequence conversion для Blob и File:
+`@@iterator` один раз, поддержка Array/custom iterable/boxed String/
+TypedArray-as-sequence, primitive string — conversion error, quota до
+накопления, один converter на оба конструктора.
+
+Решение: единый конвертер; `GetMethod(V, @@iterator)` один раз;
+`Call`/`next`/`done`/`value` слева направо; quota `max_parts`
+проверяется до накопления — бесконечный итератор завершается
+детерминированной quota-ошибкой. Rework-поправка (§6 заказа-rework):
+никакого `return()` при abrupt completion — первоначальный
+`iterator_close_and_propagate` удалён как несоответствующий актуальным
+`sequence<T>` creation steps; quota-ошибка тоже не закрывает итератор
+(observable extension отклонён, см. ADR-0040).
+
+Последствия: M9A-IDL-01/02 и M9A-RW-05 фиксируют поведение;
+расхождение Blob/File запрещено по построению (один путь).
+
+## ADR-0037 (M9-A): exact `BlobPart` union conversion
+
+Контекст: M2 уже́сточал union до `TypeError` для не-объектов (ADR-0008);
+ТЗ M9-A §3 требует точную Web IDL развилку: BufferSource → видимый
+диапазон; branded Blob/File → shared bytes; всё остальное — USVString/
+ToString; forged brand — fallback; throwing `toString` — abrupt rules;
+порядок наблюдаем и одинаков для Blob/File.
+
+Решение: `process_part` — BufferSource, затем бренд, затем USVString
+fallback для любого другого значения (Symbol бросает собственный
+`TypeError` из `ToString`); старые oracle `TypeError` для `[123]`,
+`[null]`, `[{}]` переписаны на размеры USVString (3/4/15), а не удалены.
+BigInt stringifies (`10n` → 2 байта).
+
+Последствия: M9A-IDL-03 фиксирует fallback; ADR-0008 superseded в части
+union fallback, бренд-проверки сохранены.
+
+## ADR-0038 (M9-A, rework-superseded): shared text packaging
+
+Контекст: ТЗ §6.4 краток (label → UTF-8 → BOM → U+FFFD) и не упоминает
+MIME `charset`; W3C File API WD 23.08.2026 packaging-data steps требуют
+промежуточный `charset`-шаг. Первоначально сохранялся `EncodingError`
+для неизвестного пользовательского label.
+
+Решение (rework, см. ADR-0040): `package::resolve_text_encoding(label,
+media_type)` возвращает `TextEncoding` (не `Option`): explicit label →
+MIME `charset` → UTF-8 через точный `get an encoding`
+(`Encoding::for_label`, не `for_label_no_replacement`); `replacement`
+резолвится и декодирует в U+FFFD побайтово. Оба ридера идут обычным
+путем (async — start/read/load, sync — строка). Change control —
+`docs/spec-delta.md`.
+
+Последствия: M9A-TEXT-01/M9A-RW-01/M9A-RW-02 фиксируют алгоритм и
+sync/async-паритет; новых зависимостей нет.
+
+## ADR-0039 (M9-A): opaque registration identity, shutdown never revives
+
+Контекст: ТЗ §4.1 требует identity-aware повторную регистрацию без
+сравнения trait objects по значениям, без публичного сравнения config и
+без раскрытия identity; атомарный preflight/rollback не ослабляется;
+повтор после `shutdown` не оживляет runtime.
+
+Решение: `RegistrationIdentity(u64)` — opaque токен (`AtomicU64`,
+`build()` mint'ит, `Clone` сохраняет); `RegisteredSpecs` хранит identity
+первой регистрации. Повтор той же identity — idempotent (handle на уже
+зарегистрированное состояние, globals не переустанавливаются); другая
+identity — `RegisterError::AlreadyRegistered` без мутации; после
+`shutdown` та же identity возвращает существующий (закрытый) handle, а
+не живой runtime; разные Context независимы. Отдельного typed error для
+post-shutdown не введено: существующий закрытый handle уже несёт
+shutdown-состояние, что фиксирует тест.
+
+Последствия: M9A-REG-01 фиксирует все четыре ветви; публичная
+поверхность не расширена (guard `lib_rs_denies_unsafe` зелёный).
+
+## ADR-0040 (M9-A rework): encoding fallback, argument order, iterator surface
+
+Контекст: заказ-rework `tasks/18_TASK_M9A_REWORK_CONFORMANCE.md`
+переопределяет три M9-A границы и фиксирует два дополнительных defect.
+Web IDL snapshot для rework: `boa_engine 0.22.0` (sequence/iterator
+семантика vendored-крейта; `get an encoding`/`Decode` — `encoding_rs
+0.8.35`, `Encoding::for_label` + `new_decoder()` со sniffing).
+
+Решение:
+
+1. Неизвестный explicit label — failure с fallback (MIME charset →
+   UTF-8), не `EncodingError`; `for_label_no_replacement` заменён
+   точным `for_label`; fail-fast `EncodingError`-ветки удалены из
+   обоих ридеров; M4/M8 oracle переписаны (pure-model `ReadBad` →
+   `ReadAgain`, `TermKind::Error`/`ErrorRestart` удалены,
+   `reentrant_error_handler` — через quota-`SecurityError`,
+   tracing-класс `encoding` — только для `replacement`-label reads).
+2. Порядок аргументов: `Blob(blobParts → options)`,
+   `File(fileBits → fileName → options)`; двухфазная модель
+   (`ConvertedBlobPart`: conversion-time snapshots BufferSource/
+   USVString/brand → `process_converted` с `endings` и итоговым
+   size-accounting); сырые `JsValue` между фазами не хранятся.
+3. Никакого `return()` при abrupt completion, включая quota-лимит
+   (единый Web IDL path без закрытия; observable extension отклонён).
+4. `FileList.prototype[Symbol.iterator] === Array.prototype.values`
+   (тот же function object, `{writable:true, enumerable:false,
+   configurable:true}`); `entries`/`keys`/`values`/`forEach` не
+   добавляются. BOM-sniffing оставлен как есть (`new_decoder()`),
+   provenance-флаг отклонён: Decode заменяет любой fallback.
+5. `docs/spec-delta.md` фиксирует label → MIME → UTF-8 и BOM
+   authority со ссылками; `docs/spec-matrix.md` — M9A/M9A-RW строки с
+   source/test anchors.
+
+Последствия: trace rows M9A-RW-01…06; совокупный M9-A diff — см.
+rework-handoff.

@@ -372,7 +372,7 @@ fn sync_binary_string_preserves_nuls_and_high_bytes() {
 }
 
 // ──────────────────────────────────────────────
-// 4. Text: BOM, malformed, multibyte, labels, unknown label
+// 4. Text: BOM, malformed, multibyte, labels, unknown label fallback
 // ──────────────────────────────────────────────
 
 #[test]
@@ -395,14 +395,19 @@ fn sync_text_matches_async_representations() {
             if (sync.readAsText(new Blob(['ab']), '') !== 'ab') return false;
             // File inherits the Blob path.
             if (sync.readAsText(new File(['f'], 'f.txt')) !== 'f') return false;
+            // Unknown explicit label falls through to MIME/UTF-8, never
+            // `EncodingError`: MIME charset wins when present, UTF-8
+            // decoding otherwise.
+            if (sync.readAsText(
+                    new Blob([new Uint8Array([0xE9])], { type: 'text/plain;charset=windows-1252' }),
+                    'not-an-encoding') !== 'é') return false;
+            if (sync.readAsText(new Blob(['abc']), 'not-an-encoding') !== 'abc') return false;
+            if (sync.readAsText(
+                    new Blob([new Uint8Array([0xC3, 0xA9])], { type: 'text/plain;charset=bogus-charset' }),
+                    'not-an-encoding') !== 'é') return false;
             return true;
         })()
         ",
-    );
-    assert_throws_dom(
-        &mut context,
-        "new FileReaderSync().readAsText(new Blob(['abc']), 'not-an-encoding')",
-        "EncodingError",
     );
 }
 
@@ -411,7 +416,7 @@ fn throwing_label_is_converted_after_brand_and_argument_checks() {
     // A throwing encoding object must never be observed when the receiver
     // or the Blob argument itself is illegal: brand/argument `TypeError`s
     // come first. With a valid receiver/blob the conversion throw itself
-    // propagates (not a brand or `EncodingError` failure).
+    // propagates (not a brand failure; no `EncodingError` exists anymore).
     let mut context = setup_with_env(FileApiEnvironment::DedicatedWorker);
     assert_eval(
         &mut context,

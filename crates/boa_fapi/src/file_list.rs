@@ -89,6 +89,12 @@ pub(crate) fn item(this: &JsValue, args: &[JsValue], context: &mut Context) -> J
 }
 
 /// Registers the FileList members on the prototype.
+///
+/// Web IDL "define the iteration methods": an interface with an indexed
+/// property getter receives `prototype[Symbol.iterator]` aliased to
+/// `%Array.prototype.values%` (same function object, `{ writable: true,
+/// enumerable: false, configurable: true }`). No `entries`/`keys`/
+/// `values`/`forEach` are added: FileList declares no value-iterator.
 pub(crate) fn init_prototype(prototype: &JsObject, context: &mut Context) -> JsResult<()> {
     use boa_engine::native_function::NativeFunction;
 
@@ -125,6 +131,26 @@ pub(crate) fn init_prototype(prototype: &JsObject, context: &mut Context) -> JsR
             .value(item_function)
             .writable(true)
             .enumerable(true)
+            .configurable(true),
+        context,
+    )?;
+
+    // Indexed iteration: the same function object as
+    // `%Array.prototype.values%`, so borrowed-call semantics stay exactly
+    // the generic Array iterator semantics (no FileList-specific brand
+    // check beyond what the shared iterator performs).
+    let array_values = context
+        .intrinsics()
+        .constructors()
+        .array()
+        .prototype()
+        .get(js_string!("values"), context)?;
+    prototype.define_property_or_throw(
+        PropertyKey::from(JsSymbol::iterator()),
+        PropertyDescriptor::builder()
+            .value(array_values)
+            .writable(true)
+            .enumerable(false)
             .configurable(true),
         context,
     )?;

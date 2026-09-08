@@ -7,10 +7,9 @@
 use std::sync::Arc;
 
 use boa_engine::object::JsObject;
-use boa_engine::object::builtins::{
-    JsArray, JsArrayBuffer, JsDataView, JsSharedArrayBuffer, JsTypedArray,
-};
-use boa_engine::{Context, JsResult, JsValue, js_string};
+use boa_engine::object::builtins::{JsArrayBuffer, JsDataView, JsSharedArrayBuffer, JsTypedArray};
+use boa_engine::property::PropertyKey;
+use boa_engine::{Context, JsResult, JsSymbol, JsValue, js_string};
 use boa_fapi_core::blob::{BlobData, BlobSegment};
 use boa_fapi_core::endings::{NativeLineEnding, convert_line_endings_to_native};
 use boa_fapi_core::limits::FileApiLimits;
@@ -222,7 +221,7 @@ pub(crate) struct PartsCollector {
 }
 
 impl PartsCollector {
-    fn new(limits: FileApiLimits) -> Self {
+    pub(crate) fn new(limits: FileApiLimits) -> Self {
         Self {
             blob: BlobData::empty(""),
             parts: 0,
@@ -326,27 +325,63 @@ fn view_bytes(buffer: &JsValue, byte_offset: usize, byte_length: usize) -> JsRes
     ))
 }
 
-/// Converts one `BlobPart` value and appends it to `collector`.
-fn process_part(
+/// One union-converted `BlobPart`, before options-dependent processing.
+///
+/// Conversion-time snapshot per the rework order contract: `BufferSource`
+/// bytes are copied immediately, `USVString` is materialized immediately,
+/// and `Blob`/`File` keeps its immutable backing. `endings`, MIME
+/// normalization and final blob-size accounting are *not* applied here:
+/// options are not converted yet.
+pub(crate) enum ConvertedBlobPart {
+    /// Copied byte sequence (BufferSource visible range, empty parts).
+    Bytes(Bytes),
+    /// Shared immutable backing of a branded `Blob`/`File`.
+    Shared(Arc<BlobData>),
+    /// USVString conversion result, before `endings` processing.
+    Text(String),
+}
+
+/// Converts one `BlobPart` union value into its snapshot form.
+///
+/// Member order `(BufferSource or Blob or USVString)`: real `BufferSource`
+/// copies the visible range now; branded `Blob`/`File` keeps the shared
+/// backing; every other value takes the USVString `ToString` path now. A
+/// forged Blob/File-shaped object fails the brand and falls to `ToString`;
+/// a throwing `toString` propagates as the abrupt completion. Part-count
+/// pressure is enforced here (before unbounded accumulation); byte-size
+/// pressure stays in the processing step, which owns the limits.
+fn convert_part(
     value: &JsValue,
-    endings: EndingMode,
-    collector: &mut PartsCollector,
+    parts: &mut usize,
+    limits: &FileApiLimits,
     context: &mut Context,
-) -> JsResult<()> {
+) -> JsResult<ConvertedBlobPart> {
+    if *parts >= limits.max_parts {
+        return Err(range_error("too many blob parts"));
+    }
     if let Some(object) = value.as_object() {
         // Union member order: BufferSource, then Blob, then USVString.
+        // The counter increments only for an accepted part: throwing
+        // BufferSource accessors and throwing `toString` leave it
+        // unchanged (the whole conversion fails anyway), and a detached
+        // buffer's empty sequence still counts as one part.
         if let Ok(buffer) = JsArrayBuffer::from_object(object.clone()) {
-            return collector.push_copied(array_buffer_bytes(&buffer));
+            let bytes = array_buffer_bytes(&buffer);
+            *parts += 1;
+            return Ok(ConvertedBlobPart::Bytes(bytes));
         }
         if let Ok(shared) = JsSharedArrayBuffer::from_object(object.clone()) {
-            return collector.push_copied(Bytes::from(shared.to_vec()));
+            let bytes = Bytes::from(shared.to_vec());
+            *parts += 1;
+            return Ok(ConvertedBlobPart::Bytes(bytes));
         }
         if let Ok(typed) = JsTypedArray::from_object(object.clone()) {
             let offset = typed.byte_offset(context)?;
             let length = typed.byte_length(context)?;
             let buffer = typed.buffer(context)?;
-            return view_bytes(&buffer, offset, length)
-                .and_then(|bytes| collector.push_copied(bytes));
+            let bytes = view_bytes(&buffer, offset, length)?;
+            *parts += 1;
+            return Ok(ConvertedBlobPart::Bytes(bytes));
         }
         if let Ok(view) = JsDataView::from_object(object.clone()) {
             let offset = view.byte_offset(context)?;
@@ -356,76 +391,148 @@ fn process_part(
                 .map_err(|_| type_error("the view offset exceeds the addressable range"))?;
             let length = usize::try_from(length)
                 .map_err(|_| type_error("the view length exceeds the addressable range"))?;
-            return view_bytes(&buffer, offset, length)
-                .and_then(|bytes| collector.push_copied(bytes));
+            let bytes = view_bytes(&buffer, offset, length)?;
+            *parts += 1;
+            return Ok(ConvertedBlobPart::Bytes(bytes));
         }
         if let Some(native) = object.downcast_ref::<BlobNative>() {
-            return collector.push_shared(native.blob_data());
+            *parts += 1;
+            return Ok(ConvertedBlobPart::Shared(native.blob_data().clone()));
         }
         if let Some(native) = object.downcast_ref::<FileNative>() {
-            return collector.push_shared(native.blob_data());
+            *parts += 1;
+            return Ok(ConvertedBlobPart::Shared(native.blob_data().clone()));
         }
-        // An object matching no union member is a TypeError, never `ToString`.
-        return Err(type_error(
-            "BlobPart must be a BufferSource, Blob, File or USVString",
-        ));
+        // Any other object (plain, forged Blob/File shape, proxy, boxed
+        // String): USVString fallback via observable `ToString`; a
+        // throwing `toString` propagates as the abrupt completion.
+        drop(object);
     }
+    // Non-object values (numbers, booleans, null, Symbol, BigInt,
+    // primitive strings): USVString `ToString`; Symbol throws its own
+    // `TypeError` unchanged, everything else stringifies.
+    let text = usv_string(value, context)?;
+    *parts += 1;
+    Ok(ConvertedBlobPart::Text(text))
+}
 
-    // The order fixes BlobPart semantics: only actual strings take the
-    // USVString path; every other non-object value (numbers, booleans,
-    // null, ...) is an "other part" and fails synchronously.
-    let Some(string) = value.as_string() else {
+/// Applies `endings` and accumulates converted parts into `BlobData`.
+///
+/// Processing step after all arguments are converted: text parts are
+/// line-ending processed, then every part is appended under the final
+/// blob-size accounting. A failure leaves `collector` unchanged for the
+/// failed part (no observable partial blob).
+pub(crate) fn process_converted(
+    converted: Vec<ConvertedBlobPart>,
+    endings: EndingMode,
+    collector: &mut PartsCollector,
+) -> JsResult<()> {
+    for part in converted {
+        match part {
+            ConvertedBlobPart::Bytes(bytes) => collector.push_copied(bytes)?,
+            ConvertedBlobPart::Shared(data) => collector.push_shared(&data)?,
+            ConvertedBlobPart::Text(text) => {
+                let prepared = match endings {
+                    EndingMode::Transparent => text,
+                    EndingMode::Native => {
+                        convert_line_endings_to_native(&text, platform_native_ending())
+                    }
+                };
+                collector.push_copied(Bytes::from(prepared))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `GetMethod(V, @@iterator)`: one normative read, missing/null/undefined
+/// means "not iterable", non-callable throws `TypeError`.
+fn get_iterator_method(value: &JsValue, context: &mut Context) -> JsResult<Option<JsObject>> {
+    // Primitive strings are non-objects: argument conversion fails
+    // before the iterator protocol (a boxed String still iterates).
+    if value.as_string().is_some() && value.as_object().is_none() {
+        return Ok(None);
+    }
+    let key = PropertyKey::from(JsSymbol::iterator());
+    let method = value.to_object(context)?.get(key, context)?;
+    if method.is_null_or_undefined() {
+        return Ok(None);
+    }
+    method
+        .as_callable()
+        .map(Some)
+        .ok_or_else(|| type_error("the provided value is not iterable: @@iterator is not callable"))
+}
+
+/// Web IDL `sequence<BlobPart>` conversion shared by `Blob` and `File`.
+///
+/// Normative order: `undefined` (Blob only) is empty; `GetMethod(V,
+/// @@iterator)` once; absent/non-callable throws `TypeError`; boxed
+/// `String` and `TypedArray`-as-sequence iterate through their own
+/// `@@iterator`; a primitive string is non-object and fails per argument
+/// conversion. Iteration runs `next` → `done` → `value` left to right;
+/// abrupt completion propagates unchanged with *no* iterator closing:
+/// the `sequence<T>` creation steps convert `IteratorStepValue` results
+/// without calling `iterator.return()` on failure.
+///
+/// The sequence converter performs only typed conversion: BufferSource
+/// bytes are copied at element-conversion time, USVString is
+/// materialized at element-conversion time, `Blob`/`File` backings are
+/// retained, and the part count is bounded before unbounded
+/// accumulation. It applies no `endings`, no MIME normalization and no
+/// final blob-size accounting — options are not converted yet. Callers
+/// run [`process_converted`] after the remaining arguments are
+/// converted.
+pub(crate) fn convert_sequence(
+    value: &JsValue,
+    required: bool,
+    limits: &FileApiLimits,
+    context: &mut Context,
+) -> JsResult<Vec<ConvertedBlobPart>> {
+    if value.is_undefined() {
+        if required {
+            return Err(type_error(
+                "the provided value cannot be converted to a sequence<BlobPart>",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let Some(method) = get_iterator_method(value, context)? else {
         return Err(type_error(
-            "BlobPart must be a BufferSource, Blob, File or USVString",
+            "the provided value cannot be converted to a sequence<BlobPart>",
         ));
     };
-    let text = string.to_std_string_lossy();
-    let prepared = match endings {
-        EndingMode::Transparent => text,
-        EndingMode::Native => convert_line_endings_to_native(&text, platform_native_ending()),
+    let iterator_value = method.call(value, &[], context)?;
+    let Some(iterator) = iterator_value.as_object() else {
+        return Err(type_error("the iterator result is not an object"));
     };
-    collector.push_copied(Bytes::from(prepared))
+    let next_value = iterator.get(js_string!("next"), context)?;
+    let Some(next) = next_value.as_callable() else {
+        return Err(type_error("the iterator next method is not callable"));
+    };
+    // Part-count pressure is enforced per element inside `convert_part`,
+    // before unbounded accumulation; an infinite iterator therefore ends
+    // deterministically in a quota error. No `return()` runs on any
+    // abrupt completion: errors propagate unchanged.
+    let mut parts = 0_usize;
+    let mut converted = Vec::new();
+    loop {
+        let result_value = next.call(&iterator.clone().into(), &[], context)?;
+        let Some(result_object) = result_value.as_object() else {
+            return Err(type_error("the iterator result is not an object"));
+        };
+        let done_value = result_object.get(js_string!("done"), context)?;
+        if done_value.to_boolean() {
+            return Ok(converted);
+        }
+        let element = result_object.get(js_string!("value"), context)?;
+        converted.push(convert_part(&element, &mut parts, limits, context)?);
+    }
 }
 
 /// Returns the constructor argument at `index`, or `undefined` when absent.
 pub(crate) fn arg(args: &[JsValue], index: usize) -> JsValue {
     args.get(index).cloned().unwrap_or_default()
-}
-
-/// Converts the optional `sequence<BlobPart>` constructor argument.
-///
-/// Absent or `undefined` means an empty sequence; anything that is not an
-/// ordinary `Array` object is a `TypeError`.
-pub(crate) fn blob_parts(value: &JsValue, _context: &mut Context) -> JsResult<Option<JsObject>> {
-    if value.is_undefined() {
-        return Ok(None);
-    }
-    let Some(object) = value.as_object() else {
-        return Err(type_error(
-            "the provided value cannot be converted to a sequence<BlobPart>",
-        ));
-    };
-    // Validates that the object really is an Array.
-    JsArray::from_object(object.clone())?;
-    Ok(Some(object))
-}
-
-/// Processes every part of an ordinary `Array` left to right.
-pub(crate) fn collect_parts(
-    parts: Option<&JsObject>,
-    endings: EndingMode,
-    limits: &FileApiLimits,
-    context: &mut Context,
-) -> JsResult<PartsCollector> {
-    let mut collector = PartsCollector::new(limits.clone());
-    if let Some(object) = parts {
-        let length = JsArray::from_object(object.clone())?.length(context)?;
-        for index in 0..length {
-            let element = object.get(index, context)?;
-            process_part(&element, endings, &mut collector, context)?;
-        }
-    }
-    Ok(collector)
 }
 
 /// The `type` and `endings` members shared by `BlobPropertyBag` and `FilePropertyBag`.

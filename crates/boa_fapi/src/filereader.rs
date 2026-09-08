@@ -37,7 +37,7 @@ use boa_gc::{Finalize, Trace};
 use crate::brand;
 use crate::dom::{self, ListEntry};
 use crate::error::type_error;
-use crate::package::{IncrementalDecoder, TextEncoding, resolve_label};
+use crate::package::{IncrementalDecoder, TextEncoding, resolve_text_encoding};
 use crate::webidl::dom_string;
 
 /// Constructor/prototype pair installed as the `FileReader` global.
@@ -512,7 +512,6 @@ fn fail_fast(
     #[cfg(feature = "tracing")]
     {
         let result_class = match name {
-            "EncodingError" => "encoding",
             "QuotaExceededError" => "quota",
             // `SecurityError` here is only the concurrent-reads quota path.
             "SecurityError" => "quota",
@@ -561,7 +560,6 @@ fn read_as_array_buffer(
         ReadKind::ArrayBuffer,
         TextEncoding {
             encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
         },
         String::new(),
         context,
@@ -580,7 +578,6 @@ fn read_as_binary_string(
         ReadKind::BinaryString,
         TextEncoding {
             encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
         },
         String::new(),
         context,
@@ -590,25 +587,17 @@ fn read_as_binary_string(
 /// `readAsText(blob, encoding?)`: `length = 1` (encoding optional).
 fn read_as_text(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     // The encoding label converts before any state change, but after the
-    // brand/argument checks so failures leave the reader untouched.
-    let object = require_reader(this)?;
+    // brand/argument checks so failures leave the reader untouched. The
+    // shared selector (explicit label → MIME charset → UTF-8, unknown
+    // labels fall through, never `EncodingError`) runs here so async and
+    // sync observe the same string.
     let data = blob_arg(args)?;
     let label = if args.len() >= 2 && !args[1].is_undefined() {
         Some(dom_string(&args[1], context)?)
     } else {
         None
     };
-    let Some(encoding) = resolve_label(label.as_deref()) else {
-        // Unknown label: terminate through the `error` path with
-        // `EncodingError` and no partial result.
-        return fail_fast(
-            &object,
-            data.size(),
-            "EncodingError",
-            "unknown text encoding",
-            context,
-        );
-    };
+    let encoding = resolve_text_encoding(label.as_deref(), data.media_type());
     start_read(this, args, ReadKind::Text, encoding, String::new(), context)
 }
 
@@ -665,7 +654,6 @@ fn read_as_data_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> 
         ReadKind::DataUrl,
         TextEncoding {
             encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: false,
         },
         media_type,
         context,
@@ -1005,12 +993,19 @@ fn finish_at_eof(
             .map(|specs| crate::observability::environment_hash_for_specs(&specs))
             .unwrap_or(0);
         let chunks = if total == 0 { 0 } else { 1 };
+        // A `replacement`-encoding label still succeeds (every byte
+        // decodes to U+FFFD); the terminal class stays observable.
+        let class = if kind == ReadKind::Text && encoding.encoding == encoding_rs::REPLACEMENT {
+            "encoding"
+        } else {
+            "ok"
+        };
         crate::observability::emit(
             "filereader_read",
             total,
             crate::observability::elapsed_ms(trace_start),
             chunks,
-            "ok",
+            class,
             env,
         );
     }

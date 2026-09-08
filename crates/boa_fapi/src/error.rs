@@ -9,8 +9,10 @@ use boa_fapi_core::file_api_error::FileApiError;
 pub enum RegisterError {
     /// The extension is already registered in this context.
     ///
-    /// Per the M2 registration rule every second call returns this error;
-    /// the first registration leaves the context unchanged.
+    /// Returned when a *different* registration identity attempts to
+    /// register on an already-registered context (see the identity-aware
+    /// rule on `FileApiExtension::register`): the first registration is
+    /// left unchanged and no global is reinstalled.
     #[error("the File API extension is already registered in this context")]
     AlreadyRegistered,
     /// The global object is not extensible, so the globals cannot be installed.

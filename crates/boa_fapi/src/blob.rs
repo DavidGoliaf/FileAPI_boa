@@ -17,7 +17,8 @@ use crate::brand;
 use crate::error::{js_from_core, type_error};
 use crate::extension::snapshot;
 use crate::webidl::{
-    BlobOptions, arg, blob_parts, collect_parts, dom_string, optional_clamped_long_long,
+    BlobOptions, PartsCollector, arg, convert_sequence, dom_string, optional_clamped_long_long,
+    process_converted,
 };
 
 /// The internal Blob brand: immutable segmented bytes plus a media type.
@@ -101,9 +102,15 @@ pub(crate) fn constructor(
     };
     let prototype = constructor_prototype(&target, specs.blob_proto(), context)?;
 
-    let parts = blob_parts(&arg(args, 0), context)?;
+    // Web IDL argument order: `blobParts` sequence conversion first
+    // (typed conversion with conversion-time BufferSource/USVString
+    // snapshots, no `endings` yet), then the options dictionary, then
+    // the options-dependent processing step.
+    let limits = specs.limits().clone();
+    let converted = convert_sequence(&arg(args, 0), false, &limits, context)?;
     let options = BlobOptions::parse(&arg(args, 1), context)?;
-    let collector = collect_parts(parts.as_ref(), options.endings, specs.limits(), context)?;
+    let mut collector = PartsCollector::new(limits);
+    process_converted(converted, options.endings, &mut collector)?;
     let data = collector.into_blob_data(&options.media_type)?;
 
     Ok(JsValue::from(create_instance(

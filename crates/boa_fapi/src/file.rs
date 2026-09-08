@@ -15,7 +15,9 @@ use crate::brand;
 use crate::clock::Clock;
 use crate::error::type_error;
 use crate::extension::snapshot;
-use crate::webidl::{FileOptions, arg, blob_parts, collect_parts, usv_string};
+use crate::webidl::{
+    FileOptions, PartsCollector, arg, convert_sequence, process_converted, usv_string,
+};
 
 /// The internal File brand: Blob payload plus immutable `name`/`lastModified`.
 ///
@@ -115,19 +117,19 @@ pub(crate) fn constructor(
     }
     let prototype = constructor_prototype(&target, specs.file_proto(), context)?;
 
-    // Required `fileBits` sequence: `undefined` fails the sequence conversion.
-    let parts = blob_parts(&arg(args, 0), context)?;
+    // Web IDL argument order: `fileBits` sequence conversion first
+    // (typed conversion with conversion-time snapshots, no `endings`
+    // yet), then `fileName` USVString, then the options dictionary, then
+    // the options-dependent processing step.
+    let limits = specs.limits().clone();
+    let converted = convert_sequence(&arg(args, 0), true, &limits, context)?;
     // Required `fileName`: USVString, then every `/` becomes `:`.
     let file_name = usv_string(&arg(args, 1), context)?;
     let file_name = normalize_file_name(&file_name);
 
     let options = FileOptions::parse(&arg(args, 2), context)?;
-    let collector = collect_parts(
-        parts.as_ref(),
-        options.blob.endings,
-        specs.limits(),
-        context,
-    )?;
+    let mut collector = PartsCollector::new(limits);
+    process_converted(converted, options.blob.endings, &mut collector)?;
     let data = Arc::new(collector.into_blob_data(&options.blob.media_type)?);
 
     let timestamp = options

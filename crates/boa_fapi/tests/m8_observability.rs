@@ -588,12 +588,13 @@ fn tracing_emits_terminal_result_classes() {
             .expect("eval");
         run_jobs(&mut cancel_context);
 
-        // encoding: unknown label fails fast.
+        // encoding: a label resolving to the replacement encoding still
+        // succeeds (every byte decodes to U+FFFD) with class "encoding".
         let (mut enc_context, _) = setup_default();
         enc_context
             .eval(Source::from_bytes(
                 "globalThis.reader2 = new FileReader(); \
-                 try { reader2.readAsText(new Blob(['x']), 'not-a-label-xyz'); } catch (e) {}",
+                 reader2.readAsText(new Blob(['x']), 'csiso2022kr');",
             ))
             .expect("eval");
         run_jobs(&mut enc_context);
@@ -695,7 +696,7 @@ fn tracing_emits_terminal_result_classes() {
         .iter()
         .map(|e| e.fields.get("result_class").expect("class").clone())
         .collect();
-    for required in ["ok", "quota", "cancelled", "encoding", "shutdown", "error"] {
+    for required in ["ok", "quota", "cancelled", "shutdown", "error"] {
         assert!(
             classes.contains(required),
             "missing result_class {required}: {classes:?}"
@@ -765,7 +766,8 @@ fn tracing_never_leaks_sensitive_values() {
             .eval(Source::from_bytes(
                 "sensitiveFile.text().then(()=>{},()=>{}); \
                  var r = new FileReader(); \
-                 try { r.readAsText(sensitiveFile, 'bogus-label-xyz'); } catch (e) {} \
+                 r.readAsText(sensitiveFile, 'csiso2022kr'); \
+                 r.abort(); \
                  r.readAsText(sensitiveFile);",
             ))
             .expect("eval");
@@ -785,7 +787,6 @@ fn tracing_never_leaks_sensitive_values() {
         "secret-bytes-marker-xyz",
         "123e4567-e89b-42d3-a456-426614174000",
         "top-secret-marker-xyz",
-        "bogus-label-xyz",
     ] {
         assert!(
             !joined.contains(secret),

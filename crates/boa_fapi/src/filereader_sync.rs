@@ -152,25 +152,15 @@ fn read_bytes_sync(
     let trace_size = data.size();
     // Encoding label conversion and resolution come after the brand and
     // argument checks, but before the size preflight (same order as the
-    // async `readAsText`): an unknown label throws `EncodingError` even
-    // for an oversized blob, with no read and no partial result.
+    // async `readAsText`): an unknown label falls through to MIME/UTF-8
+    // (never `EncodingError`), with no read and no partial result.
     let label = match label_arg {
         None => None,
         Some(value) if value.is_undefined() => None,
         Some(value) => Some(dom_string(value, context)?),
     };
-    let Some(encoding) = package::resolve_label(label.as_deref()) else {
-        #[cfg(feature = "tracing")]
-        crate::observability::emit(
-            "filereader_sync",
-            trace_size,
-            crate::observability::elapsed_ms(trace_start),
-            0,
-            "encoding",
-            trace_env,
-        );
-        return Err(throw_named(&dom, "EncodingError", "unknown text encoding"));
-    };
+    let media_type = data.media_type().to_owned();
+    let encoding = package::resolve_text_encoding(label.as_deref(), &media_type);
     // Sync-size preflight before any source read or output allocation.
     if data.size() > limits.max_sync_read_bytes {
         #[cfg(feature = "tracing")]
@@ -310,12 +300,19 @@ fn read_as_text_sync(this: &JsValue, args: &[JsValue], context: &mut Context) ->
             .unwrap_or(0);
         let size = bytes.len() as u64;
         let chunks = if size == 0 { 0 } else { 1 };
+        // A `replacement`-encoding label decodes every byte to U+FFFD;
+        // the terminal class stays observable without an error path.
+        let class = if encoding.encoding == encoding_rs::REPLACEMENT {
+            "encoding"
+        } else {
+            "ok"
+        };
         crate::observability::emit(
             "filereader_sync",
             size,
             crate::observability::elapsed_ms(trace_start),
             chunks,
-            "ok",
+            class,
             env,
         );
     }

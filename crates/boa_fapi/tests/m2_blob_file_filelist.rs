@@ -382,12 +382,15 @@ fn string_parts_and_usv_replacement() {
     // A lone surrogate becomes U+FFFD (3 UTF-8 bytes).
     assert_eval(&mut context, "new Blob(['\\uD800']).size === 3");
     assert_eval(&mut context, "new Blob(['a', 'b']).size === 2");
-    // Numbers, booleans and null are not USVString parts.
-    assert_eval_type_error(&mut context, "new Blob([123])");
-    assert_eval_type_error(&mut context, "new Blob([null])");
-    assert_eval_type_error(&mut context, "new Blob([{}])");
+    // Web IDL union fallback: primitives/objects stringify via USVString.
+    assert_eval(&mut context, "new Blob([123]).size === 3");
+    assert_eval(&mut context, "new Blob([null]).size === 4");
+    assert_eval(&mut context, "new Blob([undefined]).size === 9");
+    assert_eval(&mut context, "new Blob([true]).size === 4");
+    assert_eval(&mut context, "new Blob([{}]).size === 15");
+    // Symbol/BigInt cannot convert via ToString for this union position.
     assert_eval_type_error(&mut context, "new Blob([Symbol('x')])");
-    // Non-array parts fail.
+    // Non-iterable parts fail.
     assert_eval_type_error(&mut context, "new Blob('abc')");
     assert_eval_type_error(&mut context, "new Blob(null)");
 }
@@ -968,10 +971,7 @@ fn hostile_values_never_panic() {
         &mut context,
         r"
         var hostile = [
-            () => new Blob([new Proxy({}, {})]),
-            () => new Blob([{length: -1}]),
-            () => new Blob([{length: 1e21}]),
-            () => new Blob([new Date()]),
+            () => new Blob([Symbol('x')]),
             () => new File(['x'], {toString: null}),
         ];
         hostile.every(fn_must_throw => {

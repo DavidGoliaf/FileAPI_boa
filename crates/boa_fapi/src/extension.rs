@@ -2,9 +2,10 @@
 //!
 //! Registration is atomic: constructor and prototype objects are built
 //! first, every preflight runs before `globalThis` changes, and a failed
-//! install rolls back so that none of the three globals remains installed.
-//! The chosen re-registration rule is **(b)**: every second call to
-//! `register` on the same context returns [`RegisterError::AlreadyRegistered`].
+//! install rolls back so that none of the globals remains installed.
+//! Re-registration is identity-aware: the same opaque identity is
+//! idempotent, a different identity is rejected with
+//! [`RegisterError::AlreadyRegistered`].
 
 use std::sync::Arc;
 
@@ -105,9 +106,35 @@ pub trait CloneAdapter: Send + Sync + 'static {
     fn decode(&self, bytes: &[u8]) -> Result<FileApiClonePayload, CloneError>;
 }
 
+/// Opaque registration identity for one built [`FileApiExtension`].
+///
+/// Created once per `build()` and preserved by `Clone`: a clone of an
+/// extension carries the same identity, while a separately built
+/// extension — even with identical visible configuration — carries a
+/// different one. The value is never exposed publicly, never derived
+/// from configuration contents, and never compared by value: the
+/// registration compares only opaque identity tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RegistrationIdentity(u64);
+
+impl RegistrationIdentity {
+    /// Mints a fresh identity token.
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
+        Self(token)
+    }
+}
+
 /// Immutable extension configuration.
 #[derive(Clone)]
 pub(crate) struct ExtensionConfig {
+    /// Opaque registration identity: assigned once per built extension
+    /// and preserved by `Clone`. Two separately built extensions never
+    /// share an identity, even with visually identical fields; identity
+    /// is never exposed publicly and never compared by value.
+    pub(crate) identity: RegistrationIdentity,
     /// Clock for `File.lastModified` defaults.
     pub(crate) clock: Arc<dyn Clock>,
     /// M1 resource limits for blob construction and slicing.
@@ -221,6 +248,10 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) shutdown: crate::lifecycle::ShutdownFlag,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
+    /// Opaque identity stored at registration time: a repeat `register`
+    /// with the same identity is idempotent, a different identity is
+    /// rejected without mutation.
+    pub(crate) identity: RegistrationIdentity,
 }
 
 impl RegisteredSpecs {
@@ -493,6 +524,7 @@ impl FileApiExtensionBuilder {
     pub fn build(&self) -> FileApiExtension {
         FileApiExtension {
             config: ExtensionConfig {
+                identity: RegistrationIdentity::fresh(),
                 clock: self.clock.clone().unwrap_or_else(|| Arc::new(SystemClock)),
                 limits: self.limits.clone().unwrap_or_default(),
                 streams_shim: self.streams_shim.unwrap_or(true),
@@ -529,11 +561,26 @@ impl FileApiExtension {
     /// Registers `Blob`, `File` and the internal `FileList` machinery.
     ///
     /// The registration is atomic: when any preflight or installation step
-    /// fails, none of the globals is left installed. A second call on the
-    /// same context returns [`RegisterError::AlreadyRegistered`].
+    /// fails, none of the globals is left installed. Identity-aware
+    /// re-registration: a repeat `register` of the *same* identity (the
+    /// same built extension or its clone) on the same context is
+    /// idempotent — globals are not reinstalled and the returned handle
+    /// points at the already-registered state. A *different* identity,
+    /// even with a visually identical configuration, is rejected with
+    /// [`RegisterError::AlreadyRegistered`] without mutation. A repeat
+    /// after `shutdown` never revives the runtime: the same-identity call
+    /// returns the existing handle (still shut down), a different identity
+    /// is rejected. Different contexts stay independent (per-context
+    /// `RegisteredSpecs`).
     pub fn register(&self, context: &mut Context) -> Result<FileApiHandle, RegisterError> {
-        // Re-registration rule (b): every second call is rejected.
-        if context.has_data::<RegisteredSpecs>() {
+        // Identity-aware re-registration: the stored identity decides.
+        if let Some(existing) = context.get_data::<RegisteredSpecs>() {
+            if existing.identity == self.config.identity {
+                return Ok(FileApiHandle {
+                    specs: existing.clone(),
+                    shutdown: existing.shutdown.clone(),
+                });
+            }
             return Err(RegisterError::AlreadyRegistered);
         }
 
@@ -736,6 +783,7 @@ impl FileApiExtension {
             url_store: Arc::clone(&url_store),
             shutdown: shutdown.clone(),
             config: self.config.clone(),
+            identity: self.config.identity,
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
 

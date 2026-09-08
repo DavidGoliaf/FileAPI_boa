@@ -16,26 +16,22 @@ use boa_fapi_core::file_api_error::FileApiError;
 pub(crate) struct TextEncoding {
     /// The resolved Encoding Standard encoding.
     pub(crate) encoding: &'static encoding_rs::Encoding,
-    /// Whether the input starts with that encoding's BOM (UTF-8 only in
-    /// this shim: `encoding_rs` strips the BOM when sniffing is enabled).
-    pub(crate) strip_utf8_bom: bool,
 }
 
 /// Incremental decoder state for `readAsText`.
 ///
-/// Wraps an `encoding_rs::Decoder`; `push` feeds one chunk and returns the
-/// decoded prefix, `finish` flushes with `last = true`. Malformed sequences
-/// decode with replacement, never as an exception. Split multibyte
-/// sequences stay buffered inside the decoder, never emitted as U+FFFD
-/// early. A leading UTF-8 BOM is stripped once (Encoding Standard BOM
-/// handling) when the operation uses UTF-8 decoding.
+/// Wraps an `encoding_rs::Decoder` created with BOM sniffing enabled;
+/// `push` feeds one chunk and returns the decoded prefix, `finish`
+/// flushes with `last = true`. Malformed sequences decode with
+/// replacement, never as an exception. Split multibyte sequences stay
+/// buffered inside the decoder, never emitted as U+FFFD early. A leading
+/// BOM selects the effective encoding once (Encoding Standard BOM
+/// handling): UTF-8/UTF-16LE/UTF-16BE sniffing wins over any fallback.
 pub(crate) struct IncrementalDecoder {
-    /// The underlying `encoding_rs` decoder.
+    /// The underlying `encoding_rs` decoder (BOM sniffing enabled).
     decoder: Option<encoding_rs::Decoder>,
     /// Whether the decoder already finished.
     finished: bool,
-    /// Whether the leading UTF-8 BOM was already consumed.
-    bom_consumed: bool,
 }
 
 impl IncrementalDecoder {
@@ -44,14 +40,13 @@ impl IncrementalDecoder {
         Self {
             decoder: None,
             finished: false,
-            bom_consumed: false,
         }
     }
 
     /// Feeds one chunk and returns the decoded prefix.
     pub(crate) fn push(&mut self, encoding: &TextEncoding, chunk: &[u8]) -> String {
         if self.decoder.is_none() {
-            self.decoder = Some(encoding.encoding.new_decoder_without_bom_handling());
+            self.decoder = Some(encoding.encoding.new_decoder());
         }
         let Some(decoder) = self.decoder.as_mut() else {
             return String::new();
@@ -62,7 +57,6 @@ impl IncrementalDecoder {
         // treats capacity as the output limit and never reallocates.
         let mut out = String::with_capacity(chunk.len().saturating_add(8));
         let (_, _, _) = decoder.decode_to_string(chunk, &mut out, false);
-        strip_leading_bom_once(encoding, &mut self.bom_consumed, &mut out);
         out
     }
 
@@ -73,14 +67,13 @@ impl IncrementalDecoder {
         }
         self.finished = true;
         if self.decoder.is_none() {
-            self.decoder = Some(encoding.encoding.new_decoder_without_bom_handling());
+            self.decoder = Some(encoding.encoding.new_decoder());
         }
         let Some(decoder) = self.decoder.as_mut() else {
             return String::new();
         };
         let mut out = String::with_capacity(8);
         let (_, _, _) = decoder.decode_to_string(b"", &mut out, true);
-        strip_leading_bom_once(encoding, &mut self.bom_consumed, &mut out);
         out
     }
 }
@@ -91,50 +84,66 @@ impl Default for IncrementalDecoder {
     }
 }
 
-/// Strips one leading U+FEFF once per UTF-8 operation (Encoding Standard
-/// BOM handling for `readAsText`). Non-UTF-8 encodings keep the character.
-fn strip_leading_bom_once(encoding: &TextEncoding, consumed: &mut bool, out: &mut String) {
-    if *consumed || !encoding.strip_utf8_bom {
-        return;
+/// Extracts a `charset` parameter from a Blob MIME type per the W3C
+/// packaging-data steps: split on `;`, take the first `charset=`
+/// parameter, strip quotes/whitespace. Returns `None` when absent.
+pub(crate) fn mime_charset(media_type: &str) -> Option<&str> {
+    for param in media_type.split(';').skip(1) {
+        let param = param.trim();
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value);
     }
-    *consumed = true;
-    if out.starts_with('\u{FEFF}') {
-        out.drain(..'\u{FEFF}'.len_utf8());
-    }
+    None
 }
 
-/// Resolves an encoding label.
+/// Shared `readAsText` encoding selection (async `FileReader` and sync
+/// `FileReaderSync` call this one function, so the strings cannot
+/// diverge), per File API "packaging data / Text" over Encoding Standard
+/// "get an encoding" and "Decode":
 ///
-/// Returns `None` for an unknown or unsupported label: the caller fails the
-/// operation with `EncodingError` and no partial result. `None` (absent
-/// label) defaults to UTF-8.
-pub(crate) fn resolve_label(label: Option<&str>) -> Option<TextEncoding> {
-    let Some(label) = label else {
-        return Some(TextEncoding {
-            encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
-        });
-    };
-    if label.trim().is_empty() {
-        return Some(TextEncoding {
-            encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
-        });
+/// 1. an explicit label selects the fallback encoding via `get an
+///    encoding`; an unknown label is *failure*, not an exception — it
+///    falls through to the MIME step, never `EncodingError`;
+/// 2. else the Blob MIME `charset` parameter via `get an encoding`;
+/// 3. else UTF-8;
+/// 4. `Decode` BOM-sniffs and may replace any fallback with UTF-8,
+///    UTF-16LE or UTF-16BE;
+/// 5. malformed sequences decode to U+FFFD.
+///
+/// Exact `get an encoding` semantics (`Encoding::for_label`): labels
+/// that map to the `replacement` encoding resolve to it (decoding then
+/// yields U+FFFD per byte) instead of falling through. `None` is never
+/// returned: there is no `EncodingError` path for labels.
+pub(crate) fn resolve_text_encoding(label: Option<&str>, media_type: &str) -> TextEncoding {
+    if let Some(label) = label
+        && !label.trim().is_empty()
+        && let Some(encoding) = encoding_rs::Encoding::for_label(label.trim().as_bytes())
+    {
+        return TextEncoding { encoding };
     }
-    // `for_label_no_replacement` maps unknown labels and the `replacement`
-    // encoding itself to `None`: both terminate with `EncodingError`.
-    encoding_rs::Encoding::for_label_no_replacement(label.trim().as_bytes()).map(|encoding| {
-        TextEncoding {
-            encoding,
-            strip_utf8_bom: encoding == encoding_rs::UTF_8,
-        }
-    })
+    if let Some(charset) = mime_charset(media_type)
+        && let Some(encoding) = encoding_rs::Encoding::for_label(charset.trim().as_bytes())
+    {
+        return TextEncoding { encoding };
+    }
+    TextEncoding {
+        encoding: encoding_rs::UTF_8,
+    }
 }
 
 /// Decodes a complete byte input with exactly the incremental semantics:
 ///
 /// one `push` of the whole input followed by `finish`. Malformed sequences
-/// decode with replacement; a single leading UTF-8 BOM is stripped.
+/// decode with replacement; the BOM sniff selects the effective encoding.
 pub(crate) fn decode_text(encoding: &TextEncoding, bytes: &[u8]) -> String {
     let mut decoder = IncrementalDecoder::new();
     let mut out = decoder.push(encoding, bytes);
