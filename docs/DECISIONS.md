@@ -246,3 +246,112 @@ multibyte-последовательности; разрешённая зави�
 
 Последствия: split на любой байтовой границе доказан JS-тестами;
 зависимость не добавлена, ADR о ней не нужен.
+
+## ADR-0017 (M4-A): минимальный DOM shim и capability negotiation
+
+Контекст: `FileReader` требует `EventTarget`/`Event`/`ProgressEvent`/
+`DOMException`, но Boa 0.22 не содержит DOM; полный DOM вне scope M4-A.
+
+Решение: `dom.rs` + Cargo feature `dom-shim` (default on) +
+`FileApiExtensionBuilder::dom_shim(bool)` (default true). Регистрируются
+только 5 globals (`EventTarget`, `Event`, `ProgressEvent`, `DOMException`,
+`FileReader`), 3 метода EventTarget, 7 атрибутов + 2 метода Event, 3
+атрибута ProgressEvent, `name`/`message` DOMException, 5 методов + 3
+readonly атрибута + 6 handlers + 3 константы FileReader. Бренд — нативные
+типы данных (JS не может подделать); dispatch только at-target;
+`capture` принимается, но не влияет на порядок. Отключение (feature off
+или `dom_shim(false)`) возвращает typed `RegisterError::DomShimDisabled`
+до мутации `globalThis`; конфликты и нерасширяемость — fail-fast с atomic
+rollback, как M2/M3-B. Host DOM adapter отсутствует честно, вместо
+заглушек.
+
+Последствия: M2 preflight/rollback атомарно охватывают новые globals;
+`FileReader.prototype` наследует `EventTarget.prototype`.
+
+## ADR-0018 (M4-A): FileReading FIFO + generation lifetime
+
+Контекст: File API требует отдельную FIFO File Reading task source,
+generation-защиту от stale completion и доставку через обычный цикл
+`Context::run_jobs()` без фоновых потоков.
+
+Решение: jobs используют promise-job очередь Boa (`PromiseJob::with_realm`
++ `Context::enqueue_job`): `SimpleJobExecutor` дренирует всю promise
+очередь за проход, поэтому successor pump, поставленный после всех уже
+очередных jobs, всё равно выполняется в том же `run_jobs()` с точным FIFO
+против ранних readers. `loadstart`/`progress` диспатчатся синхронно внутри
+своего pump job (всё ещё внутри task source, никогда на вызывающем JS
+стеке): иначе successor pump того же reader успел бы перевести state в
+DONE до прибытия `loadstart` на non-terminal LOADING gate. Terminal
+события (`load`/`error`/`abort` + условный `loadend`) идут через queued
+dispatch jobs, чтобы reentrant handlers наблюдали settled DONE state.
+Каждая операция несёт монотонную nonzero generation; любой late job с
+чужой generation — строгий no-op (без чтения, мутации, слота квоты и
+событий). Quota `max_concurrent_reads_per_global` живёт в per-Context
+числах (`QueueHolder`: `active` + `next_generation`, без GC-указателей);
+инкрементальный `BlobReader` и `encoding_rs::Decoder` путешествуют по
+значению от job к job. Throttle `progress`: максимум раз в 50 мс по
+инжектированному `Clock`, кроме одного на chunk при редких chunks;
+финальный `progress(loaded=total)` всегда перед `load`; события несут тот
+же clock tick как `timeStamp` (создание события часов не читает).
+
+Последствия: abort/stale races детерминированы; `force_collect()` до jobs
+не теряет callbacks/state (всё traced: reader в capture, listeners в
+native data); потоков/`tokio`/собственного event loop нет.
+
+## ADR-0019 (M4-A): result/error mapping
+
+Контекст: нужны точные упаковки четырёх представлений и центральное
+отображение core failures на `DOMException` (M4-A фиксирует выбор), плюс
+миграция M3 promise-read failures с plain `Error`/`RangeError`.
+
+Решение: `readAsArrayBuffer` — точные байты в свежий `ArrayBuffer`;
+`readAsBinaryString` — один code unit U+0000..U+00FF на байт (NUL
+сохраняются); `readAsText` — инкрементальный `encoding_rs::Decoder`
+(`new_decoder_without_bom_handling` + ручной strip одного leading U+FEFF
+для UTF-8 операций; replacement для malformed; split multibyte никогда не
+эмитится рано); unknown label — `EncodingError` без partial result;
+`readAsDataURL` — `data:<type>;base64,<payload>` (пустой type →
+`data:;base64,`), стандартный base64 без пробелов, checked arithmetic до
+аллокации против `max_data_url_output` (`QuotaExceededError`).
+Центральный `dom::map_core_error`: NotFound→NotFoundError,
+UnsafeFile/TooManyReads/PermissionDenied→SecurityError,
+SnapshotChanged/FileLocked/InvalidRange/Internal→NotReadableError,
+ResourceLimit→QuotaExceededError, Cancelled→AbortError; сообщения без
+path/bytes/source details. M3 `text()`/`arrayBuffer()`/`bytes()` и M3-B
+stream errors мигрированы ровно один раз на тот же mapping (тесты и trace
+rows обновлены; старые claims про plain `Error`/`RangeError` удалены).
+
+Последствия: память O(chunk + final result); при любой ошибке partial JS
+result нет; `error` — `null` или same-realm `DOMException`.
+
+## ADR-0020 (M4-A): зависимость `encoding_rs` 0.8
+
+Контекст: `readAsText(blob, label)` обязан следовать Encoding Standard
+через разрешённую ТЗ §2.3 зависимость (M3-B обошёлся ручным UTF-8
+декодером, но произвольные labels требуют полной таблицы кодировок).
+
+Решение: `encoding_rs = "0.8"` (workspace dep, зафиксирована в
+`Cargo.lock` как 0.8.35) — Gecko-ориентированная реализация Encoding
+Standard (активно поддерживается Mozilla/w3c-совместимая), permissive
+лицензия (Apache-2.0 OR MIT) AND BSD-3-Clause, MSRV 1.36 (ниже нашего
+1.91), без unsafe в нашем коде. Используется только `Encoding::
+for_label_no_replacement` + инкрементальный `Decoder::decode_to_string`
+с ручным UTF-8 BOM strip.
+
+Последствия: `cargo-deny` allow-list пополнена `BSD-3-Clause` (третья
+дизъюнктная лицензия `encoding_rs`); дерево зависимостей расширяется на
+`encoding_rs` + `cfg-if`.
+
+## ADR-0021 (M4-A): зависимость `base64` 0.22
+
+Контекст: `readAsDataURL` требует стандартный base64 без пробелов/переносов
+(ТЗ §2.3 разрешает `base64` 0.22).
+
+Решение: `base64 = "0.22"` (workspace dep, зафиксирована в `Cargo.lock`
+как 0.22.1) — широко используемый крейт (marshal pierce/rust-base64,
+десятки миллионов загрузок), permissive лицензия MIT OR Apache-2.0, MSRV
+1.48 (ниже нашего 1.91), без unsafe в нашем коде. Используется только
+`Engine::encode` со `general_purpose::STANDARD`.
+
+Последствия: `cargo-deny` allow-list не меняется (MIT/Apache-2.0 уже
+разрешены); дерево расширяется минимально (без транзитивных deps).

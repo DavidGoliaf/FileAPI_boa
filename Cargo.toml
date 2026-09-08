@@ -31,6 +31,8 @@ thiserror = "2"
 proptest = "1"
 boa_engine = "0.22"
 boa_gc = "0.22"
+encoding_rs = "0.8"
+base64 = "0.22"
 
 [profile.dev]
 opt-level = 0

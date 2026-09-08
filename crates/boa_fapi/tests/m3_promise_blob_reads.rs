@@ -407,9 +407,10 @@ fn bytes_results_are_independent() {
 // ──────────────────────────────────────────────
 
 #[test]
-fn over_materialize_limit_rejects_with_range_error() {
+fn over_materialize_limit_rejects_with_quota_exceeded() {
     // A 70 KiB ceiling (above the 64 KiB chunk floor) with a 70 KiB+1 blob:
-    // the limit is enforced per read by `materialize()`.
+    // the limit is enforced per read by `materialize()`. After M4-A the
+    // rejection is the mapped `QuotaExceededError` DOMException.
     let mut context = setup_with_materialize_limit(70 * 1024);
     let big = "new Uint8Array(70 * 1024 + 1)";
     assert_eval(
@@ -421,7 +422,7 @@ fn over_materialize_limit_rejects_with_range_error() {
             globalThis.p = new Blob([{big}]).text();
             globalThis.p.then(
                 () => {{ globalThis.outcome = 'fulfilled'; }},
-                error => {{ globalThis.outcome = error instanceof RangeError ? 'range' : 'other:' + error.name; }}
+                error => {{ globalThis.outcome = (error instanceof DOMException) && error.name === 'QuotaExceededError' ? 'quota' : 'other:' + error.name; }}
             );
             // Still pending: the rejection happens in the job.
             return globalThis.outcome === 'pending' && (globalThis.p instanceof Promise);
@@ -430,7 +431,7 @@ fn over_materialize_limit_rejects_with_range_error() {
         ),
     );
     context.run_jobs().expect("run_jobs failed");
-    assert_eval(&mut context, "globalThis.outcome === 'range'");
+    assert_eval(&mut context, "globalThis.outcome === 'quota'");
     // The blob is still usable for M2 metadata and slice.
     assert_eval(
         &mut context,
@@ -440,7 +441,8 @@ fn over_materialize_limit_rejects_with_range_error() {
 
 #[test]
 fn materialize_limit_boundary() {
-    // 64 KiB ceiling: `size == limit` succeeds, `size == limit + 1` rejects.
+    // 64 KiB ceiling: `size == limit` succeeds, `size == limit + 1` rejects
+    // with `QuotaExceededError` for every method.
     let mut context = setup_with_materialize_limit(64 * 1024);
     let exact = "new Uint8Array(64 * 1024)";
     let over = "new Uint8Array(64 * 1024 + 1)";
@@ -472,7 +474,7 @@ fn materialize_limit_boundary() {
             ]) {{
                 read.then(
                     () => {{}},
-                    error => {{ if (error instanceof RangeError) globalThis.rejections++; }}
+                    error => {{ if ((error instanceof DOMException) && error.name === 'QuotaExceededError') globalThis.rejections++; }}
                 );
             }}
             return true;
@@ -485,21 +487,21 @@ fn materialize_limit_boundary() {
 }
 
 // ──────────────────────────────────────────────
-// 9. No accidental M4 surface (M3-B streams are expected to exist)
+// 9. No accidental M4-B surface (M4-A DOM/FileReader are expected to exist)
 // ──────────────────────────────────────────────
 
 #[test]
-fn no_filereader_or_dom_globals_appear() {
+fn dom_and_filereader_globals_are_present_without_m4b() {
     let mut context = setup();
     assert_eval(
         &mut context,
         r"
         typeof Blob.prototype.stream === 'function'
         && typeof Blob.prototype.textStream === 'function'
-        && typeof globalThis.FileReader === 'undefined'
+        && typeof globalThis.FileReader === 'function'
         && typeof globalThis.FileReaderSync === 'undefined'
-        && typeof globalThis.EventTarget === 'undefined'
-        && typeof globalThis.DOMException === 'undefined'
+        && typeof globalThis.EventTarget === 'function'
+        && typeof globalThis.DOMException === 'function'
         && typeof globalThis.ReadableStream === 'function'
         ",
     );

@@ -47,7 +47,8 @@ Native data owns `Arc<BlobData>` plus immutable Rust strings/numbers only;
 it contains no `JsObject`/`JsValue`/`Context` and is GC-safe through the
 `boa_gc` derive with `#[unsafe_ignore_trace]` on non-GC fields.
 
-Not implemented (M4+): FileReader, DOM events, blob URLs, structured clone.
+Not implemented (M4-B+): FileReaderSync, workers, filesystem-backed
+sources, blob URLs, structured clone, full DOM/HTML, WPT harness.
 
 ### Layer 2b: `boa_fapi` promise reads (M3-A)
 `promise_read.rs` owns the single conversion/packaging/scheduling path for
@@ -59,9 +60,10 @@ Not implemented (M4+): FileReader, DOM events, blob URLs, structured clone.
   mode is enqueued via `Context::enqueue_job`; the job calls the bounded
   `BlobData::materialize`, packages the result (UTF-8 replacement string,
   fresh `ArrayBuffer`, or fresh offset-0 `Uint8Array`), and settles once;
-- `MaterializeBytes` rejects as `RangeError`; other read failures reject as
-  plain `Error` (no `DOMException` before M4); the embedder runs
-  `context.run_jobs()` explicitly — the job never calls it itself.
+- `MaterializeBytes` and every other read failure reject with the central
+  M4-A mapped `DOMException` (`ResourceLimit` → `QuotaExceededError`,
+  others → the mapped name); the embedder runs `context.run_jobs()`
+  explicitly — the job never calls it itself.
 
 ### Layer 2c: `boa_fapi` streams shim (M3-B)
 `streams.rs` owns the branded `ReadableStream` shim:
@@ -76,8 +78,45 @@ Not implemented (M4+): FileReader, DOM events, blob URLs, structured clone.
 - `ReadableStream`/`ReadableStreamDefaultReader` constructors reject direct
   `new`; `getReader` locks, `releaseLock` unlocks only with no queued read,
   stream/reader `cancel()` resolve `undefined` idempotently through jobs;
-- full WHATWG Streams, FileReader, events, and DOMException stay absent by
-  construction (bounded-surface guard).
+- after M4-A stream errors reject with the central mapped `DOMException`
+  (same mapping as promise reads and FileReader), not a plain `Error`.
+
+### Layer 2d: `boa_fapi` DOM shim + `FileReader` (M4-A)
+`dom.rs` owns the minimal branded DOM surface; `filereader.rs` owns the
+asynchronous `FileReader` state machine:
+
+- `dom-shim` Cargo feature (default on) +
+  `FileApiExtensionBuilder::dom_shim(bool)` (default true): off returns
+  typed `RegisterError::DomShimDisabled` before any `globalThis` mutation;
+  the five globals install atomically with the M2/M3-B preflight/rollback;
+- `EventTarget` (3 methods, tuple `(type, callback, capture)` dedupe,
+  at-target dispatch only, listener exceptions never stop the remaining
+  listeners), `Event` (7 readonly attributes + `preventDefault`/
+  `stopImmediatePropagation`), `ProgressEvent` (inherits `Event`, 3
+  readonly progress attributes), `DOMException` (inherits `Error`,
+  readonly `name`/`message`, `[object DOMException]`, required names);
+- `FileReader` inherits `EventTarget`: 5 async read methods, `EMPTY`/
+  `LOADING`/`DONE` on constructor and prototype, readonly
+  `readyState`/`result`/`error`, 6 writable `on*` handlers; initial state
+  exactly `(EMPTY, null, null)`; `result` only `null`/DOMString/fresh
+  `ArrayBuffer`; `error` only `null`/same-realm `DOMException`;
+- one FileReading job per read, chained per operation through the ordinary
+  Boa promise-job queue drained by `context.run_jobs()` (no threads, no
+  `run_jobs()` inside jobs, no JS from source completion); `loadstart`/
+  `progress` dispatch synchronously inside their pump job, terminal
+  `load`/`error`/`abort` (+ conditional `loadend`) through queued dispatch
+  jobs; monotonic generations make stale completions strict no-ops;
+  `progress` throttled to once per 50 ms of the injected `Clock` (one per
+  chunk when chunks are rarer), final `progress(loaded=total)` always
+  before `load`; `max_concurrent_reads_per_global` quota with exact
+  release on every terminal/abort/stale path;
+- `readAsText` decodes incrementally through `encoding_rs` (replacement,
+  split sequences, BOM); `readAsDataURL` checks `max_data_url_output`
+  with checked arithmetic before allocation; memory stays O(chunk + final
+  result); M3 promise/stream errors migrated once to the same central
+  `DOMException` mapping;
+- explicitly omitted M4-B features: `FileReaderSync`, workers, filesystem
+  sources, blob URLs, structured clone, full DOM/HTML, WPT harness.
 
 ### Layer 3: Host adapters (future M5+)
 
@@ -101,7 +140,7 @@ Future filesystem implementations will check snapshot stability on each read and
 boa_fapi_core (no external runtime deps beyond bytes/thiserror)
     └── bytes, thiserror
 
-boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror
+boa_fapi → boa_fapi_core + boa_engine + boa_gc + bytes + thiserror + encoding_rs + base64
 boa_fapi_fs (future) → boa_fapi_core + std::fs
 boa_fapi_wpt (future) → boa_fapi_core + test harness
 ```

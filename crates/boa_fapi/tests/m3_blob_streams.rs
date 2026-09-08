@@ -177,6 +177,8 @@ fn shim_constructors_and_receivers_reject_synchronously() {
 
 #[test]
 fn full_streams_api_absent() {
+    // M4-A adds exactly the DOM/FileReader surface; full WHATWG Streams
+    // stays absent.
     let mut context = setup();
     assert_eval(
         &mut context,
@@ -189,8 +191,8 @@ fn full_streams_api_absent() {
         && typeof WritableStream === 'undefined'
         && typeof TextDecoder === 'undefined'
         && typeof TextDecoderStream === 'undefined'
-        && typeof FileReader === 'undefined'
-        && typeof DOMException === 'undefined'
+        && typeof FileReader === 'function'
+        && typeof DOMException === 'function'
         ",
     );
 }

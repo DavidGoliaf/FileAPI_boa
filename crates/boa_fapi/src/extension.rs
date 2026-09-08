@@ -33,6 +33,9 @@ pub(crate) struct ExtensionConfig {
     pub(crate) limits: FileApiLimits,
     /// Whether the M3-B streams shim is registered.
     pub(crate) streams_shim: bool,
+    /// Whether the M4-A DOM shim (`EventTarget`, `Event`, `ProgressEvent`,
+    /// `DOMException`, `FileReader`) is registered.
+    pub(crate) dom_shim: bool,
 }
 
 /// The registered classes and configuration of a context.
@@ -47,6 +50,12 @@ pub(crate) struct RegisteredSpecs {
     /// Streams shim constructors/prototypes (present when enabled).
     #[cfg(feature = "streams-shim")]
     pub(crate) streams: Option<crate::streams::StreamSpecs>,
+    /// DOM shim constructors/prototypes (present when enabled).
+    #[cfg(feature = "dom-shim")]
+    pub(crate) dom: Option<crate::dom::DomSpecs>,
+    /// FileReader constructor/prototype (present when the DOM shim is on).
+    #[cfg(feature = "dom-shim")]
+    pub(crate) filereader: Option<crate::filereader::FileReaderSpecs>,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
 }
@@ -71,6 +80,63 @@ impl RegisteredSpecs {
     pub(crate) fn now_unix_millis(&self) -> i64 {
         self.config.clock.now_unix_millis()
     }
+
+    /// Reads the current time from the injected clock as an event time stamp.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn clock_millis(&self) -> f64 {
+        self.config.clock.now_unix_millis() as f64
+    }
+
+    /// Returns the `EventTarget` interface prototype.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn dom_event_target_proto(&self) -> JsObject {
+        self.dom
+            .as_ref()
+            .map(|dom| dom.event_target.prototype())
+            .unwrap_or_else(|| self.blob_proto())
+    }
+
+    /// Returns the `Event` interface prototype.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn dom_event_proto(&self) -> JsObject {
+        self.dom
+            .as_ref()
+            .map(|dom| dom.event.prototype())
+            .unwrap_or_else(|| self.blob_proto())
+    }
+
+    /// Returns the `ProgressEvent` interface prototype.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn dom_progress_event_proto(&self) -> JsObject {
+        self.dom
+            .as_ref()
+            .map(|dom| dom.progress_event.prototype())
+            .unwrap_or_else(|| self.blob_proto())
+    }
+
+    /// Returns the `DOMException` interface prototype.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn dom_exception_proto(&self) -> JsObject {
+        self.dom
+            .as_ref()
+            .map(|dom| dom.dom_exception.prototype())
+            .unwrap_or_else(|| self.blob_proto())
+    }
+
+    /// Returns the `FileReader` interface prototype.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn filereader_proto(&self) -> JsObject {
+        self.filereader
+            .as_ref()
+            .map(|spec| spec.reader.prototype())
+            .unwrap_or_else(|| self.blob_proto())
+    }
+
+    /// Returns the cloned DOM specs when the shim is registered.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn dom_specs(&self) -> Option<crate::dom::DomSpecs> {
+        self.dom.clone()
+    }
 }
 
 /// Clones the registration state out of the context so that callers never
@@ -90,6 +156,7 @@ pub struct FileApiExtensionBuilder {
     clock: Option<Arc<dyn Clock>>,
     limits: Option<FileApiLimits>,
     streams_shim: Option<bool>,
+    dom_shim: Option<bool>,
 }
 
 impl FileApiExtensionBuilder {
@@ -119,6 +186,16 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Enables or disables the M4-A DOM shim registration.
+    ///
+    /// Defaults to `true`. When `false` (or the `dom-shim` Cargo feature
+    /// is off), `register` fails before touching `globalThis` because no
+    /// host DOM adapter is implemented in this milestone.
+    pub fn dom_shim(&mut self, enabled: bool) -> &mut Self {
+        self.dom_shim = Some(enabled);
+        self
+    }
+
     /// Creates the extension.
     #[must_use]
     pub fn build(&self) -> FileApiExtension {
@@ -127,6 +204,7 @@ impl FileApiExtensionBuilder {
                 clock: self.clock.clone().unwrap_or_else(|| Arc::new(SystemClock)),
                 limits: self.limits.clone().unwrap_or_default(),
                 streams_shim: self.streams_shim.unwrap_or(true),
+                dom_shim: self.dom_shim.unwrap_or(true),
             },
         }
     }
@@ -166,6 +244,14 @@ impl FileApiExtension {
             return Err(RegisterError::StreamsShimDisabled);
         }
 
+        // DOM shim availability is checked before any globalThis mutation:
+        // without the shim there is no host DOM adapter. Same flag/feature
+        // combination as the streams shim.
+        let dom_available = self.config.dom_shim && cfg!(feature = "dom-shim");
+        if !dom_available {
+            return Err(RegisterError::DomShimDisabled);
+        }
+
         // Host limits are validated before any globalThis mutation: an
         // invalid configuration fails with a typed error and installs
         // nothing. This is the full `FileApiLimits::validate()` contract,
@@ -187,6 +273,13 @@ impl FileApiExtension {
         let file_list_proto = build_file_list_prototype(context)?;
         #[cfg(feature = "streams-shim")]
         let stream_specs = crate::streams::build_stream_specs(context)?;
+        #[cfg(feature = "dom-shim")]
+        let error_prototype = context.intrinsics().constructors().error().prototype();
+        #[cfg(feature = "dom-shim")]
+        let dom_specs = crate::dom::build_dom_specs(context, error_prototype)?;
+        #[cfg(feature = "dom-shim")]
+        let filereader_specs =
+            crate::filereader::build_filereader_specs(context, dom_specs.event_target.prototype())?;
         // Preflight: extensibility and every own global name.
         let global = context.global_object();
         if !global.is_extensible(context).map_err(RegisterError::Js)? {
@@ -203,6 +296,16 @@ impl FileApiExtension {
             "ReadableStream",
             #[cfg(feature = "streams-shim")]
             "ReadableStreamDefaultReader",
+            #[cfg(feature = "dom-shim")]
+            "EventTarget",
+            #[cfg(feature = "dom-shim")]
+            "Event",
+            #[cfg(feature = "dom-shim")]
+            "ProgressEvent",
+            #[cfg(feature = "dom-shim")]
+            "DOMException",
+            #[cfg(feature = "dom-shim")]
+            "FileReader",
         ] {
             let key = PropertyKey::from(js_string!(name));
             if keys.contains(&key) {
@@ -217,6 +320,10 @@ impl FileApiExtension {
             &file_spec,
             #[cfg(feature = "streams-shim")]
             &stream_specs,
+            #[cfg(feature = "dom-shim")]
+            &dom_specs,
+            #[cfg(feature = "dom-shim")]
+            &filereader_specs,
         ) {
             rollback_globals(context)?;
             return Err(RegisterError::Js(error));
@@ -228,6 +335,10 @@ impl FileApiExtension {
             file_list_proto,
             #[cfg(feature = "streams-shim")]
             streams: Some(stream_specs),
+            #[cfg(feature = "dom-shim")]
+            dom: Some(dom_specs),
+            #[cfg(feature = "dom-shim")]
+            filereader: Some(filereader_specs),
             config: self.config.clone(),
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
@@ -286,12 +397,15 @@ struct OrdinaryPrototype;
 /// Installs `Blob` and `File` on the global object (Web IDL attributes:
 /// writable, non-enumerable, configurable). `FileList` installs nothing.
 /// The streams shim installs `ReadableStream` and
-/// `ReadableStreamDefaultReader` the same way.
+/// `ReadableStreamDefaultReader` the same way; the DOM shim installs
+/// `EventTarget`, `Event`, `ProgressEvent`, `DOMException` and `FileReader`.
 fn install_globals(
     context: &mut Context,
     blob_spec: &StandardConstructor,
     file_spec: &StandardConstructor,
     #[cfg(feature = "streams-shim")] stream_specs: &crate::streams::StreamSpecs,
+    #[cfg(feature = "dom-shim")] dom_specs: &crate::dom::DomSpecs,
+    #[cfg(feature = "dom-shim")] filereader_specs: &crate::filereader::FileReaderSpecs,
 ) -> JsResult<()> {
     let global = context.global_object();
     for (name, constructor) in [
@@ -326,6 +440,24 @@ fn install_globals(
             context,
         )?;
     }
+    #[cfg(feature = "dom-shim")]
+    for (name, constructor) in [
+        ("EventTarget", dom_specs.event_target.constructor()),
+        ("Event", dom_specs.event.constructor()),
+        ("ProgressEvent", dom_specs.progress_event.constructor()),
+        ("DOMException", dom_specs.dom_exception.constructor()),
+        ("FileReader", filereader_specs.reader.constructor()),
+    ] {
+        global.define_property_or_throw(
+            js_string!(name),
+            PropertyDescriptor::builder()
+                .value(constructor)
+                .writable(true)
+                .enumerable(false)
+                .configurable(true),
+            context,
+        )?;
+    }
     Ok(())
 }
 
@@ -339,6 +471,16 @@ fn rollback_globals(context: &mut Context) -> Result<(), RegisterError> {
         "ReadableStream",
         #[cfg(feature = "streams-shim")]
         "ReadableStreamDefaultReader",
+        #[cfg(feature = "dom-shim")]
+        "EventTarget",
+        #[cfg(feature = "dom-shim")]
+        "Event",
+        #[cfg(feature = "dom-shim")]
+        "ProgressEvent",
+        #[cfg(feature = "dom-shim")]
+        "DOMException",
+        #[cfg(feature = "dom-shim")]
+        "FileReader",
     ] {
         // The property was just defined as configurable, so deletion succeeds
         // on ordinary globals. A hostile exotic global may still refuse; the

@@ -17,12 +17,13 @@ use boa_engine::object::builtins::{JsArrayBuffer, JsPromise, JsUint8Array};
 use boa_engine::{Context, JsResult, JsString, JsValue};
 use boa_fapi_core::blob::BlobData;
 use boa_fapi_core::cancellation::CancellationToken;
-use boa_fapi_core::error::ResourceLimitKind;
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_fapi_core::limits::FileApiLimits;
 
 use crate::brand;
-use crate::error::{js_read_error, range_error, type_error};
+#[cfg(not(feature = "dom-shim"))]
+use crate::error::range_error;
+use crate::error::{js_read_error, type_error};
 
 /// The read mode captured by a promise job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,10 +110,11 @@ fn snapshot_limits(context: &Context) -> JsResult<FileApiLimits> {
 
 /// Runs inside the promise job: materializes, packages, and settles once.
 ///
-/// Materialization failure rejects: `MaterializeBytes` limit as `RangeError`,
-/// every other core/read error as a plain `Error` without path/source/body
-/// detail. Packaging failure rejects with the engine error. The promise is
-/// settled exactly once; the blob is never mutated.
+/// Materialization failure rejects with the central M4-A `DOMException`
+/// mapping (`ResourceLimit` → `QuotaExceededError`, other core failures →
+/// the mapped name), built in the same realm. No path, source, or body
+/// detail leaks into the message. Packaging failure rejects with the engine
+/// error. The promise is settled exactly once; the blob is never mutated.
 fn settle_read(
     request: &ReadRequest,
     resolvers: &ResolvingFunctions,
@@ -143,22 +145,40 @@ fn settle_read(
     Ok(JsValue::undefined())
 }
 
-/// Rejects with the M3-mandated error kind for a materialization failure.
+/// Rejects with the M4-A `DOMException` mapping for a materialization
+/// failure: `ResourceLimit` → same-realm `QuotaExceededError`, every other
+/// core failure → the centrally mapped `DOMException` name. Without the
+/// `dom-shim` feature (M4-A off) the pre-M4 mapping applies instead:
+/// `MaterializeBytes` → `RangeError`, every other failure → plain `Error`.
 fn reject_with(
     error: &FileApiError,
     reject: &boa_engine::object::builtins::JsFunction,
     context: &mut Context,
 ) -> JsResult<()> {
-    let reason: JsValue = match error {
-        FileApiError::ResourceLimit(ResourceLimitKind::MaterializeBytes) => {
-            range_error("blob size exceeds the materialization limit")
+    #[cfg(feature = "dom-shim")]
+    {
+        let (name, message) = crate::dom::map_core_error(error);
+        let reason: JsValue = crate::extension::snapshot(context)
+            .ok()
+            .and_then(|specs| specs.dom_specs())
+            .map(|dom| JsValue::from(crate::dom::construct_exception(&dom, name, message)))
+            .unwrap_or_else(|| js_read_error(context));
+        reject.call(&JsValue::undefined(), &[reason], context)?;
+        Ok(())
+    }
+    #[cfg(not(feature = "dom-shim"))]
+    {
+        let reason: JsValue = match error {
+            FileApiError::ResourceLimit(
+                boa_fapi_core::error::ResourceLimitKind::MaterializeBytes,
+            ) => range_error("blob size exceeds the materialization limit")
                 .into_opaque(context)
-                .map_or_else(|_| js_read_error(context), JsValue::from)
-        }
-        _ => js_read_error(context),
-    };
-    reject.call(&JsValue::undefined(), &[reason], context)?;
-    Ok(())
+                .map_or_else(|_| js_read_error(context), JsValue::from),
+            _ => js_read_error(context),
+        };
+        reject.call(&JsValue::undefined(), &[reason], context)?;
+        Ok(())
+    }
 }
 
 /// Converts an engine packaging error into a rejection reason value.
@@ -200,18 +220,21 @@ fn package_bytes(mode: ReadMode, bytes: &bytes::Bytes, context: &mut Context) ->
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    //! Child-module proof of the rejection-type mapping through the real
-    //! `read_promise` → `PromiseJob` → `Context::run_jobs()` path.
+    //! Child-module proof of the M4-A rejection-type mapping through the
+    //! real `read_promise` → `PromiseJob` → `Context::run_jobs()` path.
     //!
-    //! The blob carries a controlled `ByteSource` that is structurally
-    //! valid (`len()` covers the segment) but fails reads with
-    //! `FileApiError::Cancelled`. The source type exists only in this
-    //! test module: no production hook, no public arbitrary-source API.
+    //! After M4-A the `DOMException` exists, so both limit and non-limit
+    //! failures reject with the central mapped `DOMException`. The blob
+    //! carries a controlled `ByteSource` that is structurally valid (`len()`
+    //! covers the segment) but fails reads with `FileApiError::Cancelled`.
+    //! The source type exists only in this test module: no production hook,
+    //! no public arbitrary-source API.
     //!
     //! Prototype identity (`instanceof`) cannot be proven from Rust alone —
     //! `name` is writable — so each test attaches a JavaScript rejection
     //! handler in the same `Context` before jobs run and reads back its
-    //! observable verdict after `run_jobs()`.
+    //! observable verdict after `run_jobs()`. The extension is registered
+    //! first so the same-realm `DOMException` prototype exists.
 
     use super::*;
     use boa_engine::{Source, js_string};
@@ -261,6 +284,10 @@ mod tests {
     /// `globalThis.probe`, with a rejection handler recording the
     /// realm-local verdict into `globalThis.verdict`.
     ///
+    /// The extension must be registered before calling: the rejection is a
+    /// same-realm `DOMException`, so the verdict also probes
+    /// `DOMException` inheritance from `Error`.
+    ///
     /// Returns the input metadata for the unchanged-blob assertion.
     fn enqueue_probe(
         context: &mut Context,
@@ -283,15 +310,26 @@ mod tests {
                      () => { globalThis.verdict = 'fulfilled'; }, \
                      error => { \
                          globalThis.verdict = \
-                             (error instanceof RangeError) ? 'range' \
-                             : (error instanceof Error) \
-                                 ? 'error:' + error.name + ':' + error.message \
-                                 : 'other'; \
+                             (error instanceof DOMException) \
+                                 ? 'dom:' + error.name + ':' + error.message \
+                                     + ':' + (error instanceof Error) \
+                                 : (error instanceof RangeError) ? 'range' \
+                                 : (error instanceof Error) \
+                                     ? 'error:' + error.name + ':' + error.message \
+                                     : 'other'; \
                      } \
                  );",
             ))
             .expect("attach handler");
         (data.size(), data.segment_count())
+    }
+
+    /// Registers the extension into `context` (same-realm `DOMException`).
+    fn register(context: &mut Context) {
+        crate::extension::FileApiExtension::builder()
+            .build()
+            .register(context)
+            .expect("registration failed");
     }
 
     /// Reads back the JS handler verdict after jobs have run.
@@ -305,27 +343,33 @@ mod tests {
     }
 
     #[test]
-    fn non_limit_error_rejects_with_plain_error_not_range_error() {
+    fn non_limit_error_rejects_with_mapped_dom_exception() {
         let data = failing_blob();
         let context = &mut Context::default();
+        register(context);
         let (size_before, segments_before) =
             enqueue_probe(context, &data, &FileApiLimits::default());
         // Pending before the queue runs: the handler has not observed the
         // rejection yet.
         assert_eq!(js_verdict(context), "pending");
         context.run_jobs().expect("run_jobs");
-        // Prototype identity proven in the originating realm: a plain
-        // `Error` with the M3 message, never a `RangeError`.
-        assert_eq!(js_verdict(context), "error:Error:blob read failed");
+        // Prototype identity proven in the originating realm: the M4-A
+        // central mapping turns `Cancelled` into `AbortError`, inheriting
+        // from `Error` — never a plain `Error` or `RangeError`.
+        assert_eq!(
+            js_verdict(context),
+            "dom:AbortError:the read was aborted:true"
+        );
         // No fulfilled text value and unchanged input metadata.
         assert_eq!(data.size(), size_before);
         assert_eq!(data.segment_count(), segments_before);
     }
 
     #[test]
-    fn non_limit_rejection_mapping_is_distinct_from_limit_mapping() {
-        // Same job path with an over-limit blob rejects as `RangeError`,
-        // proving the two mappings are distinct in the same JS-realm style.
+    fn limit_error_rejects_with_quota_exceeded_dom_exception() {
+        // Same job path with an over-limit blob rejects with the M4-A
+        // `ResourceLimit` mapping (`QuotaExceededError`), proving the two
+        // mappings are distinct in the same JS-realm style.
         let big = BlobData::from_segments(
             vec![boa_fapi_core::blob::BlobSegment {
                 source: Arc::new(MemorySource::new(bytes::Bytes::copy_from_slice(b"hello"))),
@@ -340,28 +384,31 @@ mod tests {
         tight.max_materialize_bytes = 4;
         let data = Arc::new(big);
         let context = &mut Context::default();
+        register(context);
         let (size_before, segments_before) = enqueue_probe(context, &data, &tight);
         assert_eq!(js_verdict(context), "pending");
         context.run_jobs().expect("run_jobs");
         assert_eq!(
             js_verdict(context),
-            "range",
-            "limit mapping must reject with RangeError"
+            "dom:QuotaExceededError:the operation exceeds the configured quota:true",
+            "limit mapping must reject with QuotaExceededError"
         );
         assert_eq!(data.size(), size_before);
         assert_eq!(data.segment_count(), segments_before);
     }
 
     #[test]
-    fn js_realm_verdict_helper_distinguishes_range_error() {
-        // Self-check: the verdict helper distinguishes a plain `Error`
-        // from a `RangeError` in the same realm (guards against a vacuous
+    fn js_realm_verdict_helper_distinguishes_dom_exception() {
+        // Self-check: the verdict helper distinguishes a `DOMException`
+        // from a plain `Error` in the same realm (guards against a vacuous
         // `instanceof` assertion above).
         let context = &mut Context::default();
+        register(context);
         let value = context
             .eval(Source::from_bytes(
-                "var e = new RangeError('x'); \
-                 (e instanceof RangeError) && (e instanceof Error);",
+                "var e = new DOMException('x', 'NotReadableError'); \
+                 (e instanceof DOMException) && (e instanceof Error) \
+                 && !(e instanceof RangeError) && e.name === 'NotReadableError';",
             ))
             .expect("eval");
         assert_eq!(value.as_boolean(), Some(true));

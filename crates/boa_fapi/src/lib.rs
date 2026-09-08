@@ -13,11 +13,20 @@
 //! `Blob.prototype.arrayBuffer()` and `Blob.prototype.bytes()` (inherited
 //! by `File`). Each call returns a pending `Promise` immediately; the read,
 //! packaging, and settlement run in a Boa promise job after the embedder
-//! calls `Context::run_jobs()`.
+//! calls `Context::run_jobs()`. After M4-A rejections use the central
+//! `DOMException` mapping.
+//!
+//! M3-B adds the capability-checked `ReadableStream` shim for
+//! `Blob.prototype.stream()`/`textStream()`.
+//!
+//! M4-A adds the minimal self-contained `dom-shim` (`EventTarget`, `Event`,
+//! `ProgressEvent`, `DOMException`) and the asynchronous `FileReader` for
+//! memory-backed `Blob`/`File`. Every read enqueues FileReading jobs
+//! delivered through the ordinary `Context::run_jobs()` cycle; no
+//! `FileReaderSync`, workers, filesystem sources, blob URLs, clone, or WPT
+//! harness are included.
 //!
 //! The engine-independent data model and algorithms live in `boa_fapi_core`.
-//! The rest of M3 (streams), M4–M7 APIs (FileReader, blob URLs, WPT) are
-//! intentionally absent.
 //!
 //! # Example
 //!
@@ -46,6 +55,8 @@
 #![deny(clippy::panic)]
 
 pub mod clock;
+#[cfg(feature = "dom-shim")]
+pub mod dom;
 pub mod error;
 pub mod extension;
 
@@ -53,6 +64,8 @@ mod blob;
 mod brand;
 mod file;
 mod file_list;
+#[cfg(feature = "dom-shim")]
+mod filereader;
 mod promise_read;
 #[cfg(feature = "streams-shim")]
 mod streams;
