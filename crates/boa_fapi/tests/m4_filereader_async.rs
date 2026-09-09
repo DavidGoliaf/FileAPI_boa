@@ -1430,12 +1430,27 @@ fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
         ",
     );
     // M9-B host loop: `poll_io` turns the worker completion into a Boa
-    // job, then `run_jobs` settles it.
-    for _ in 0..64 {
+    // job, then `run_jobs` settles it. `poll_io` is strictly
+    // non-blocking, so the loop yields briefly (bounded, hang-guard only)
+    // while threaded-executor I/O is still outstanding.
+    for _ in 0..200 {
         let settled = handle.poll_io(&mut context).unwrap_or(0);
         context.run_jobs().expect("run_jobs failed");
         if settled == 0 && !handle.has_pending_io() {
             break;
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(&mut context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
         }
     }
     assert_eval(&mut context, "globalThis.outcome === 'fulfilled:ok'");

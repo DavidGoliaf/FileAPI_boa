@@ -399,6 +399,49 @@ fn filereader_and_dom_surface_is_bounded() {
 }
 
 #[test]
+fn promise_read_has_no_sync_filesystem_fallback() {
+    // M9-B: `promise_read.rs` (Boa thread) must never call the blocking
+    // primitives itself. `BlobData::materialize`, `ByteSource::read_range`
+    // and `BlobReader::read_next` may appear only in comments/docs and in
+    // the `#[cfg(test)]` module (controlled unit sources); the worker entry
+    // lives in `io.rs` (`FileIoTask::execute`). Behaviourally this is
+    // proven by `m9_promise_io::blocking_source_never_runs_inside_boa_job`
+    // with a gated blocking source; this guard keeps the call path absent
+    // by construction.
+    let content = read(&workspace_root().join("crates/boa_fapi/src/promise_read.rs"));
+    let stripped = strip_test_modules(&content);
+    for forbidden in [".materialize(", "read_range(", "read_next(", ".execute("] {
+        let mut hits = 0;
+        for line in stripped.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "promise_read.rs must not contain {forbidden}");
+    }
+    // The worker entry point itself is asserted present in `io.rs`, so the
+    // guard above cannot go vacuous (a rename would fail loudly here).
+    let io = read(&workspace_root().join("crates/boa_fapi/src/io.rs"));
+    for required in [
+        "fn run_materialize_guarded",
+        ".materialize(&self.limits",
+        "fn execute(",
+    ] {
+        assert!(io.contains(required), "io.rs must contain `{required}`");
+    }
+    // Docs still describe the intended threading contract.
+    let promise_docs = read(&workspace_root().join("crates/boa_fapi/src/promise_read.rs"));
+    assert!(
+        promise_docs.contains("worker"),
+        "promise_read.rs docs must describe the worker path"
+    );
+}
+
+#[test]
 fn sync_surface_is_bounded() {
     // M4-B registers exactly: the `FileReaderSync` global (worker
     // environments only), four prototype methods with `length = 1`, and
@@ -808,4 +851,17 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
             "extension.rs must contain `{required}`"
         );
     }
+    // Advanced host constructors accept only immutable `BlobData`; they
+    // expose no path, handle or mutable byte surface to JavaScript.
+    for required in ["blob_from_data", "file_from_data"] {
+        assert!(
+            extension.contains(required),
+            "extension.rs must contain `{required}`"
+        );
+    }
+    let lib_rs = read(&workspace_root().join("crates/boa_fapi/src/lib.rs"));
+    assert!(
+        !lib_rs.contains("pub use blob::BlobNative"),
+        "lib.rs must not expose BlobNative"
+    );
 }

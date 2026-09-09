@@ -140,7 +140,7 @@ pub(crate) fn read_promise(
         );
     })?;
     let task = bridge.task_for(operation_id, token, Arc::clone(&data), limits.clone());
-    if let Err(error) = bridge.executor().submit(task) {
+    if let Err(error) = bridge.submit_guarded(task) {
         // Submit failure: release the reservation exactly once and settle
         // the pending read through the typed error path (one Boa job).
         bridge.unreserve(operation_id);
@@ -560,14 +560,33 @@ mod tests {
     }
 
     /// Drives the M9-B host loop for `context`: `poll_io` then jobs,
-    /// until quiescent (bounded: 64 rounds are enough for promise tests).
+    /// until quiescent. The default executor runs separately, so polling
+    /// alone cannot guarantee it receives a time slice on every supported
+    /// platform. The bounded wait is a test hang guard, not a synchronous
+    /// I/O path.
     fn drive(context: &mut Context) {
         let handle = poll_handle(context);
-        for _ in 0..64 {
+        for _ in 0..200 {
             let settled = handle.poll_io(context).unwrap_or(0);
             context.run_jobs().expect("run_jobs");
             if settled == 0 && !handle.has_pending_io() {
-                break;
+                context.run_jobs().expect("run_jobs");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+            if handle.has_pending_io() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+                while handle.has_pending_io() {
+                    let _ = handle.poll_io(context);
+                    if !handle.has_pending_io() {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
             }
         }
     }

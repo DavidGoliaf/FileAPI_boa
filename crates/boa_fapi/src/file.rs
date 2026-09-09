@@ -84,11 +84,10 @@ pub(crate) fn native_from_bytes(
 
 /// Builds the native state for a File over an existing [`BlobData`].
 ///
-/// Used by the `fs` host import: the payload already carries its
-/// filesystem snapshot, and only the display name/timestamp are attached
-/// here. No basename is computed; `display_name` is the only name JS
-/// observes.
-#[cfg(feature = "fs")]
+/// Used by host imports and advanced host integrations: the payload already
+/// carries its immutable snapshot, and only the display name/timestamp are
+/// attached here. No basename is computed; `display_name` is the only name
+/// JS observes.
 pub(crate) fn native_from_data(
     data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
     display_name: &str,

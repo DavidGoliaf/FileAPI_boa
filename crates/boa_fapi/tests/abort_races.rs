@@ -55,15 +55,30 @@ fn eval_side_effect(context: &mut Context, source: &str) {
 
 /// Drives jobs until quiescent (bounded: FileReader chains settle fast).
 /// Promise reads additionally need `poll_io` first; the helper drives the
-/// M9-B host loop so both settle.
+/// M9-B host loop so both settle. `poll_io` is strictly non-blocking, so
+/// the loop yields briefly (bounded, hang-guard only) while threaded
+/// I/O is still outstanding.
 fn drain(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
-    for _ in 0..16 {
+    for _ in 0..64 {
         let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs");
         if settled == 0 && !handle.has_pending_io() {
             context.run_jobs().expect("run_jobs");
             if !handle.has_pending_io() {
                 break;
+            }
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
             }
         }
     }

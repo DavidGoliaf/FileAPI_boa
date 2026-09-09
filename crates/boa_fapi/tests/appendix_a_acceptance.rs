@@ -65,11 +65,24 @@ fn assert_async_body(context: &mut Context, handle: &boa_fapi::FileApiHandle, bo
     let promise = value
         .as_object()
         .unwrap_or_else(|| panic!("expected a promise from {source}"));
-    for _ in 0..64 {
+    for _ in 0..200 {
         let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs failed");
         if settled == 0 && !handle.has_pending_io() {
             break;
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
         }
     }
     let state = boa_engine::object::builtins::JsPromise::from_object(promise)

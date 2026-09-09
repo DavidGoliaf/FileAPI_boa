@@ -29,7 +29,7 @@ evidence, not acceptance.
   (`settle_completion` + `PendingReads` table); submit/queue-full/worker-
   loss/shutdown settle through the central `DOMException` mapping
   (`TooManyReads` → `SecurityError`, worker loss → `NotReadableError`).
-- Tests: `crates/boa_fapi/tests/m9_promise_io.rs` (11, controlled manual
+- Tests: `crates/boa_fapi/tests/m9_promise_io.rs` (17, controlled manual
   executor + counting wake, no `sleep` oracle): pending-before-I/O with a
   usable Boa thread, `run_jobs`-alone never settles (behavioural blocking-
   source guard with a gated worker thread), foreign `poll_io` rejection,
@@ -50,6 +50,14 @@ evidence, not acceptance.
   `io.rs` is the single allowed `std::thread` site; public I/O surface
   asserted.
 - No new dependencies (`cargo-deny` clean, allow-list unchanged).
+- Rework after acceptance: `poll_io` is now strictly non-blocking; the WPT
+  runner uses a generation-counted `FileIoWake` plus a bounded condition
+  variable wait, rather than a fixed CPU-spin budget. `m9_promise_io` runs
+  under the exact acceptance command (17 tests, no feature gate), and the
+  operation-id `u64::MAX` boundary is covered by an `io.rs` unit test.
+  The legacy M8 feature-off guard now drives the same documented host loop;
+  the `promise_read` unit helper has a bounded worker-scheduling guard, so
+  it does not assume a fixed number of immediate polls is portable.
 
 ## Timing-independent evidence (blocking source not on the Boa thread)
 
@@ -66,7 +74,10 @@ evidence, not acceptance.
   jobs run, completion before `poll_io` runs no JS, and `poll_io` settles
   exactly 1 job.
 - Pre-existing behaviour preserved: `cargo test --workspace --all-features`
-  green (all suites), `m9_promise_io` 11/11 green.
+  green (all suites), `m9_promise_io` 17/17 green.
+- Feature combinations: `cargo hack check --feature-powerset --depth 2`
+  green; the advanced immutable `BlobData` host constructors do not require
+  a test-only Cargo feature and compile in every supported feature set.
 
 ## Deviations
 

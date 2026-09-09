@@ -67,12 +67,29 @@ fn setup_with_materialize_limit(max_materialize_bytes: u64) -> (Context, boa_fap
 
 /// Drives the M9-B host loop until quiescent: `poll_io` turns worker
 /// completions into Boa jobs, `run_jobs` settles them.
+///
+/// `poll_io` is strictly non-blocking, so with the default threaded
+/// executor the loop additionally yields briefly (bounded, hang-guard
+/// only) while I/O is still outstanding before moving to the next pass.
 fn drive_host_loop(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
-    for _ in 0..64 {
+    for _ in 0..200 {
         let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs failed");
         if settled == 0 && !handle.has_pending_io() {
             break;
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
         }
     }
 }

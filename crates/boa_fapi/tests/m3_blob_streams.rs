@@ -469,11 +469,26 @@ fn two_streams_are_independent() {
         .unwrap_or_else(|| panic!("expected a promise from {source}"));
     // M9-B host loop: `poll_io` turns the worker completion into a Boa
     // job, then `run_jobs` settles it (streams need only `run_jobs`).
-    for _ in 0..64 {
+    // `poll_io` is strictly non-blocking, so the loop yields briefly
+    // (bounded, hang-guard only) while threaded I/O is outstanding.
+    for _ in 0..200 {
         let settled = handle.poll_io(&mut context).unwrap_or(0);
         context.run_jobs().expect("run_jobs failed");
         if settled == 0 && !handle.has_pending_io() {
             break;
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(&mut context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
         }
     }
     let state = boa_engine::object::builtins::JsPromise::from_object(promise)

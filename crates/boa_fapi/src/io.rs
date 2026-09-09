@@ -37,10 +37,9 @@
 //! - `shutdown` cancels outstanding work, clears queued completions, and
 //!   forbids late settlement; a late worker safely drops its result.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use boa_fapi_core::blob::BlobData;
 use boa_fapi_core::cancellation::CancellationToken;
@@ -57,10 +56,29 @@ pub struct FileApiContextId(u64);
 
 impl FileApiContextId {
     /// Mints a fresh context id.
-    pub(crate) fn fresh() -> Self {
+    ///
+    /// Monotonic until exhaustion; on exhaustion (practically
+    /// unreachable: 2^64 registrations) returns `None` instead of wrapping
+    /// so ids are never reused within the process lifetime. `0` and
+    /// `u64::MAX` are never issued.
+    pub(crate) fn fresh() -> Option<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
-        Self(id)
+        loop {
+            let candidate = NEXT.load(Ordering::Relaxed);
+            if candidate == 0 || candidate == u64::MAX {
+                NEXT.store(u64::MAX, Ordering::Relaxed);
+                return None;
+            }
+            match NEXT.compare_exchange_weak(
+                candidate,
+                candidate.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(candidate)),
+                Err(_) => continue,
+            }
+        }
     }
 
     /// Returns the opaque numeric value (for wake routing and diagnostics).
@@ -228,6 +246,11 @@ impl FileIoTask {
     }
 
     /// Runs the bounded materialization without Boa.
+    ///
+    /// Kept as the explicit reference for the unguarded entry: the worker
+    /// contract requires the guarded path (`run_materialize_guarded`), and
+    /// the source guard `promise_read_has_no_sync_filesystem_fallback`
+    /// asserts both entries stay present.
     #[allow(dead_code)]
     fn run_materialize(&self) {
         if self.bridge.is_shutdown() || self.cancel.is_cancelled() {
@@ -367,8 +390,26 @@ pub(crate) struct IoBridge {
 #[derive(Debug, Default)]
 struct BridgeState {
     active: usize,
-    completions: VecDeque<FileIoCompletion>,
+    /// Completions grouped by operation id in submission order.
+    ///
+    /// Workers may finish out of order; `take_completions` releases only
+    /// the longest in-order prefix (FIFO settlement by submission order),
+    /// so an early-finishing later read can never overtake an earlier one.
+    /// Entries hold at most one completion each (one task per operation).
+    completions: BTreeMap<u64, FileIoCompletion>,
+    /// Operation ids that already have a queued completion. Kept in sync
+    /// with `completions`; used to compute the in-order prefix and to keep
+    /// `has_pending`/reservation accounting exact.
+    completed: BTreeSet<u64>,
+    /// Submission order of live operations (monotonic by construction).
+    /// Late/out-of-window completions whose id is absent here are dropped
+    /// as stale by `take_completions`.
+    order: VecDeque<u64>,
     tokens: HashMap<u64, CancellationToken>,
+    /// When `true` no further ids can be minted (u64 space exhausted or a
+    /// context id saturated): reservations fail as `QuotaFull` instead of
+    /// reusing an id.
+    ids_exhausted: bool,
     shutdown: bool,
 }
 
@@ -399,49 +440,9 @@ impl IoBridge {
         self.context_id
     }
 
+    #[allow(dead_code)]
     pub(crate) fn executor(&self) -> &Arc<dyn FileIoExecutor> {
         &self.executor
-    }
-
-    /// Bounded drain sweep before `poll_io` reads the queue.
-    ///
-    /// Exits immediately when every outstanding operation already has a
-    /// queued completion or no work is outstanding. Otherwise waits briefly
-    /// (bounded) so that the pre-existing `poll`-free host loops observe
-    /// settlement. Controlled manual executors never complete on their own,
-    /// so the sweep simply expires there and the pending-before-`poll_io`
-    /// contract stays provable.
-    pub(crate) fn drain_completed(&self) {
-        // Skip the wait entirely when there is nothing outstanding.
-        let outstanding = if let Ok(state) = self.state.lock() {
-            state.active
-        } else {
-            return;
-        };
-        if outstanding == 0 {
-            return;
-        }
-        // Fast path: completions for tiny memory reads usually land
-        // quickly; check without sleeping first.
-        if let Ok(state) = self.state.lock() {
-            if state.active == 0 || state.completions.len() >= state.active {
-                return;
-            }
-        } else {
-            return;
-        }
-        for _ in 0..10_000 {
-            // Allowed threading site: the M9-B compatibility yield while
-            // waiting for an already-running worker (std::thread).
-            std::thread::sleep(Duration::from_micros(200));
-            if let Ok(state) = self.state.lock() {
-                if state.active == 0 || state.completions.len() >= state.active {
-                    return;
-                }
-            } else {
-                return;
-            }
-        }
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
@@ -457,7 +458,9 @@ impl IoBridge {
     ///
     /// Returns the operation id plus its cancellation token. Fails without
     /// consuming a slot when the quota is full, the completion queue is
-    /// full, or the runtime is shut down.
+    /// full, ids are exhausted, or the runtime is shut down. Ids are never
+    /// reused: once the u64 space is exhausted every further reservation
+    /// fails as `QuotaFull` (the runtime must be recreated).
     pub(crate) fn reserve(&self) -> Result<(FileIoOperationId, CancellationToken), ReserveError> {
         if self.shutdown.is_shutdown() {
             return Err(ReserveError::Shutdown);
@@ -466,20 +469,38 @@ impl IoBridge {
         if state.shutdown || self.shutdown.is_shutdown() {
             return Err(ReserveError::Shutdown);
         }
+        if state.ids_exhausted {
+            return Err(ReserveError::QuotaFull);
+        }
         if state.active >= self.concurrency_limit {
             return Err(ReserveError::QuotaFull);
         }
-        if state.completions.len() >= self.completion_cap {
+        if state.completed.len() >= self.completion_cap {
             return Err(ReserveError::CompletionFull);
         }
-        let id = self.next_operation.fetch_add(1, Ordering::Relaxed).max(1);
-        if id == u64::MAX {
-            // Practically unreachable (2^64 operations); treat further
-            // reservations as quota exhaustion rather than reusing ids.
+        let raw = self.next_operation.fetch_add(1, Ordering::Relaxed);
+        // `0` and `u64::MAX` are never issued (sentinels): exhaustion
+        // saturates the counter and refuses further ids instead of
+        // wrapping around to a reused value. In particular a `0` (only
+        // reachable via counter corruption/wrap) exhausts rather than
+        // skipping to `1`, which could alias the very first operation.
+        if raw == 0 || raw == u64::MAX {
+            // Exhausted: saturate the counter and refuse further ids
+            // instead of wrapping around to a reused value.
+            self.next_operation.store(u64::MAX, Ordering::Relaxed);
+            state.ids_exhausted = true;
+            return Err(ReserveError::QuotaFull);
+        }
+        let id = raw;
+        // Defensive: the counter is monotonic by construction, so a live
+        // duplicate is unreachable; refuse rather than alias two operations.
+        if state.tokens.contains_key(&id) || state.completed.contains(&id) {
+            state.ids_exhausted = true;
             return Err(ReserveError::QuotaFull);
         }
         let token = CancellationToken::new();
         state.tokens.insert(id, token.clone());
+        state.order.push_back(id);
         state.active = state.active.saturating_add(1);
         Ok((FileIoOperationId(id), token))
     }
@@ -502,10 +523,19 @@ impl IoBridge {
         }
     }
 
-    /// Releases one reserved slot exactly once (submit failure path).
+    /// Releases one reserved slot exactly once.
+    ///
+    /// Used by the submit-failure path and by `take_completions` cleanup.
+    /// Removes the operation from the submission order as well, so a stale
+    /// late completion can never match a future operation.
     pub(crate) fn unreserve(&self, operation_id: FileIoOperationId) {
         if let Ok(mut state) = self.state.lock() {
             state.tokens.remove(&operation_id.0);
+            state.completed.remove(&operation_id.0);
+            state.completions.remove(&operation_id.0);
+            if let Some(position) = state.order.iter().position(|id| *id == operation_id.0) {
+                state.order.remove(position);
+            }
             state.active = state.active.saturating_sub(1);
         }
     }
@@ -515,35 +545,99 @@ impl IoBridge {
         self.unreserve(operation_id);
     }
 
+    /// Submits a task through the configured executor with panic containment.
+    ///
+    /// A panicking third-party [`FileIoExecutor::submit`] is contained and
+    /// reported as [`FileIoSubmitError::WorkerLost`] (stable
+    /// `NotReadableError` downstream), exactly like a disconnected worker.
+    /// The `task` is consumed in every outcome: on containment failure there
+    /// is no task left to leak (it is dropped with its reservation released
+    /// by the caller).
+    pub(crate) fn submit_guarded(&self, task: FileIoTask) -> Result<(), FileIoSubmitError> {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.executor.submit(task)));
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Err(FileIoSubmitError::WorkerLost),
+        }
+    }
+
     /// Pushes a worker completion; drops it safely after shutdown.
     ///
     /// By construction (one reserved completion slot per active operation
     /// and `completion_cap >= concurrency_limit`) the queue cannot be full
     /// here; a full queue drops the late result without touching quota
-    /// (quota was already released at shutdown). The wake hook runs after
-    /// the lock is released and never touches Boa.
+    /// (quota was already released at shutdown). Late completions for
+    /// unknown or already-settled operations are dropped as stale. The wake
+    /// hook runs after the lock is released, never touches Boa, and is
+    /// itself panic-contained: a panicking host wake can neither kill the
+    /// worker nor poison the queue (the completion stays queued).
     pub(crate) fn push_completion(&self, completion: FileIoCompletion) {
+        let id = completion.operation_id().0;
         let should_wake = if let Ok(mut state) = self.state.lock() {
             if state.shutdown || self.shutdown.is_shutdown() {
                 return;
             }
-            if state.completions.len() >= self.completion_cap {
+            if !state.tokens.contains_key(&id) {
+                // Unknown or already settled/shut down: stale, drop it.
                 return;
             }
-            state.completions.push_back(completion);
+            if state.completed.contains(&id) {
+                return;
+            }
+            if state.completed.len() >= self.completion_cap {
+                return;
+            }
+            state.completions.insert(id, completion);
+            state.completed.insert(id);
             true
         } else {
             return;
         };
         if should_wake {
-            self.wake.wake(self.context_id);
+            let wake_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.wake.wake(self.context_id);
+            }));
+            let _ = wake_result;
         }
     }
 
-    /// Drains queued completions (Boa thread only, via `poll_io`).
+    /// Drains the longest in-order prefix of queued completions.
+    ///
+    /// Boa thread only, via `poll_io`. Completions are keyed by operation
+    /// id; only the prefix starting at the oldest outstanding operation is
+    /// released, in submission order, so a later-finishing worker can never
+    /// overtake an earlier submission (FIFO settlement). A completion for
+    /// an unknown id (stale or post-shutdown) is dropped without settling.
     pub(crate) fn take_completions(&self) -> Vec<FileIoCompletion> {
         if let Ok(mut state) = self.state.lock() {
-            state.completions.drain(..).collect()
+            let mut out = Vec::new();
+            while let Some(front) = state.order.front().copied() {
+                if !state.completed.contains(&front) {
+                    break;
+                }
+                let _ = state.order.pop_front();
+                if let Some(completion) = state.completions.remove(&front) {
+                    state.completed.remove(&front);
+                    out.push(completion);
+                } else {
+                    state.completed.remove(&front);
+                }
+            }
+            // Opportunistically drop completions that lost their order slot
+            // (e.g. after `unreserve` on a submit failure racing a worker):
+            // they can never become in-order again.
+            let stale: Vec<u64> = state
+                .completions
+                .keys()
+                .copied()
+                .filter(|id| !state.order.contains(id))
+                .collect();
+            for id in stale {
+                state.completions.remove(&id);
+                state.completed.remove(&id);
+            }
+            out
         } else {
             Vec::new()
         }
@@ -552,7 +646,7 @@ impl IoBridge {
     /// Returns `true` while work is outstanding or completions wait.
     pub(crate) fn has_pending(&self) -> bool {
         if let Ok(state) = self.state.lock() {
-            state.active > 0 || !state.completions.is_empty()
+            state.active > 0 || !state.completed.is_empty()
         } else {
             false
         }
@@ -566,7 +660,7 @@ impl IoBridge {
 
     /// Cancels outstanding work, clears the queue, and forbids late
     /// settlement. Idempotent; late workers drop their results. Quota is
-    /// released in bulk exactly once (active reset, tokens cleared).
+    /// released in bulk exactly once (active reset, tokens/order cleared).
     pub(crate) fn shutdown(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.shutdown = true;
@@ -575,6 +669,8 @@ impl IoBridge {
             }
             state.tokens.clear();
             state.completions.clear();
+            state.completed.clear();
+            state.order.clear();
             state.active = 0;
         }
     }
@@ -588,9 +684,9 @@ impl IoBridge {
 /// and exit when the executor is dropped. No thread-per-read, no unbounded
 /// growth, no Boa access from workers.
 ///
-/// Compatibility note: `poll_io` performs a bounded drain sweep before
-/// reading the queue so the pre-existing `poll`-free host loops observe
-/// settlement without an explicit wake; a controlled manual executor still
+/// `poll_io` never waits: it only drains already-queued completions. Hosts
+/// that want prompt settlement wait on the [`FileIoWake`] signal (or their
+/// own event) and then call `poll_io`; a controlled manual executor still
 /// proves that no completion runs before `poll_io`.
 pub struct ThreadedFileIoExecutor {
     inner: Mutex<ExecutorInner>,
@@ -715,5 +811,43 @@ fn worker_loop(rx: Arc<Mutex<std::sync::mpsc::Receiver<FileIoTask>>>) {
         if let Some(task) = task {
             task.execute();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct RejectingExecutor;
+
+    impl FileIoExecutor for RejectingExecutor {
+        fn submit(&self, _task: FileIoTask) -> Result<(), FileIoSubmitError> {
+            Err(FileIoSubmitError::WorkerLost)
+        }
+    }
+
+    #[test]
+    fn operation_id_exhaustion_fails_closed_without_reuse() {
+        let bridge = IoBridge::new(
+            FileApiContextId(7),
+            2,
+            Arc::new(RejectingExecutor),
+            Arc::new(NoopWake),
+            crate::lifecycle::ShutdownFlag::new(),
+        );
+        // Exercise the actual u64 boundary without performing 2^64 reads.
+        bridge.next_operation.store(u64::MAX - 1, Ordering::Relaxed);
+        let reserved = bridge.reserve();
+        assert!(reserved.is_ok(), "last id before sentinel must reserve");
+        let Some((last_id, _)) = reserved.ok() else {
+            return;
+        };
+        assert_eq!(last_id.get(), u64::MAX - 1);
+        bridge.unreserve(last_id);
+
+        assert!(matches!(bridge.reserve(), Err(ReserveError::QuotaFull)));
+        // The counter is saturated: another reservation cannot wrap to 1.
+        assert!(matches!(bridge.reserve(), Err(ReserveError::QuotaFull)));
     }
 }

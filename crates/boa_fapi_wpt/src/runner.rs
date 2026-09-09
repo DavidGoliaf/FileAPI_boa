@@ -10,11 +10,11 @@
 //! exhausted while `async_test`/`promise_test` entries are still pending.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use boa_engine::{Context, Source};
-use boa_fapi::{Clock, FileApiExtension, FileApiHandle};
+use boa_fapi::{Clock, FileApiContextId, FileApiExtension, FileApiHandle, FileIoWake};
 use thiserror::Error;
 
 use crate::harness;
@@ -100,6 +100,45 @@ pub enum RunError {
 #[derive(Debug)]
 struct WptClock {
     millis: i64,
+}
+
+/// Wake adapter for the runner's explicit host loop.
+///
+/// The worker never touches Boa through this type. It merely increments a
+/// generation and wakes the harness thread, which then calls `poll_io` and
+/// `run_jobs`. A generation avoids the lost-wake race between observing a
+/// pending read and waiting on the condition variable.
+#[derive(Debug, Default)]
+struct WptWake {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl WptWake {
+    fn observe(&self) -> u64 {
+        self.generation.lock().map(|value| *value).unwrap_or(0)
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: Duration) {
+        let Ok(generation) = self.generation.lock() else {
+            return;
+        };
+        if *generation != observed || timeout.is_zero() {
+            return;
+        }
+        let _ = self
+            .changed
+            .wait_timeout_while(generation, timeout, |value| *value == observed);
+    }
+}
+
+impl FileIoWake for WptWake {
+    fn wake(&self, _context_id: FileApiContextId) {
+        if let Ok(mut generation) = self.generation.lock() {
+            *generation = generation.wrapping_add(1);
+            self.changed.notify_one();
+        }
+    }
 }
 
 impl Clock for WptClock {
@@ -269,16 +308,18 @@ fn split_trailing_punctuation(value: &str) -> (&str, &str) {
 }
 
 /// Registers the File API extension into a fresh context.
-fn fresh_context() -> Result<(Context, FileApiHandle), RunError> {
+fn fresh_context() -> Result<(Context, FileApiHandle, Arc<WptWake>), RunError> {
     let mut context = Context::default();
+    let wake = Arc::new(WptWake::default());
     let handle = FileApiExtension::builder()
         .clock(Arc::new(WptClock {
             millis: 1_700_000_000_000,
         }))
+        .io_wake(Arc::clone(&wake) as Arc<dyn FileIoWake>)
         .build()
         .register(&mut context)
         .map_err(|_| RunError::Register)?;
-    Ok((context, handle))
+    Ok((context, handle, wake))
 }
 
 /// Reads a JS string evaluation, mapping failure to [`RunError::Readback`].
@@ -312,39 +353,49 @@ fn eval_u64(context: &mut Context, source: &str) -> Result<u64, RunError> {
 /// Executes one manifest file and maps recorded entries to subtest rows.
 ///
 /// The file runs in a fresh `Context`; the prelude installs first, then
-/// the adapted source. `run_jobs()` is pumped up to `max_pump_passes`
-/// passes (or `file_timeout` wall guard): entries recorded by then decide
-/// `PASS`/`FAIL`; still-expected-but-unrecorded async entries decide
-/// `TIMEOUT`. Subtests expected `NOTRUN` are never executed for status:
-/// they are reported `NOTRUN` with the manifest gap reason when the file
-/// itself evaluated cleanly.
+/// the adapted source. Each pump pass drives the documented M9-B host loop
+/// (`FileApiHandle::poll_io` then `Context::run_jobs()`, up to
+/// `max_pump_passes` passes or `file_timeout` wall guard): entries recorded
+/// by then decide `PASS`/`FAIL`; still-expected-but-unrecorded async
+/// entries decide `TIMEOUT`. Subtests expected `NOTRUN` are never executed
+/// for status: they are reported `NOTRUN` with the manifest gap reason when
+/// the file itself evaluated cleanly.
 pub fn run_file(
     file: &ManifestFile,
     source_text: &str,
     options: &RunOptions,
 ) -> Result<FileResult, RunError> {
     let started = Instant::now();
-    let (context, _handle) = &mut fresh_context()?;
+    let (context, handle, wake) = &mut fresh_context()?;
     let context: &mut Context = context;
     context
         .eval(Source::from_bytes(&harness::prelude_source(&file.path)))
         .map_err(|_| RunError::Prelude)?;
     let file_result = context.eval(Source::from_bytes(source_text));
     let file_error = file_result.err().map(|e| format!("{e:?}"));
-    // Bounded pump: explicit job passes, no sleep, wall guard as backstop.
-    // A job error is FAIL for every unsettled row (never a silent TIMEOUT
-    // substitution): the flag below poisons all pending rows of this file.
+    // Bounded pump: the actual host loop is wake -> poll_io -> run_jobs.
+    // `poll_io` is deliberately non-blocking, so an outstanding read waits
+    // on the worker's wake signal rather than consuming a fixed number of
+    // CPU spins before the worker receives a time slice. The wall guard
+    // bounds a lost worker or a source that never returns. A job error is
+    // FAIL for every unsettled row (never a silent TIMEOUT substitution).
     let mut job_failed = false;
     let mut passes = 0;
     while passes < options.max_pump_passes {
         if started.elapsed() > options.file_timeout {
             break;
         }
+        let observed_wake = wake.observe();
+        let _ = handle.poll_io(context);
         if context.run_jobs().is_err() {
             job_failed = true;
             break;
         }
         passes += 1;
+        if handle.has_pending_io() {
+            let remaining = options.file_timeout.saturating_sub(started.elapsed());
+            wake.wait_for_change(observed_wake, remaining);
+        }
     }
     // Read back recorded entries: `pass|name|message` per index.
     // The count is clamped (10 000) and every per-index read is fallible.

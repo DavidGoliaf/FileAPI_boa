@@ -115,15 +115,36 @@ pub trait CloneAdapter: Send + Sync + 'static {
 /// from configuration contents, and never compared by value: the
 /// registration compares only opaque identity tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RegistrationIdentity(u64);
+pub(crate) struct RegistrationIdentity(pub(crate) u64);
 
 impl RegistrationIdentity {
     /// Mints a fresh identity token.
+    ///
+    /// CAS-guarded and saturating: issues `1..u64::MAX-1` exactly once
+    /// each and never wraps. On u64 exhaustion (practically unreachable:
+    /// 2^64 built extensions) returns the `u64::MAX` sentinel instead of
+    /// `0` or a reused live value; `register` rejects the sentinel with
+    /// `IoIdsExhausted` before any mutation, so exhausted identities can
+    /// never alias two contexts.
     fn fresh() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let token = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
-        Self(token)
+        loop {
+            let candidate = NEXT.load(Ordering::Relaxed);
+            if candidate == 0 || candidate == u64::MAX {
+                NEXT.store(u64::MAX, Ordering::Relaxed);
+                return Self(u64::MAX);
+            }
+            match NEXT.compare_exchange_weak(
+                candidate,
+                candidate.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(candidate),
+                Err(_) => continue,
+            }
+        }
     }
 }
 
@@ -627,6 +648,11 @@ impl FileApiExtension {
     /// is rejected. Different contexts stay independent (per-context
     /// `RegisteredSpecs`).
     pub fn register(&self, context: &mut Context) -> Result<FileApiHandle, RegisterError> {
+        // Exhausted identity tokens (u64 wraparound guard) never alias two
+        // contexts: fail before any `globalThis` mutation.
+        if self.config.identity == RegistrationIdentity(u64::MAX) {
+            return Err(RegisterError::IoIdsExhausted);
+        }
         // Identity-aware re-registration: the stored identity decides.
         if let Some(existing) = context.get_data::<RegisteredSpecs>() {
             if existing.identity == self.config.identity {
@@ -826,8 +852,11 @@ impl FileApiExtension {
         // and forbids late settlement. The bridge handle is shared (not
         // duplicated) between the stored specs and the returned handle, so
         // `poll_io` on the handle observes the same queue the workers push
-        // into.
-        let context_id = crate::io::FileApiContextId::fresh();
+        // into. Context ids are never reused: id-space exhaustion (u64)
+        // fails registration instead of aliasing two contexts.
+        let Some(context_id) = crate::io::FileApiContextId::fresh() else {
+            return Err(RegisterError::IoIdsExhausted);
+        };
         let executor: Arc<dyn crate::io::FileIoExecutor> = self
             .config
             .io_executor
@@ -1218,6 +1247,40 @@ impl FileApiHandle {
     pub fn blob_url_count(&self) -> usize {
         self.specs.url_store.len()
     }
+
+    /// Creates a brand-valid `Blob` object over a host-owned immutable
+    /// [`BlobData`] payload.
+    ///
+    /// The object is indistinguishable from any other `Blob` for brand
+    /// checks and promise reads; it exists so integration tests can drive
+    /// the real `Blob.prototype.text()/arrayBuffer()/bytes()` path with a
+    /// controlled host source (blocking, panicking, filesystem-backed)
+    /// without copying the payload through memory first. The payload stays
+    /// private to the host; JavaScript receives an ordinary `Blob` only.
+    pub fn blob_from_data(
+        &self,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    ) -> boa_engine::JsObject {
+        blob::create_instance(BlobNative::new(data), self.specs.blob_proto().clone())
+    }
+
+    /// Creates a brand-valid `File` object over a host-owned immutable
+    /// [`BlobData`] payload.
+    ///
+    /// Same purpose as [`Self::blob_from_data`]: imports a pre-built
+    /// host payload without exposing its source implementation to JS.
+    /// `name` is a display name (`/` becomes `:`); `last_modified`
+    /// defaults to the injected clock.
+    pub fn file_from_data(
+        &self,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+        name: &str,
+        last_modified: Option<i64>,
+    ) -> boa_engine::JsObject {
+        let native =
+            file::native_from_data(data, name, last_modified, self.specs.config.clock.as_ref());
+        boa_engine::JsObject::from_proto_and_data(self.specs.file_proto().clone(), native)
+    }
 }
 
 impl FileApiHandle {
@@ -1445,18 +1508,10 @@ impl FileApiHandle {
             return Err(PollIoError::ForeignContext);
         }
         let bridge = stored.io_bridge();
-        // Compatibility sweep: waits briefly (bounded) for already-running
-        // workers. Controlled manual executors never complete on their own,
-        // so the sweep expires there and the pending-before-`poll_io`
-        // contract stays provable. Takes whatever landed (possibly nothing
-        // on a slow worker): the host loop repeats `poll_io` after the next
-        // wake.
-        //
-        // NOTE: M9-B host loop is `poll_io` + `run_jobs()`. Tests that call
-        // only `run_jobs()` must additionally call `poll_io` first; the
-        // sweep here keeps those pre-existing tests green without changing
-        // the contract.
-        bridge.drain_completed();
+        // Non-blocking by contract: `poll_io` only turns already-queued
+        // DTOs into Boa jobs. Slow workers stay invisible until their
+        // completion lands; the host loop repeats `poll_io` after the next
+        // wake (or its own event) until quiescent.
         let completions = bridge.take_completions();
         let mut settled = 0_usize;
         for completion in completions {

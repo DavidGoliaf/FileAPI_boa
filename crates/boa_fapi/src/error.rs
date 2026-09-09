@@ -43,6 +43,13 @@ pub enum RegisterError {
     /// and no clone globals are installed.
     #[error("the structured-clone bridge `{0}` speaks an incompatible version")]
     CloneBridgeIncompatible(String),
+    /// The process-wide context/identity id space is exhausted.
+    ///
+    /// Returned before any `globalThis` mutation when no fresh opaque
+    /// context id can be minted (u64 wraparound guard): ids are never
+    /// reused, so registration fails instead of aliasing two contexts.
+    #[error("the File API context id space is exhausted")]
+    IoIdsExhausted,
     /// A Boa engine error occurred while building or installing the classes.
     #[error(transparent)]
     Js(#[from] JsError),

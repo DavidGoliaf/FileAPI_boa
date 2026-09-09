@@ -9,8 +9,14 @@
 //! `M9B-IO-03` (promise returns before filesystem I/O, settle only through
 //! a Boa job), `M9B-IO-04` (cancel/shutdown/stale/quota exact-once),
 //! `M9B-HOST-01` (host `poll_io`/`run_jobs` loop).
+//!
+//! `blob_from_data`/`file_from_data` wrap arbitrary host `BlobData` in
+//! brand-valid JS objects so the tests
+//! drive the real `Blob.prototype.*` path with controlled host sources
+//! (blocking, panicking, filesystem-backed) instead of memory copies.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg(feature = "fs")]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -144,6 +150,17 @@ impl FileIoWake for CountingWake {
 struct BlockingSource {
     len: u64,
     gate: Arc<(Mutex<bool>, Condvar)>,
+    fill: u8,
+}
+
+impl BlockingSource {
+    fn with_byte(len: u64, gate: &Arc<(Mutex<bool>, Condvar)>, fill: u8) -> Self {
+        Self {
+            len,
+            gate: Arc::clone(gate),
+            fill,
+        }
+    }
 }
 
 impl boa_fapi_core::source::ByteSource for BlockingSource {
@@ -182,7 +199,7 @@ impl boa_fapi_core::source::ByteSource for BlockingSource {
         drop(open);
         let len =
             usize::try_from(range.end - range.start).map_err(|_| FileApiError::InvalidRange)?;
-        Ok(bytes::Bytes::from(vec![7_u8; len]))
+        Ok(bytes::Bytes::from(vec![self.fill; len]))
     }
 }
 
@@ -190,34 +207,24 @@ fn blocking_blob(
     len: u64,
     gate: &Arc<(Mutex<bool>, Condvar)>,
 ) -> Arc<boa_fapi_core::blob::BlobData> {
-    let source: Arc<dyn boa_fapi_core::source::ByteSource> = Arc::new(BlockingSource {
-        len,
-        gate: Arc::clone(gate),
-    });
+    blocking_blob_with_byte(len, gate, 7)
+}
+
+/// Blocking blob variant with a configurable fill byte, so File/Blob and
+/// parity tests can distinguish payloads without a second source type.
+fn blocking_blob_with_byte(
+    len: u64,
+    gate: &Arc<(Mutex<bool>, Condvar)>,
+    fill: u8,
+) -> Arc<boa_fapi_core::blob::BlobData> {
+    let source: Arc<dyn boa_fapi_core::source::ByteSource> =
+        Arc::new(BlockingSource::with_byte(len, gate, fill));
     Arc::new(
         boa_fapi_core::blob::BlobData::from_segments(
             vec![boa_fapi_core::blob::BlobSegment {
                 source,
                 offset: 0,
                 len,
-            }],
-            "",
-            &boa_fapi_core::limits::FileApiLimits::default(),
-        )
-        .expect("valid segments"),
-    )
-}
-
-fn memory_blob(bytes: &[u8]) -> Arc<boa_fapi_core::blob::BlobData> {
-    use boa_fapi_core::source::memory::MemorySource;
-    let source: Arc<dyn boa_fapi_core::source::ByteSource> =
-        Arc::new(MemorySource::new(bytes::Bytes::copy_from_slice(bytes)));
-    Arc::new(
-        boa_fapi_core::blob::BlobData::from_segments(
-            vec![boa_fapi_core::blob::BlobSegment {
-                source,
-                offset: 0,
-                len: bytes.len() as u64,
             }],
             "",
             &boa_fapi_core::limits::FileApiLimits::default(),
@@ -296,35 +303,48 @@ fn assert_eval(context: &mut Context, source: &str) {
 }
 
 /// Drives the documented host loop until quiescent (bounded).
+///
+/// `poll_io` is strictly non-blocking: with the default threaded executor
+/// a completion may land just after a pass observed an empty queue, so the
+/// loop also yields briefly (bounded, hang-guard only) while I/O is still
+/// outstanding before giving up on a pass. Controlled manual executors
+/// never complete on their own, so the yield never masks the
+/// pending-before-`poll_io` contract there.
 fn drive(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
-    for _ in 0..64 {
+    for _ in 0..200 {
         let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs");
         if settled == 0 && !handle.has_pending_io() {
             break;
         }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
     }
 }
 
-/// Publishes a host blob object as a JS global.
+/// Publishes a brand-valid `Blob` object over an arbitrary host payload.
+///
+/// Uses the test-only `blob_from_data` constructor: no copy, no
+/// materialization, so blocking/panicking/filesystem sources reach the
+/// real `Blob.prototype.*` path intact.
 fn publish_blob(
     handle: &boa_fapi::FileApiHandle,
     context: &mut Context,
     name: &str,
     data: &Arc<boa_fapi_core::blob::BlobData>,
 ) {
-    use boa_engine::object::JsObject;
-    // Host-side construction goes through the public handle API; the blob
-    // bytes below use the memory helper so the object is brand-valid.
-    let bytes = data
-        .materialize(
-            &boa_fapi_core::limits::FileApiLimits::default(),
-            &boa_fapi_core::cancellation::CancellationToken::new(),
-        )
-        .unwrap_or_default();
-    let object: JsObject = handle
-        .blob_from_bytes(bytes, "", context)
-        .expect("host blob");
+    let object = handle.blob_from_data(Arc::clone(data));
     context
         .register_global_property(
             js_string!(name),
@@ -332,6 +352,55 @@ fn publish_blob(
             boa_engine::property::Attribute::all(),
         )
         .expect("publish");
+}
+
+/// Publishes a brand-valid `File` object over an arbitrary host payload.
+fn publish_file(
+    handle: &boa_fapi::FileApiHandle,
+    context: &mut Context,
+    name: &str,
+    data: &Arc<boa_fapi_core::blob::BlobData>,
+    file_name: &str,
+) {
+    let object = handle.file_from_data(Arc::clone(data), file_name, None);
+    context
+        .register_global_property(
+            js_string!(name),
+            object,
+            boa_engine::property::Attribute::all(),
+        )
+        .expect("publish");
+}
+
+/// Publishes a brand-valid `FileList` of the named globals.
+fn publish_file_list(
+    context: &mut Context,
+    handle: &boa_fapi::FileApiHandle,
+    name: &str,
+    files: &[&str],
+) {
+    use boa_engine::property::PropertyKey;
+    let mut objects = Vec::new();
+    for file_name in files {
+        let value = context
+            .eval(Source::from_bytes(*file_name))
+            .unwrap_or_else(|error| panic!("eval failed for {file_name}: {error}"));
+        objects.push(
+            value
+                .as_object()
+                .unwrap_or_else(|| panic!("{file_name} is not an object"))
+                .clone(),
+        );
+    }
+    let list = handle.file_list(objects, context).expect("file list");
+    context
+        .register_global_property(
+            js_string!(name),
+            list,
+            boa_engine::property::Attribute::all(),
+        )
+        .expect("publish");
+    let _ = PropertyKey::from(0_u32);
 }
 
 // ── M9B-IO-01: Send-only task and completion DTO ──
@@ -395,11 +464,66 @@ fn pending_promise_before_blocking_io_boa_thread_stays_usable() {
     assert!(!handle.has_pending_io());
 }
 
+// ── M9B-IO-03: File and FileList reads follow the same off-thread path ──
+
+#[test]
+fn file_and_file_list_reads_use_off_thread_path() {
+    // `File` inherits `Blob.prototype.*`: publish brand-valid File objects
+    // over controllable blocking payloads and prove each read submits one
+    // held task, stays pending through `run_jobs` alone, and settles only
+    // through `poll_io` + `run_jobs`.
+    let (mut context, handle, executor, _) = setup_manual();
+    let gate: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+    publish_file(
+        &handle,
+        &mut context,
+        "fileA",
+        &blocking_blob_with_byte(5, &gate, b'A'),
+        "a.txt",
+    );
+    publish_file(
+        &handle,
+        &mut context,
+        "fileB",
+        &blocking_blob_with_byte(6, &gate, b'B'),
+        "b.txt",
+    );
+    publish_file_list(&mut context, &handle, "files", &["fileA", "fileB"]);
+    assert_eval(
+        &mut context,
+        "globalThis.results = []; \
+         fileA.text().then(v => globalThis.results.push('fileA:' + v)); \
+         files.item(1).arrayBuffer().then(b => globalThis.results.push('fileB:' + b.byteLength)); \
+         (globalThis.results.length === 0);",
+    );
+    assert_eq!(executor.pending(), 2);
+    for _ in 0..2 {
+        context.run_jobs().expect("run_jobs");
+    }
+    assert_eq!(eval_str(&mut context, "globalThis.results.join(',')"), "");
+    // Open the gate and run both tasks on the test worker stand-in.
+    {
+        let (lock, gate) = &*gate;
+        *lock.lock().expect("gate") = true;
+        gate.notify_all();
+    }
+    executor.run_all();
+    // Still nothing settled before `poll_io`.
+    assert_eq!(eval_str(&mut context, "globalThis.results.join(',')"), "");
+    drive(&mut context, &handle);
+    assert_eq!(
+        eval_str(&mut context, "globalThis.results.join(',')"),
+        "fileA:AAAAA,fileB:6"
+    );
+    assert!(!handle.has_pending_io());
+}
+
 // ── Guard: no Boa-job filesystem materialize fallback ──
 //
 // The `BlockingSource` above is the behavioural oracle behind this guard:
-// the test submits a read whose worker task would block on the gate, then
-// observes that `run_jobs` alone never settles the promise. If any Boa job
+// the JS object published below carries the blocking payload itself (via
+// the test-only `blob_from_data` wrapper — no copy, no materialization),
+// so the held worker task really blocks on the gate. If any Boa job
 // performed the blocking read synchronously, the barrier would hang the
 // Boa thread (or the promise would settle without `poll_io`).
 
@@ -407,21 +531,13 @@ fn pending_promise_before_blocking_io_boa_thread_stays_usable() {
 fn blocking_source_never_runs_inside_boa_job() {
     use std::sync::mpsc;
     let (mut context, handle, executor, wake) = setup_manual();
-    // Submit a read backed by the blocking host source through the manual
-    // executor: take the held task, run it on a worker thread behind the
-    // closed gate, and prove the Boa thread stays usable meanwhile.
+    // Publish a brand-valid Blob whose payload IS the blocking host
+    // source. The `text()` call below submits a task that blocks on the
+    // gate when executed; the manual executor holds it until released.
     let gate: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
     let gate_worker = Arc::clone(&gate);
     let data = blocking_blob(11, &gate);
-    // Publish the blocking blob through a host object so the JS read below
-    // exercises the real `Blob.prototype.arrayBuffer()` path with a
-    // blocking source underneath. `publish_blob` materializes (which would
-    // block on the closed gate), so publish the memory twin first and swap
-    // the verification to the worker task below: the JS object stays the
-    // guard entry point while the held task carries the blocking payload.
-    let memory_twin = memory_blob(b"guard-bytes");
-    publish_blob(&handle, &mut context, "guardBlob", &memory_twin);
-    let _ = &data;
+    publish_blob(&handle, &mut context, "guardBlob", &data);
     let (started_tx, started_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     // Drive the public read path; the manual executor holds the task.
@@ -434,7 +550,8 @@ fn blocking_source_never_runs_inside_boa_job() {
          true",
     );
     assert_eq!(executor.pending(), 1);
-    // Move the held task to a worker thread that blocks on the gate.
+    // Move the held task to a worker thread that blocks on the gate: this
+    // is the REAL task (blocking payload included), not a substitute.
     let held = executor.take_all();
     assert_eq!(held.len(), 1);
     let task = held.into_iter().next().expect("held task");
@@ -445,13 +562,10 @@ fn blocking_source_never_runs_inside_boa_job() {
             // Wait for the test's release before executing the blocking
             // read, so the Boa thread is provably usable while blocked.
             release_rx.recv().expect("release");
-            // Execute the blocking payload directly (same `materialize`
-            // the worker would run), then complete the held operation with
-            // the exact bytes. This keeps the gate semantics while the
-            // held task proves the pending contract.
-            let (lock, _gate) = &*gate_worker;
-            let _guard = lock.lock().expect("gate");
-            task.complete_ok(bytes::Bytes::copy_from_slice(&[7_u8; 11]));
+            // Execute the REAL held task: its `materialize` blocks on the
+            // gate until the test opens it below.
+            task.execute();
+            drop(gate_worker);
         });
         started_rx
             .recv_timeout(Duration::from_secs(10))
@@ -473,9 +587,8 @@ fn blocking_source_never_runs_inside_boa_job() {
         assert_eq!(eval_str(&mut context, "globalThis.guardVerdict"), "pending");
         // Open the gate and let the worker finish, then settle through the
         // documented loop. The 11-byte blocking payload packages exactly.
-        // The worker already holds the exact bytes; the gate open is the
-        // behavioural release (no Boa job ever blocked on it).
-        assert!(wake_count_before == wake.count() || wake.count() >= wake_count_before);
+        // `wake` must have fired exactly once for this completion (the
+        // worker pushed one DTO, then signalled the host loop).
         {
             let (lock, gate) = &*gate;
             *lock.lock().expect("gate") = true;
@@ -483,6 +596,11 @@ fn blocking_source_never_runs_inside_boa_job() {
         }
         release_tx.send(()).expect("release worker");
     });
+    assert_eq!(
+        wake.count(),
+        wake_count_before + 1,
+        "exactly one wake per completion"
+    );
     drive(&mut context, &handle);
     assert_eval(&mut context, "globalThis.guardVerdict === 'fulfilled:11'");
 }
@@ -663,33 +781,74 @@ fn sixty_five_concurrent_reads_obey_limit_and_recover() {
 
 #[test]
 fn mutation_snapshot_error_carries_no_partial_bytes() {
-    use boa_fapi_core::file_api_error::FileApiError;
-    let (mut context, handle, executor, _) = setup_manual();
-    // A worker-side snapshot error settles as NotReadableError with no
-    // partial bytes: complete the held task with the typed error.
-    assert_eval(
-        &mut context,
-        "globalThis.m = 'pending'; \
-         new Blob(['mutation']).text().then(
-           v => { globalThis.m = 'fulfilled:' + v; },
-           e => { globalThis.m = (e instanceof DOMException) + ':' + e.name; }); \
-         true",
-    );
-    assert_eq!(executor.pending(), 1);
-    let tasks = executor.take_all();
-    assert_eq!(tasks.len(), 1);
-    tasks
-        .into_iter()
-        .next()
-        .expect("task")
-        .complete_err(FileApiError::SnapshotChanged);
-    assert_eq!(eval_str(&mut context, "globalThis.m"), "pending");
-    drive(&mut context, &handle);
-    assert_eq!(
-        eval_str(&mut context, "globalThis.m"),
-        "true:NotReadableError"
-    );
-    assert!(!handle.has_pending_io());
+    // Gated live-filesystem oracle (unix only): import a live temp file,
+    // mutate it after import, then read through the real promise path.
+    // The worker's snapshot check fails with no partial bytes.
+    //
+    // On weak platforms (no strong open-handle identity) live imports are
+    // refused by enforced policy, so this oracle cannot run there: the
+    // copy-fallback semantics are covered by `m5_file_fs` instead.
+    #[cfg(unix)]
+    {
+        use boa_fapi_fs::{FsRegistry, HostFileSource};
+        let (mut context, handle, executor, _) = setup_manual();
+        let dir = std::env::temp_dir().join(format!(
+            "boa-fapi-m9b-mutation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("mutation.bin");
+        std::fs::write(&path, b"stable-payload").expect("write temp file");
+        let registry = FsRegistry::new();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open temp file");
+        let resource = registry.register(file).expect("register");
+        let adapter = Arc::new(HostFileSource::new(&registry, &resource, None).expect("adapter"));
+        let object = handle
+            .file_from_resource(
+                &registry,
+                adapter,
+                "mutation.bin",
+                boa_fapi::HostFileOptions::default(),
+                &mut context,
+            )
+            .expect("import");
+        context
+            .register_global_property(
+                js_string!("mutFile"),
+                object,
+                boa_engine::property::Attribute::all(),
+            )
+            .expect("publish");
+        // Mutate after import so the worker observes a changed snapshot.
+        std::fs::write(&path, b"CHANGED-payload!!").expect("mutate temp file");
+        assert_eval(
+            &mut context,
+            "globalThis.m = 'pending'; \
+             mutFile.text().then(
+               v => { globalThis.m = 'fulfilled:' + v; },
+               e => { globalThis.m = (e instanceof DOMException) + ':' + e.name; }); \
+             true",
+        );
+        assert_eq!(executor.pending(), 1);
+        executor.run_all();
+        // Still pending before `poll_io`: no JS ran on the worker path.
+        assert_eq!(eval_str(&mut context, "globalThis.m"), "pending");
+        drive(&mut context, &handle);
+        assert_eq!(
+            eval_str(&mut context, "globalThis.m"),
+            "true:NotReadableError"
+        );
+        assert!(!handle.has_pending_io());
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
 }
 
 #[test]
@@ -710,44 +869,137 @@ fn worker_panic_settles_stable_not_readable_error() {
             panic!("host source misbehaved");
         }
     }
-    // The guarded worker entry contains the panic: submit a memory read
-    // through the public path (reserves quota), then execute a panic-source
-    // task built for the same operation shape directly. The completion is
-    // the stable read failure, and no panic escapes the worker.
+    fn panic_blob() -> Arc<boa_fapi_core::blob::BlobData> {
+        let source: Arc<dyn boa_fapi_core::source::ByteSource> = Arc::new(PanicSource);
+        Arc::new(
+            boa_fapi_core::blob::BlobData::from_segments(
+                vec![boa_fapi_core::blob::BlobSegment {
+                    source,
+                    offset: 0,
+                    len: 3,
+                }],
+                "",
+                &boa_fapi_core::limits::FileApiLimits::default(),
+            )
+            .expect("valid segments"),
+        )
+    }
+    // The guarded worker entry contains the source panic: the JS object
+    // published below carries the panicking payload itself (test-only
+    // `blob_from_data`, no copy), and the held task is executed for real.
+    // The completion is the stable `NotReadableError`, and no panic
+    // escapes the worker.
     let (mut context, handle, executor, _) = setup_manual();
-    let _ = memory_blob(b"unused");
+    publish_blob(&handle, &mut context, "panicBlob", &panic_blob());
     assert_eval(
         &mut context,
         "globalThis.p = 'pending'; \
-         new Blob(['abc']).text().then(
+         panicBlob.text().then(
            () => { globalThis.p = 'fulfilled'; },
            e => { globalThis.p = (e instanceof DOMException) + ':' + e.name; }); \
          true",
     );
     assert_eq!(executor.pending(), 1);
-    // Execute the held task: it materializes memory bytes (no panic here);
-    // the panic containment itself is proven by driving a panic source
-    // through `FileIoTask::execute` semantics without a thread below.
+    executor.run_all();
+    // Still pending before `poll_io`: containment happened on the worker,
+    // settlement happens only through a Boa job.
+    assert_eq!(eval_str(&mut context, "globalThis.p"), "pending");
+    drive(&mut context, &handle);
+    assert_eq!(
+        eval_str(&mut context, "globalThis.p"),
+        "true:NotReadableError"
+    );
+    assert!(!handle.has_pending_io());
+}
+
+#[test]
+fn panicking_submit_settles_stable_not_readable_error() {
+    struct PanickingExecutor;
+    impl FileIoExecutor for PanickingExecutor {
+        fn submit(&self, _task: FileIoTask) -> Result<(), FileIoSubmitError> {
+            panic!("third-party executor misbehaved");
+        }
+    }
+    // A panicking third-party `submit` is contained by `submit_guarded`
+    // and surfaces as the stable `NotReadableError` (WorkerLost mapping),
+    // with the reservation released exactly once.
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .io_executor(Arc::new(PanickingExecutor) as Arc<dyn FileIoExecutor>)
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
+    assert_eval(
+        &mut context,
+        "globalThis.q = 'pending'; \
+         new Blob(['q']).text().then(
+           () => { globalThis.q = 'fulfilled'; },
+           e => { globalThis.q = (e instanceof DOMException) + ':' + e.name; }); \
+         true",
+    );
+    context.run_jobs().expect("run_jobs");
+    assert_eq!(
+        eval_str(&mut context, "globalThis.q"),
+        "true:NotReadableError"
+    );
+    assert!(!handle.has_pending_io());
+    // Capacity is intact: the failed submit released its reservation, so a
+    // second read through a healthy executor path still works.
+    drop(handle);
+    let (mut context, handle, executor, _) = setup_manual();
+    assert_eval(
+        &mut context,
+        "globalThis.r = 'pending'; \
+         new Blob(['recovered']).text().then(v => { globalThis.r = v; }); \
+         true",
+    );
+    assert_eq!(executor.pending(), 1);
     executor.run_all();
     drive(&mut context, &handle);
-    // Either success (memory task) is fine here; the containment proof is
-    // that no panic escapes the worker: the suite would abort otherwise.
-    let verdict = eval_str(&mut context, "globalThis.p");
-    assert!(
-        verdict == "fulfilled" || verdict == "true:NotReadableError",
-        "unexpected verdict: {verdict}"
+    assert_eq!(eval_str(&mut context, "globalThis.r"), "recovered");
+}
+
+#[test]
+fn panicking_wake_keeps_completion_queued() {
+    struct PanickingWake;
+    impl FileIoWake for PanickingWake {
+        fn wake(&self, _context_id: FileApiContextId) {
+            panic!("third-party wake misbehaved");
+        }
+    }
+    // A panicking host wake is contained inside `push_completion`: the
+    // worker survives and the completion stays queued for `poll_io`.
+    let executor = ManualExecutor::new();
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .io_executor(Arc::clone(&executor) as Arc<dyn FileIoExecutor>)
+        .io_wake(Arc::new(PanickingWake) as Arc<dyn FileIoWake>)
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
+    assert_eval(
+        &mut context,
+        "globalThis.v = 'pending'; \
+         new Blob(['wake-ok']).text().then(v => { globalThis.v = v; }); \
+         true",
     );
-    // Direct containment proof: a panic-source task executed on this thread
-    // settles as the stable error instead of unwinding.
-    let source: Arc<dyn boa_fapi_core::source::ByteSource> = Arc::new(PanicSource);
-    let _ = source;
+    assert_eq!(executor.pending(), 1);
+    // Would unwind the worker without containment; with it, the completion
+    // lands and the wake panic is swallowed.
+    executor.run_all();
+    assert!(handle.has_pending_io());
+    drive(&mut context, &handle);
+    assert_eq!(eval_str(&mut context, "globalThis.v"), "wake-ok");
+    assert!(!handle.has_pending_io());
 }
 
 #[test]
 fn memory_and_filesystem_results_match_byte_for_byte() {
     let (mut context, handle, executor, _) = setup_manual();
     let expected = b"byte-exact-payload-0123456789";
-    // Memory path.
+    // Memory path through the real worker task.
     assert_eval(
         &mut context,
         "globalThis.mem = null; \
@@ -757,25 +1009,73 @@ fn memory_and_filesystem_results_match_byte_for_byte() {
     executor.run_all();
     drive(&mut context, &handle);
     let mem = eval_str(&mut context, "globalThis.mem");
-    // Filesystem-shaped path: the same bytes through a held manual task
-    // completed by the test worker stand-in.
+    // Real filesystem-backed path: live temp file imported as a File,
+    // read through the real worker task (no `complete_ok` substitute).
+    let dir = std::env::temp_dir().join(format!(
+        "boa-fapi-m9b-parity-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("parity.bin");
+    std::fs::write(&path, expected).expect("write temp file");
+    let registry = boa_fapi_fs::FsRegistry::new();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("open temp file");
+    let resource = registry.register(file).expect("register");
+    let object = {
+        #[cfg(unix)]
+        {
+            let adapter = Arc::new(
+                boa_fapi_fs::HostFileSource::new(&registry, &resource, None).expect("adapter"),
+            );
+            handle
+                .file_from_resource(
+                    &registry,
+                    adapter,
+                    "parity.bin",
+                    boa_fapi::HostFileOptions::default(),
+                    &mut context,
+                )
+                .expect("import")
+        }
+        #[cfg(not(unix))]
+        {
+            let bytes =
+                boa_fapi_fs::open_copy_on_import(&registry, &resource, u64::MAX).expect("copy");
+            handle
+                .file_from_bytes(
+                    bytes,
+                    "parity.bin",
+                    boa_fapi::HostFileOptions::default(),
+                    &mut context,
+                )
+                .expect("import")
+        }
+    };
+    context
+        .register_global_property(
+            js_string!("fsFile"),
+            object,
+            boa_engine::property::Attribute::all(),
+        )
+        .expect("publish");
     assert_eval(
         &mut context,
         "globalThis.fs = null; \
-         new Blob(['placeholder']).arrayBuffer().then(b => { globalThis.fs = Array.from(new Uint8Array(b)).join(','); }); \
+         fsFile.arrayBuffer().then(b => { globalThis.fs = Array.from(new Uint8Array(b)).join(','); }); \
          true",
     );
     assert_eq!(executor.pending(), 1);
-    let tasks = executor.take_all();
-    assert_eq!(tasks.len(), 1);
-    tasks
-        .into_iter()
-        .next()
-        .expect("task")
-        .complete_ok(bytes::Bytes::copy_from_slice(expected));
+    executor.run_all();
     drive(&mut context, &handle);
     let fs = eval_str(&mut context, "globalThis.fs");
-    // The filesystem-shaped completion packages identically: byte-exact.
+    // Both paths package identically: byte-exact.
     let expected_joined = expected
         .iter()
         .map(|b| b.to_string())
@@ -783,6 +1083,132 @@ fn memory_and_filesystem_results_match_byte_for_byte() {
         .join(",");
     assert_eq!(fs, expected_joined);
     assert_eq!(mem, expected_joined);
+    assert!(!handle.has_pending_io());
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_dir(&dir).ok();
+}
+
+// ── M9B-IO-04: cancellation exact-once via task.cancel() ──
+
+#[test]
+fn cancelled_task_settles_abort_and_frees_quota_once() {
+    // `FileIoTask::cancel()` flips the cooperative token the worker
+    // observes: the completion is `Cancelled` → `AbortError`, and the slot
+    // is released exactly once (a follow-up read reserves cleanly).
+    let (mut context, handle, executor, _) = setup_manual();
+    assert_eval(
+        &mut context,
+        "globalThis.c = 'pending'; \
+         new Blob(['cancel-me']).text().then(
+           () => { globalThis.c = 'fulfilled'; },
+           e => { globalThis.c = (e instanceof DOMException) + ':' + e.name; }); \
+         true",
+    );
+    assert_eq!(executor.pending(), 1);
+    let tasks = executor.take_all();
+    assert_eq!(tasks.len(), 1);
+    let task = tasks.into_iter().next().expect("task");
+    task.cancel();
+    task.execute();
+    // Still pending before `poll_io`: cancellation settled on the worker,
+    // JS runs only after the host loop.
+    assert_eq!(eval_str(&mut context, "globalThis.c"), "pending");
+    drive(&mut context, &handle);
+    assert_eq!(eval_str(&mut context, "globalThis.c"), "true:AbortError");
+    assert!(!handle.has_pending_io());
+    // Quota released exactly once: a new read reserves and settles.
+    assert_eval(
+        &mut context,
+        "globalThis.c2 = 'pending'; \
+         new Blob(['after-cancel']).text().then(v => { globalThis.c2 = v; }); \
+         true",
+    );
+    assert_eq!(executor.pending(), 1);
+    executor.run_all();
+    drive(&mut context, &handle);
+    assert_eq!(eval_str(&mut context, "globalThis.c2"), "after-cancel");
+    assert!(!handle.has_pending_io());
+}
+
+// ── M9B-IO-02 (FIFO): out-of-order worker completion settles in order ──
+
+#[test]
+fn out_of_order_completions_settle_fifo() {
+    // Two reads submitted a-then-b; the worker for b finishes first. The
+    // bridge releases only the in-order prefix, so JS observes
+    // `a:first,b:second` (the accepted M3 FIFO contract), never
+    // `b:second,a:first`.
+    let (mut context, handle, executor, _) = setup_manual();
+    assert_eval(
+        &mut context,
+        "globalThis.log = []; \
+         var a = new Blob(['first']).text(); \
+         var b = new Blob(['second']).text(); \
+         a.then(v => globalThis.log.push('a:' + v)); \
+         b.then(v => globalThis.log.push('b:' + v)); \
+         (globalThis.log.length === 0);",
+    );
+    assert_eq!(executor.pending(), 2);
+    let mut tasks = executor.take_all();
+    assert_eq!(tasks.len(), 2);
+    let second = tasks.pop().expect("second task");
+    let first = tasks.pop().expect("first task");
+    // Complete b first (out of order), then a.
+    second.execute();
+    // b's completion is queued but NOT released: a is still outstanding.
+    let settled = handle.poll_io(&mut context).expect("poll_io");
+    assert_eq!(settled, 0);
+    context.run_jobs().expect("run_jobs");
+    assert_eq!(eval_str(&mut context, "globalThis.log.join(',')"), "");
+    // Now complete a: both release in submission order.
+    first.execute();
+    drive(&mut context, &handle);
+    assert_eq!(
+        eval_str(&mut context, "globalThis.log.join(',')"),
+        "a:first,b:second"
+    );
+    assert!(!handle.has_pending_io());
+}
+
+// ── M9B-IO-01 (ids): exhaustion never reuses an id ──
+
+#[test]
+fn operation_id_exhaustion_fails_without_reuse() {
+    // Integration-level invariant: settled public reads receive strictly
+    // increasing, never-reused operation ids. The exact `u64::MAX`
+    // boundary is exercised in `io::tests::operation_id_exhaustion_fails_closed_without_reuse`.
+    let limits = boa_fapi_core::limits::FileApiLimits {
+        max_concurrent_reads_per_global: 1,
+        ..Default::default()
+    };
+    let (mut context, handle, executor, _) = setup_manual_with_limits(limits);
+    let mut seen: Vec<u64> = Vec::new();
+    for index in 0..5 {
+        assert_eval(
+            &mut context,
+            &format!(
+                "globalThis.v{index} = 'pending'; \
+                 new Blob(['x']).text().then(v => {{ globalThis.v{index} = v; }}); \
+                 true"
+            ),
+        );
+        assert_eq!(executor.pending(), 1);
+        let tasks = executor.take_all();
+        assert_eq!(tasks.len(), 1);
+        let task = tasks.into_iter().next().expect("task");
+        seen.push(task.operation_id().get());
+        task.execute();
+        drive(&mut context, &handle);
+        assert_eq!(eval_str(&mut context, &format!("globalThis.v{index}")), "x");
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), seen.len(), "operation ids must be unique");
+    assert!(
+        seen.windows(2).all(|pair| pair[0] < pair[1]),
+        "operation ids must be monotonic: {seen:?}"
+    );
     assert!(!handle.has_pending_io());
 }
 
