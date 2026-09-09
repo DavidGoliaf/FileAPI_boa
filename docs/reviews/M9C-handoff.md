@@ -125,8 +125,10 @@ encoding-теста; полный прогон `--test-threads 1` занимае
 `f380abf` составляет 3 842 добавления и 296 удалений: он превышает
 лимит заказа в 3 000 строк. До формального принятия требуется либо
 разделить work order на state/event migration, либо получить явный
-waiver этого лимита. Внешний CI также остаётся pending до публикации
-ветки. `FileReaderSync` не изменён. Исторические M4/M7/M8 validation/
+waiver этого лимита. Waiver получен. Внешний CI для итоговой реализации
+`2082ce29ab0132e196e68f5692cc1c67e832cf8e` зелёный на Ubuntu, macOS и
+Windows: https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34394832867.
+`FileReaderSync` не изменён. Исторические M4/M7/M8 validation/
 handoff не переписаны; обновлены только `docs/spec-matrix.md` (M9C-FR
 строки), `docs/architecture.md` (Layer 2b/2d), `docs/host-integration.md`
 (M9-B/M9-C loop + budget), `crates/boa_fapi/README.md`, `docs/DECISIONS.md`
