@@ -899,3 +899,38 @@ crate не добавляются: они были бы шире текущег�
 Последствия: `Blob.type` по-прежнему нормализуется существующим M1 helper,
 а packaging отдельно валидирует MIME syntax перед charset fallback; Cargo
 граф и `cargo-deny` остаются без новых зависимостей.
+
+## ADR-0042 (M9-B): explicit file I/O executor and completion bridge
+
+Контекст: ТЗ AD-4 требует один JS-поток (Boa объекты только на потоке
+`Context`; I/O отдельно с Rust DTO; материализация в Boa job), а аудит
+A-05 фиксирует расхождение: promise reads материализуют filesystem source
+внутри Boa job. Нужен единственный I/O protocol для M9-C/M9-D без новых
+зависимостей и без `unsafe`/`thread-per-read`.
+
+Решение: `crates/boa_fapi/src/io.rs` (Boa-free по данным, Boa-зависим по
+типам нет — только `std::sync` + core): `FileIoExecutor`/`FileIoWake`
+(`Send + Sync + 'static`, без Boa и без пользовательского JS),
+`FileIoTask`/`FileIoCompletion` (`Send + 'static`, без `JsValue`/
+`JsObject`/`Context`/realm/путей в типах и `Debug`), opaque
+`FileApiContextId`/`FileIoOperationId` (без reuse), per-context `IoBridge`
+(quota `max_concurrent_reads_per_global`, bounded completion queue,
+токены отмены; mutex только для bookkeeping, никогда через I/O/Boa/JS),
+`FileApiHandle::poll_io`/`has_pending_io` (только владелец `Context`,
+чужой отвергается; только DTO → Boa jobs; без пользовательского JS под
+mutex), wake hook только сигнализирует host loop, `shutdown` отменяет
+outstanding work, чистит очередь и запрещает late settlement (quota
+exact-once, late worker безопасно теряет результат).
+`FileApiConfig`/builder получает executor и wake (`io_executor`/
+`io_wake`; default — встроенный `ThreadedFileIoExecutor` 4/128 и
+`NoopWake` с жёсткими границами очереди/workers). `promise_read` хранит
+только Boa-side resolvers в per-context таблице и settles через один Boa
+job после `poll_io`; memory и filesystem идут одним путём.
+Новых зависимостей нет (только `std::thread`/`mpsc`/`sync` — уже часть
+toolchain; отдельный dependency-ADR не нужен); `cargo-deny` не меняется.
+`no_out_of_scope_surface` guard обновлён: `io.rs` — единственное
+разрешённое место `std::thread`.
+
+Последствия: trace rows `M9B-IO-01…04`, `M9B-HOST-01`; M9-C/M9-D
+мигрируют на тот же protocol без special-casing; host loop
+`poll_io`/`run_jobs` задокументирован в `docs/host-integration.md`.

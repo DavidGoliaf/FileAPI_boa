@@ -54,9 +54,18 @@ fn eval_side_effect(context: &mut Context, source: &str) {
 }
 
 /// Drives jobs until quiescent (bounded: FileReader chains settle fast).
-fn drain(context: &mut Context) {
+/// Promise reads additionally need `poll_io` first; the helper drives the
+/// M9-B host loop so both settle.
+fn drain(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
     for _ in 0..16 {
+        let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
     }
 }
 
@@ -64,7 +73,7 @@ fn drain(context: &mut Context) {
 
 #[test]
 fn abort_before_first_chunk_reports_abort_loadend() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     context
         .eval(Source::from_bytes(
             "globalThis.log = []; \
@@ -75,7 +84,7 @@ fn abort_before_first_chunk_reports_abort_loadend() {
              globalThis.r.abort();",
         ))
         .expect("abort");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.r.readyState === 2 && globalThis.r.result === null \
@@ -85,7 +94,7 @@ fn abort_before_first_chunk_reports_abort_loadend() {
 
 #[test]
 fn abort_between_progress_events_suppresses_stale_load() {
-    let (mut context, _handle) = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     context
         .eval(Source::from_bytes(
             "globalThis.log = []; \
@@ -98,7 +107,7 @@ fn abort_between_progress_events_suppresses_stale_load() {
              globalThis.r.readAsText(new Blob([new Uint8Array(64 * 1024).fill(65)]));",
         ))
         .expect("start");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.log.indexOf('load') === -1 && globalThis.r.readyState === 2",
@@ -107,7 +116,7 @@ fn abort_between_progress_events_suppresses_stale_load() {
 
 #[test]
 fn stale_completion_after_new_operation_is_noop() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     context
         .eval(Source::from_bytes(
             "globalThis.log = []; \
@@ -118,7 +127,7 @@ fn stale_completion_after_new_operation_is_noop() {
              globalThis.r.readAsText(new Blob(['second']));",
         ))
         .expect("restart");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.log.join('|') === 'load:second' && globalThis.r.result === 'second'",
@@ -127,7 +136,7 @@ fn stale_completion_after_new_operation_is_noop() {
 
 #[test]
 fn concurrent_read_quota_recovers() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     // 64 readers start LOADING; the 65th fails SecurityError through the
     // normal error path (readyState DONE + error set after jobs); after
     // all settle the freed slots accept new reads.
@@ -139,22 +148,22 @@ fn concurrent_read_quota_recovers() {
            globalThis.readers.push(r); \
          } \
          globalThis.extra = new FileReader(); \
-         globalThis.extra.readAsText(new Blob(['q']));",
+          globalThis.extra.readAsText(new Blob(['q']));",
     );
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.extra.readyState === 2 \
          && globalThis.extra.error instanceof DOMException \
          && globalThis.extra.error.name === 'SecurityError'",
     );
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.readers.every(r => r.readyState === 2) \
          && (function() { var r2 = new FileReader(); r2.readAsText(new Blob(['ok'])); return r2.readyState === 1; })()",
     );
-    drain(&mut context);
+    drain(&mut context, &handle);
 }
 
 // ── URL revoke/resolve + context shutdown ────────────────────────────
@@ -211,7 +220,7 @@ fn context_shutdown_settles_nothing_late() {
          globalThis.r.readAsText(new Blob(['x']));",
     );
     handle.shutdown(&mut context).expect("shutdown");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eval(&mut context, "globalThis.late === 'none'");
     // Late creation is rejected in JS and on the host.
     assert_eval(
@@ -242,13 +251,13 @@ fn slice_and_utf8_boundary_matrix() {
         "new Blob(['\\u00E9\\u20AC\\u{1F600}']).size === (2 + 3 + 4)",
     );
     // BOM: single leading U+FEFF stripped once for readAsText-style decode.
-    let (mut context2, _handle2) = setup();
+    let (mut context2, handle2) = setup();
     eval_side_effect(
         &mut context2,
         "globalThis.bomReader = new FileReader(); \
          globalThis.bomReader.readAsText(new Blob(['\\uFEFFhi']));",
     );
-    drain(&mut context2);
+    drain(&mut context2, &handle2);
     assert_eval(&mut context2, "globalThis.bomReader.result === 'hi'");
 }
 

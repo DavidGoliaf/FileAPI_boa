@@ -1,4 +1,48 @@
-# Host integration (M5 filesystem)
+# Host integration (M5 filesystem, M9-B I/O loop)
+
+## Promise-read I/O loop (M9-B)
+
+`Blob.prototype.text()`, `arrayBuffer()` and `bytes()` return a pending
+`Promise` before any blocking read runs. Filesystem work runs on a
+`FileIoExecutor`; the host turns completions into Boa jobs with
+`poll_io`, then settles them with `run_jobs()`. Repeat both until the
+host and the File API queues are quiescent:
+
+```text
+wait for FileIoWake or other host event
+handle.poll_io(&mut context)
+context.run_jobs()
+repeat until host and File API queues are quiescent
+```
+
+One `Context::run_jobs()` without `poll_io` is not required to wait for
+OS I/O. No automatic integration with an arbitrary Boa `JobQueue` is
+claimed: the host always drives `poll_io` explicitly. Inject the
+executor and the wake hook through the builder:
+
+```rust,no_run
+use std::sync::Arc;
+use boa_engine::Context;
+use boa_fapi::{FileApiExtension, FileIoExecutor, FileIoWake, NoopWake, ThreadedFileIoExecutor};
+
+let executor: Arc<dyn FileIoExecutor> = Arc::new(ThreadedFileIoExecutor::new(4, 128));
+let wake: Arc<dyn FileIoWake> = Arc::new(NoopWake);
+let mut context = Context::default();
+let handle = FileApiExtension::builder()
+    .io_executor(executor)
+    .io_wake(wake)
+    .build()
+    .register(&mut context)
+    .unwrap();
+// ... JS calls text()/arrayBuffer()/bytes() ...
+handle.poll_io(&mut context).unwrap();
+context.run_jobs().unwrap();
+```
+
+The built-in executor is a fixed pool with a bounded queue
+(thread-per-read without a limit is forbidden); `submit` never blocks and
+a full queue surfaces as a typed resource error. `shutdown` cancels
+outstanding work, clears queued completions, and forbids late settlement.
 
 ## Opening and authorizing a resource
 

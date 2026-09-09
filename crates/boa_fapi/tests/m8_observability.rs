@@ -292,7 +292,19 @@ fn setup_with_bridge() -> (Context, boa_fapi::FileApiHandle) {
     (context, handle)
 }
 
-fn run_jobs(context: &mut Context) {
+fn run_jobs(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..64 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs");
+        context.run_jobs().expect("run_jobs");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+    }
+}
+
+/// Boa-only drain for FileReader/stream paths (no promise I/O involved).
+fn run_jobs_boa(context: &mut Context) {
     context.run_jobs().expect("run_jobs");
     context.run_jobs().expect("run_jobs");
 }
@@ -388,14 +400,14 @@ fn tracing_emits_only_allowlisted_fields() {
     let (collector, events) = TestCollector::new();
     with_collector(collector, || {
         // Memory promise reads.
-        let (mut context, _) = setup_default();
+        let (mut context, handle) = setup_default();
         context
             .eval(Source::from_bytes(
                 "globalThis.out = 'pending'; \
                  new Blob(['hello']).text().then(v => { globalThis.out = v; });",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.out"), "hello");
         context
             .eval(Source::from_bytes(
@@ -403,7 +415,7 @@ fn tracing_emits_only_allowlisted_fields() {
                  new Blob(['abc']).bytes().then(a => { globalThis.n = a.length; });",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.n"), "3");
 
         // Stream read (one demand chunk + EOF).
@@ -415,7 +427,7 @@ fn tracing_emits_only_allowlisted_fields() {
                      globalThis.chunks = r.value.length; globalThis.done = r.done; });",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs_boa(&mut context);
         assert_eq!(eval(&mut context, "globalThis.chunks"), "9");
         assert_eq!(eval(&mut context, "globalThis.done"), "false");
 
@@ -428,7 +440,7 @@ fn tracing_emits_only_allowlisted_fields() {
                  reader.readAsText(new Blob(['async-ok']));",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs_boa(&mut context);
         assert_eq!(eval(&mut context, "globalThis.text"), "async-ok");
 
         // Sync FileReaderSync (worker env).
@@ -547,13 +559,13 @@ fn tracing_emits_terminal_result_classes() {
     let (collector, events) = TestCollector::new();
     with_collector(collector, || {
         // success (ok).
-        let (mut context, _) = setup_default();
+        let (mut context, handle) = setup_default();
         context
             .eval(Source::from_bytes(
                 "new Blob(['ok']).text().then(() => {});",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
 
         // quota: sync ceiling rejects a 5-byte read (valid config: sync <= materialize).
         let mut tight_context = Context::default();
@@ -586,7 +598,7 @@ fn tracing_emits_terminal_result_classes() {
                  reader.abort();",
             ))
             .expect("eval");
-        run_jobs(&mut cancel_context);
+        run_jobs_boa(&mut cancel_context);
 
         // encoding: a label resolving to the replacement encoding still
         // succeeds (every byte decodes to U+FFFD) with class "encoding".
@@ -597,7 +609,7 @@ fn tracing_emits_terminal_result_classes() {
                  reader2.readAsText(new Blob(['x']), 'csiso2022kr');",
             ))
             .expect("eval");
-        run_jobs(&mut enc_context);
+        run_jobs_boa(&mut enc_context);
 
         // invalid range + snapshot-changed via fake resources (Unix live).
         // On Windows the import is refused (permission); both are allow-listed.
@@ -624,7 +636,7 @@ fn tracing_emits_terminal_result_classes() {
                     fs_context
                         .eval(Source::from_bytes("fsBlob.text().then(()=>{},()=>{});"))
                         .expect("eval");
-                    run_jobs(&mut fs_context);
+                    run_jobs(&mut fs_context, &fs_handle);
                 }
                 Err(_) => {
                     // Windows copy-or-deny: permission path exercised instead.
@@ -654,7 +666,7 @@ fn tracing_emits_terminal_result_classes() {
                 fs_context
                     .eval(Source::from_bytes("mutBlob.text().then(()=>{},()=>{});"))
                     .expect("eval");
-                run_jobs(&mut fs_context);
+                run_jobs(&mut fs_context, &fs_handle);
             }
         }
 
@@ -771,7 +783,7 @@ fn tracing_never_leaks_sensitive_values() {
                  r.readAsText(sensitiveFile);",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         // Fake URL/UUID + snapshot marker + error-like text through resolves.
         let _ =
             handle.resolve_blob_url("blob:https://localhost/123e4567-e89b-42d3-a456-426614174000");
@@ -810,7 +822,7 @@ fn tracing_never_leaks_sensitive_values() {
 fn tracing_preserves_async_order_and_stale_suppression() {
     let (collector, events) = TestCollector::new();
     let js_log = with_collector(collector, || {
-        let (mut context, _) = setup_default();
+        let (mut context, handle) = setup_default();
         context
             .eval(Source::from_bytes(
                 "globalThis.log = []; \
@@ -832,8 +844,8 @@ fn tracing_preserves_async_order_and_stale_suppression() {
                  reader.readAsArrayBuffer(new Blob(['old']));",
             ))
             .expect("start read");
-        run_jobs(&mut context);
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
+        run_jobs(&mut context, &handle);
         eval(&mut context, "globalThis.log.join('|')")
     });
     assert_eq!(

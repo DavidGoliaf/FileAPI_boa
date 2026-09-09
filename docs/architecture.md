@@ -102,20 +102,32 @@ owns the host bridge; `extension.rs` owns the entry points:
   exists by design (host-side capability); `structured-clone` off keeps
   M1–M5 behavior with no partial surface.
 
-### Layer 2b: `boa_fapi` promise reads (M3-A)
-`promise_read.rs` owns the single conversion/packaging/scheduling path for
+### Layer 2b: `boa_fapi` promise reads (M9-B executor)
+
+`io.rs` owns the explicit file I/O executor and completion bridge;
+`promise_read.rs` owns the validation/submit/settle path for
 `Blob.prototype.text()`, `arrayBuffer()`, and `bytes()`:
 
-- brand check (`require_blob`) is synchronous; failures never create a `Promise`;
-- `JsPromise::new_pending` creates the pending promise in the current realm;
-- a `PromiseJob` capturing only `Arc<BlobData>`, cloned limits, and the read
-  mode is enqueued via `Context::enqueue_job`; the job calls the bounded
-  `BlobData::materialize`, packages the result (UTF-8 replacement string,
-  fresh `ArrayBuffer`, or fresh offset-0 `Uint8Array`), and settles once;
-- `MaterializeBytes` and every other read failure reject with the central
-  M4-A mapped `DOMException` (`ResourceLimit` → `QuotaExceededError`,
-  others → the mapped name); the embedder runs `context.run_jobs()`
-  explicitly — the job never calls it itself.
+- brand/Web IDL validation, size preflight and quota reservation run on
+  the Boa thread; failures settle the fresh pending promise through one
+  Boa job without worker contact;
+- the method submits a Send-only `FileIoTask` (shared `BlobData`,
+  limits snapshot, cancellation token, bridge — no `JsValue`/`JsObject`/
+  `Context`/paths) to the context `FileIoExecutor` and returns the
+  pending `Promise` immediately;
+- a worker materializes without Boa, pushes a Rust-only
+  `FileIoCompletion` (bytes or typed `FileApiError`), and signals the
+  `FileIoWake` hook; packaging (`String`/`ArrayBuffer`/`Uint8Array`)
+  happens on the Boa thread after `poll_io`;
+- `FileApiHandle::poll_io` (owner only; foreign contexts rejected)
+  turns DTOs into Boa settlement jobs without calling user JS or holding
+  the bridge mutex across Boa calls; `has_pending_io` reports
+  outstanding work; `shutdown` cancels, clears, and forbids late
+  settlement with exact-once quota release;
+- the built-in `ThreadedFileIoExecutor` is a fixed pool with a bounded
+  queue (thread-per-read without a limit is forbidden); tests inject a
+  controlled manual executor. The protocol is designed so M9-C (FileReader)
+  and M9-D (streams) can migrate without special-casing.
 
 ### Layer 2c: `boa_fapi` streams shim (M3-B)
 `streams.rs` owns the branded `ReadableStream` shim:

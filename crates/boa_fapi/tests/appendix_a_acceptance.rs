@@ -57,7 +57,7 @@ fn eval_side_effect(context: &mut Context, source: &str) {
 }
 
 /// Evaluates an async IIFE and asserts it fulfills with `true` after jobs.
-fn assert_async_body(context: &mut Context, body: &str) {
+fn assert_async_body(context: &mut Context, handle: &boa_fapi::FileApiHandle, body: &str) {
     let source = format!("(async () => {{ {body} }})()");
     let value = context
         .eval(Source::from_bytes(&source))
@@ -65,7 +65,13 @@ fn assert_async_body(context: &mut Context, body: &str) {
     let promise = value
         .as_object()
         .unwrap_or_else(|| panic!("expected a promise from {source}"));
-    context.run_jobs().expect("run_jobs failed");
+    for _ in 0..64 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+    }
     let state = boa_engine::object::builtins::JsPromise::from_object(promise)
         .expect("promise object")
         .state();
@@ -184,23 +190,26 @@ fn host_file_list_order_identity_and_access() {
 
 #[test]
 fn promise_reads_settle_only_after_jobs() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         "var seen = 'pending'; \
          var p = new Blob(['abc']).text().then(v => { seen = v; }); \
          if (seen !== 'pending') return false; \
          var t = await p.then(() => seen); \
-         return t === 'abc';",
+          return t === 'abc';",
     );
     assert_async_body(
         &mut context,
+        &handle,
         "var buf = await new Blob(['abc']).arrayBuffer(); \
          var view = new Uint8Array(buf); \
-         return buf.byteLength === 3 && view[0] === 97 && view[2] === 99;",
+          return buf.byteLength === 3 && view[0] === 97 && view[2] === 99;",
     );
     assert_async_body(
         &mut context,
+        &handle,
         "var bytes = await new File(['xy'], 'f.txt').bytes(); \
          return bytes instanceof Uint8Array && bytes.length === 2 && bytes.byteOffset === 0;",
     );
@@ -208,9 +217,10 @@ fn promise_reads_settle_only_after_jobs() {
 
 #[test]
 fn streams_deliver_chunks_on_demand_after_jobs() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         "var reader = new Blob(['hello']).stream().getReader(); \
          var first = await reader.read(); \
          var second = await reader.read(); \
@@ -218,6 +228,7 @@ fn streams_deliver_chunks_on_demand_after_jobs() {
     );
     assert_async_body(
         &mut context,
+        &handle,
         "var reader = new Blob(['a']).textStream().getReader(); \
          var first = await reader.read(); \
          return typeof first.value === 'string' && first.value === 'a';",

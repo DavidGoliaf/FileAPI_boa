@@ -2,10 +2,14 @@
 //!
 //! Every test uses a fresh real `boa_engine::Context`, registers the
 //! extension, executes JavaScript, and drives settlement explicitly with
-//! `context.run_jobs()`. Demand, FIFO order, EOF, cancellation, and error
-//! paths are proven through JS-observable state only. Garbage-collection
-//! safety of pending reads is proven by the deterministic `boa_gc` path in
-//! `streams::tests` (resolvers live in job captures, never in shared state).
+//! `context.run_jobs()` (streams settle through Boa jobs alone). Demand,
+//! FIFO order, EOF, cancellation, and error paths are proven through
+//! JS-observable state only. Garbage-collection safety of pending reads is
+//! proven by the deterministic `boa_gc` path in `streams::tests`
+//! (resolvers live in job captures, never in shared state).
+//!
+//! The one body that additionally awaits a promise read
+//! (`two_streams_are_independent`) drives the M9-B host loop instead.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -434,9 +438,14 @@ fn second_chunk_not_read_before_second_demand() {
 
 #[test]
 fn two_streams_are_independent() {
-    let mut context = setup();
-    assert_async_body(
-        &mut context,
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
+    let source = format!(
+        "(async () => {{ {} }})()",
         r"
         var blob = new Blob(['shared']);
         var a = blob.stream().getReader();
@@ -450,7 +459,30 @@ fn two_streams_are_independent() {
         if (blob.size !== 6) return false;
         if ((await blob.text()) !== 'shared') return false;
         return true;
-        ",
+        "
+    );
+    let value = context
+        .eval(Source::from_bytes(&source))
+        .unwrap_or_else(|error| panic!("eval failed for {source}: {error}"));
+    let promise = value
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a promise from {source}"));
+    // M9-B host loop: `poll_io` turns the worker completion into a Boa
+    // job, then `run_jobs` settles it (streams need only `run_jobs`).
+    for _ in 0..64 {
+        let settled = handle.poll_io(&mut context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+    }
+    let state = boa_engine::object::builtins::JsPromise::from_object(promise)
+        .expect("promise object")
+        .state();
+    assert_eq!(
+        state,
+        boa_engine::builtins::promise::PromiseState::Fulfilled(boa_engine::JsValue::from(true)),
+        "async body did not fulfill with true: {source} (state: {state:?})"
     );
 }
 

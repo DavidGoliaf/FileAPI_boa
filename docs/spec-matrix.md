@@ -63,6 +63,16 @@ integration suites live in `crates/boa_fapi_core/tests/`.
 | M3-READ-07 | `File` reads use exactly the Blob-brand path | `promise_read.rs` — `brand::require_blob` accepts `FileNative` | `::file_inherits_read_methods_without_own_copies`, `::text_decodes_ascii_and_multibyte` (File case) |
 | M3-READ-08 | Bounded core materialize: multi-segment order, empty, exact/over limit, short/long source responses, cancel before/between, checked-offset failure | `boa_fapi_core/src/blob.rs` — `BlobData::materialize` | `blob::tests::materialize_multi_segment_order`, `::materialize_empty_blob`, `::materialize_exactly_at_limit`, `::materialize_one_over_limit_rejected_before_allocation`, `::materialize_rejects_short_source_response`, `::materialize_rejects_long_source_response`, `::materialize_cancelled_before_first_read`, `::materialize_cancelled_between_segments`, `::materialize_checked_offset_failure` |
 
+## M9-B — I/O executor and Promise Blob reads (`crates/boa_fapi`)
+
+| ID | Normative rule | Code | Test |
+|---|---|---|---|
+| M9B-IO-01 | Send-only executor task and completion DTO (no `JsValue`/`JsObject`/`Context`/realm/paths in types or `Debug`) | `crates/boa_fapi/src/io.rs` — `FileIoTask`, `FileIoCompletion`, `FileApiContextId`, `FileIoOperationId` | `m9_promise_io.rs::io_task_and_completion_are_send_static_without_js` — `cargo test --package boa_fapi --test m9_promise_io -- --nocapture` |
+| M9B-IO-02 | Context-bound bounded completion queue and wake contract; `poll_io` rejects foreign contexts | `io.rs` — `IoBridge::reserve/push_completion/take_completions`; `extension.rs` — `FileApiHandle::poll_io/has_pending_io` | `m9_promise_io.rs::poll_io_rejects_foreign_context_without_state_change`, `::completion_before_poll_io_runs_no_js_and_wake_fires` — same command |
+| M9B-IO-03 | Promise returns before filesystem I/O; settle only through a Boa job after `poll_io`; no Boa-job `materialize` fallback (behavioural blocking-source guard) | `promise_read.rs` — `read_promise/settle_completion`; `io.rs` — `FileIoTask::execute` (worker only) | `m9_promise_io.rs::pending_promise_before_blocking_io_boa_thread_stays_usable`, `::blocking_source_never_runs_inside_boa_job`, `::memory_and_filesystem_results_match_byte_for_byte` — same command |
+| M9B-IO-04 | Cancellation/shutdown/stale completion/quota exact-once; queue-full/worker-loss typed errors | `io.rs` — `IoBridge::reserve/unreserve/release/shutdown`; `promise_read.rs` — submit-failure path; `extension.rs` — `shutdown` tracks the bridge | `m9_promise_io.rs::success_error_cancel_shutdown_and_queue_full_free_quota_once`, `::sixty_five_concurrent_reads_obey_limit_and_recover`, `::mutation_snapshot_error_carries_no_partial_bytes`, `::worker_panic_settles_stable_not_readable_error` — same command |
+| M9B-HOST-01 | Reproducible host `poll_io`/`run_jobs` integration loop | `docs/host-integration.md`, `crates/boa_fapi/README.md`, `extension.rs` — `poll_io` docs | `m9_promise_io.rs::host_poll_run_jobs_loop_until_quiescent` — same command |
+
 ## M3-B — Blob streams (`crates/boa_fapi`, `crates/boa_fapi_core`)
 
 | ID | Normative rule | Code | Test |

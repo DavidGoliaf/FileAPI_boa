@@ -238,6 +238,12 @@ fn lib_rs_denies_unsafe_and_limits_re_exports() {
         "HostFileOptions",
         "OsEntropy",
         "UrlEntropySource",
+        "pub use io::{",
+        "FileApiContextId",
+        "FileIoExecutor",
+        "FileIoWake",
+        "PollIoError",
+        "ThreadedFileIoExecutor",
     ] {
         assert!(lib.contains(exposed), "lib.rs must contain `{exposed}`");
     }
@@ -547,9 +553,18 @@ fn no_out_of_scope_surface() {
     // capability; `boa_fapi` production code holds no `std::fs`/`std::path`
     // itself — the `fs` feature only wires the opaque `FileResource`
     // trait. `structuredClone` as a JS global never exists: the bridge is
-    // host-side only.)
+    // host-side only. M9-B owns the single allowed threading site: the
+    // `io.rs` executor/worker plus its documented compatibility yield may
+    // use `std::thread`; every other module must not.)
     let mut all = String::new();
     for entry in walk_rs(&src) {
+        let name = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == "io.rs" {
+            continue;
+        }
         all.push_str(&read(&entry));
         all.push('\n');
     }
@@ -613,6 +628,35 @@ fn no_out_of_scope_surface() {
             );
         }
     }
+    // The `io.rs` threading site itself stays bounded: the I/O protocol
+    // is the single allowed public surface outside `extension.rs`/`lib.rs`
+    // (M9-B), plus only the worker pool, the join-handle list, and the
+    // documented yield may name threading.
+    let io = read(&src.join("io.rs"));
+    for required in [
+        "ThreadedFileIoExecutor",
+        "FileIoExecutor",
+        "FileIoWake",
+        "poll_io",
+        "pub struct FileApiContextId",
+        "pub struct FileIoTask",
+        "pub struct FileIoCompletion",
+        "pub enum FileIoSubmitError",
+        "pub enum PollIoError",
+    ] {
+        assert!(io.contains(required), "io.rs must contain {required}");
+    }
+    let mut io_hits = 0;
+    for line in io.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.contains("tokio") {
+            io_hits += 1;
+        }
+    }
+    assert_eq!(io_hits, 0, "io.rs must not introduce tokio");
     let extension = read(&src.join("extension.rs"));
     assert!(
         extension.contains("environment"),
@@ -742,6 +786,22 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         "blob_urls_empty",
         "UrlEntropySource",
         "CloneAdapter",
+    ] {
+        assert!(
+            extension.contains(required),
+            "extension.rs must contain `{required}`"
+        );
+    }
+    // The M9-B I/O surface exists and stays opaque (no paths, handles or
+    // JS values in the public types).
+    for required in [
+        "poll_io",
+        "has_pending_io",
+        "io_executor",
+        "io_wake",
+        "FileIoExecutor",
+        "FileIoWake",
+        "PollIoError",
     ] {
         assert!(
             extension.contains(required),

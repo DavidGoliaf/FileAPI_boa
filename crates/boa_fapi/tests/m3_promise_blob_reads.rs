@@ -1,9 +1,10 @@
 //! M3-A integration tests: promise-returning `Blob` reads.
 //!
 //! Every test uses a fresh real `boa_engine::Context`, registers the
-//! extension, executes JavaScript, and drives settlement explicitly with
-//! `context.run_jobs()`. No test settles a promise synchronously, and no
-//! test inspects private internals: assertions observe JS values only.
+//! extension, executes JavaScript, and drives settlement through the M9-B
+//! host loop (`handle.poll_io(&mut context)` + `context.run_jobs()`). No
+//! test settles a promise synchronously, and no test inspects private
+//! internals: assertions observe JS values only.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -27,14 +28,14 @@ impl Clock for FixedClock {
 const FIXED_TIME: i64 = 1_700_000_000_000;
 
 /// Creates a clean context with the extension registered (default limits).
-fn setup() -> Context {
+fn setup() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a clean context with `max_materialize_bytes` overridden.
@@ -44,7 +45,7 @@ fn setup() -> Context {
 /// `validate()` (sync <= materialize <= blob, chunk <= materialize) still
 /// passes and the materialize limit is enforced per read by `materialize()`.
 /// (Requires max_materialize_bytes >= 64 KiB so the default chunk fits.)
-fn setup_with_materialize_limit(max_materialize_bytes: u64) -> Context {
+fn setup_with_materialize_limit(max_materialize_bytes: u64) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     assert!(
         max_materialize_bytes >= 64 * 1024,
@@ -55,13 +56,25 @@ fn setup_with_materialize_limit(max_materialize_bytes: u64) -> Context {
         max_sync_read_bytes: max_materialize_bytes.min(32 * 1024 * 1024),
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
+}
+
+/// Drives the M9-B host loop until quiescent: `poll_io` turns worker
+/// completions into Boa jobs, `run_jobs` settles them.
+fn drive_host_loop(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..64 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+    }
 }
 
 /// Evaluates `source` and asserts that the result is `true`.
@@ -79,9 +92,9 @@ fn assert_eval(context: &mut Context, source: &str) {
 /// Evaluates `source` (an async IIFE body returning a `bool` promise),
 /// drives jobs to completion, and asserts the settled value is `true`.
 ///
-/// The IIFE returns a promise, so one `run_jobs()` pass settles both the
-/// read job and the awaiting continuation.
-fn assert_async_body(context: &mut Context, body: &str) {
+/// The IIFE returns a promise, so the host loop settles both the read
+/// completion and the awaiting continuation.
+fn assert_async_body(context: &mut Context, handle: &boa_fapi::FileApiHandle, body: &str) {
     let source = format!("(async () => {{ {body} }})()");
     let value = context
         .eval(Source::from_bytes(&source))
@@ -89,7 +102,7 @@ fn assert_async_body(context: &mut Context, body: &str) {
     let promise = value
         .as_object()
         .unwrap_or_else(|| panic!("expected a promise from {source}"));
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(context, handle);
     let state = boa_engine::object::builtins::JsPromise::from_object(promise)
         .expect("promise object")
         .state();
@@ -119,7 +132,7 @@ fn assert_eval_type_error(context: &mut Context, source: &str) {
 
 #[test]
 fn read_methods_live_on_blob_prototype_with_correct_descriptors() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -143,7 +156,7 @@ fn read_methods_live_on_blob_prototype_with_correct_descriptors() {
 
 #[test]
 fn file_inherits_read_methods_without_own_copies() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -160,7 +173,7 @@ fn file_inherits_read_methods_without_own_copies() {
 
 #[test]
 fn brand_violations_throw_synchronously_without_promise() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     // Borrowed getters/methods, forged objects and foreign `this` fail
     // before any Promise could be created.
     assert_eval_type_error(&mut context, r"Object.create(Blob.prototype).text()");
@@ -192,7 +205,7 @@ fn brand_violations_throw_synchronously_without_promise() {
 
 #[test]
 fn text_returns_pending_promise_settled_by_run_jobs() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -207,7 +220,7 @@ fn text_returns_pending_promise_settled_by_run_jobs() {
         })()
         ",
     );
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.order.join(',') === 'sync,handler:hello'",
@@ -216,7 +229,7 @@ fn text_returns_pending_promise_settled_by_run_jobs() {
 
 #[test]
 fn empty_blob_read_stays_pending_until_run_jobs() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -228,13 +241,13 @@ fn empty_blob_read_stays_pending_until_run_jobs() {
         })()
         ",
     );
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(&mut context, &handle);
     assert_eval(&mut context, "globalThis.seen === 'text:|ab:0'");
 }
 
 #[test]
 fn two_concurrent_reads_settle_fifo() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -249,7 +262,7 @@ fn two_concurrent_reads_settle_fifo() {
         })()
         ",
     );
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.log.join(',') === 'a:first,b:second'",
@@ -262,9 +275,10 @@ fn two_concurrent_reads_settle_fifo() {
 
 #[test]
 fn text_decodes_ascii_and_multibyte() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             var t1 = await new Blob(['aé😀']).text();
@@ -277,9 +291,10 @@ fn text_decodes_ascii_and_multibyte() {
 
 #[test]
 fn text_replaces_invalid_utf8() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             // Lone 0xFF byte and a truncated 2-byte sequence both decode
@@ -295,9 +310,10 @@ fn text_replaces_invalid_utf8() {
 
 #[test]
 fn text_reads_composed_and_sliced_blobs() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             var composed = new Blob([new Blob(['he']), 'llo', new Uint8Array([33])]);
@@ -316,9 +332,10 @@ fn text_reads_composed_and_sliced_blobs() {
 
 #[test]
 fn array_buffer_returns_exact_bytes_in_fresh_buffer() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             var ab = await new Blob(['abc']).arrayBuffer();
@@ -335,9 +352,10 @@ fn array_buffer_returns_exact_bytes_in_fresh_buffer() {
 
 #[test]
 fn array_buffer_results_are_independent() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             var blob = new Blob(['abc']);
@@ -361,9 +379,10 @@ fn array_buffer_results_are_independent() {
 
 #[test]
 fn bytes_returns_uint8array_with_offset_zero() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             var u8 = await new Blob(['AB']).bytes();
@@ -382,9 +401,10 @@ fn bytes_returns_uint8array_with_offset_zero() {
 
 #[test]
 fn bytes_results_are_independent() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
 
             var blob = new Blob(['xy']);
@@ -411,7 +431,7 @@ fn over_materialize_limit_rejects_with_quota_exceeded() {
     // A 70 KiB ceiling (above the 64 KiB chunk floor) with a 70 KiB+1 blob:
     // the limit is enforced per read by `materialize()`. After M4-A the
     // rejection is the mapped `QuotaExceededError` DOMException.
-    let mut context = setup_with_materialize_limit(70 * 1024);
+    let (mut context, handle) = setup_with_materialize_limit(70 * 1024);
     let big = "new Uint8Array(70 * 1024 + 1)";
     assert_eval(
         &mut context,
@@ -430,7 +450,7 @@ fn over_materialize_limit_rejects_with_quota_exceeded() {
         "
         ),
     );
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(&mut context, &handle);
     assert_eval(&mut context, "globalThis.outcome === 'quota'");
     // The blob is still usable for M2 metadata and slice.
     assert_eval(
@@ -443,12 +463,13 @@ fn over_materialize_limit_rejects_with_quota_exceeded() {
 fn materialize_limit_boundary() {
     // 64 KiB ceiling: `size == limit` succeeds, `size == limit + 1` rejects
     // with `QuotaExceededError` for every method.
-    let mut context = setup_with_materialize_limit(64 * 1024);
+    let (mut context, handle) = setup_with_materialize_limit(64 * 1024);
     let exact = "new Uint8Array(64 * 1024)";
     let over = "new Uint8Array(64 * 1024 + 1)";
     // size == limit succeeds for every method (byte-exact check via lengths).
     assert_async_body(
         &mut context,
+        &handle,
         &format!(
             r"
 
@@ -482,7 +503,7 @@ fn materialize_limit_boundary() {
         "
         ),
     );
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(&mut context, &handle);
     assert_eval(&mut context, "globalThis.rejections === 3");
 }
 
@@ -492,7 +513,7 @@ fn materialize_limit_boundary() {
 
 #[test]
 fn dom_and_filereader_globals_are_present_without_m4b() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"

@@ -82,6 +82,7 @@ pub mod clock;
 pub mod dom;
 pub mod error;
 pub mod extension;
+pub mod io;
 
 mod blob;
 mod brand;
@@ -112,4 +113,8 @@ pub use error::RegisterError;
 pub use extension::{
     CloneAdapter, CloneBridgeDescriptor, FileApiEnvironment, FileApiExtension,
     FileApiExtensionBuilder, FileApiHandle, HostFileOptions, OsEntropy, UrlEntropySource,
+};
+pub use io::{
+    FileApiContextId, FileIoCompletion, FileIoExecutor, FileIoOperationId, FileIoSubmitError,
+    FileIoTask, FileIoWake, NoopWake, PollIoError, ThreadedFileIoExecutor,
 };

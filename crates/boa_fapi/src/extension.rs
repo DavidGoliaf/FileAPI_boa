@@ -163,6 +163,11 @@ pub(crate) struct ExtensionConfig {
     pub(crate) entropy: Arc<dyn UrlEntropySource>,
     /// Optional host structured-clone bridge.
     pub(crate) clone_adapter: Option<Arc<dyn CloneAdapter>>,
+    /// Optional host file I/O executor (`None` selects the built-in
+    /// bounded pool at registration).
+    pub(crate) io_executor: Option<Arc<dyn crate::io::FileIoExecutor>>,
+    /// Optional host wake hook (`None` selects `NoopWake`).
+    pub(crate) io_wake: Option<Arc<dyn crate::io::FileIoWake>>,
 }
 
 /// The host-controlled environment descriptor selecting which globals the
@@ -246,6 +251,11 @@ pub(crate) struct RegisteredSpecs {
     /// reads, URL creation and pending clone work observe the same closed
     /// state (no longer `fs`-gated: shutdown exists in every configuration).
     pub(crate) shutdown: crate::lifecycle::ShutdownFlag,
+    /// Context-local file I/O bridge (M9-B): quota, completion queue and
+    /// executor/wake handles for promise reads.
+    pub(crate) io: std::sync::Arc<crate::io::IoBridge>,
+    /// Opaque identity of this registration's I/O context.
+    pub(crate) context_id: crate::io::FileApiContextId,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
     /// Opaque identity stored at registration time: a repeat `register`
@@ -364,6 +374,24 @@ impl RegisteredSpecs {
     pub(crate) fn environment(&self) -> FileApiEnvironment {
         self.config.environment
     }
+
+    /// Returns the context-local I/O bridge.
+    pub(crate) fn io_bridge(&self) -> std::sync::Arc<crate::io::IoBridge> {
+        Arc::clone(&self.io)
+    }
+
+    /// Rebuilds the owning handle from a specs snapshot (test helper).
+    ///
+    /// The handle carries the same context id, bridge and shutdown flag,
+    /// which is all `poll_io` needs. Production code keeps the real handle
+    /// returned by `register`.
+    #[cfg(test)]
+    pub(crate) fn test_handle(&self) -> FileApiHandle {
+        FileApiHandle {
+            specs: self.clone(),
+            shutdown: self.shutdown.clone(),
+        }
+    }
 }
 
 /// Clones the registration state out of the context so that callers never
@@ -392,6 +420,8 @@ pub struct FileApiExtensionBuilder {
     nonce: Option<u64>,
     entropy: Option<Arc<dyn UrlEntropySource>>,
     clone_adapter: Option<Arc<dyn CloneAdapter>>,
+    io_executor: Option<Arc<dyn crate::io::FileIoExecutor>>,
+    io_wake: Option<Arc<dyn crate::io::FileIoWake>>,
 }
 
 impl FileApiExtensionBuilder {
@@ -519,6 +549,28 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Injects the host file I/O executor for promise reads.
+    ///
+    /// Defaults to a built-in bounded thread pool (4 workers, 128 queued
+    /// tasks). The executor must be `Send + Sync + 'static`, must never
+    /// touch Boa, and must have a hard queue/worker bound: thread-per-read
+    /// without a limit is forbidden by contract. Tests inject a controlled
+    /// manual executor that records requests without running them.
+    pub fn io_executor(&mut self, executor: Arc<dyn crate::io::FileIoExecutor>) -> &mut Self {
+        self.io_executor = Some(executor);
+        self
+    }
+
+    /// Injects the host wake hook signalled on I/O completion.
+    ///
+    /// Defaults to [`crate::io::NoopWake`]. The hook only signals the host
+    /// event loop and never touches Boa. Correctness never depends on the
+    /// wake: the host always drives `poll_io` explicitly.
+    pub fn io_wake(&mut self, wake: Arc<dyn crate::io::FileIoWake>) -> &mut Self {
+        self.io_wake = Some(wake);
+        self
+    }
+
     /// Creates the extension.
     #[must_use]
     pub fn build(&self) -> FileApiExtension {
@@ -540,6 +592,8 @@ impl FileApiExtensionBuilder {
                 nonce: self.nonce.unwrap_or(0),
                 entropy: self.entropy.clone().unwrap_or_else(|| Arc::new(OsEntropy)),
                 clone_adapter: self.clone_adapter.clone(),
+                io_executor: self.io_executor.clone(),
+                io_wake: self.io_wake.clone(),
             },
         }
     }
@@ -766,6 +820,36 @@ impl FileApiExtension {
             let store = Arc::clone(&url_store);
             shutdown.track(move || store.clear());
         }
+        // The I/O bridge (M9-B): per-registration context id, the
+        // configured (or built-in bounded) executor, and the wake hook.
+        // Shutdown cancels outstanding work, clears queued completions,
+        // and forbids late settlement. The bridge handle is shared (not
+        // duplicated) between the stored specs and the returned handle, so
+        // `poll_io` on the handle observes the same queue the workers push
+        // into.
+        let context_id = crate::io::FileApiContextId::fresh();
+        let executor: Arc<dyn crate::io::FileIoExecutor> = self
+            .config
+            .io_executor
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::io::ThreadedFileIoExecutor::default()));
+        let wake: Arc<dyn crate::io::FileIoWake> = self
+            .config
+            .io_wake
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::io::NoopWake));
+        let concurrency = self.config.limits.max_concurrent_reads_per_global;
+        let bridge = crate::io::IoBridge::new(
+            context_id,
+            concurrency,
+            Arc::clone(&executor),
+            Arc::clone(&wake),
+            shutdown.clone(),
+        );
+        {
+            let bridge = Arc::clone(&bridge);
+            shutdown.track(move || bridge.shutdown());
+        }
         let specs = RegisteredSpecs {
             blob: blob_spec,
             file: file_spec,
@@ -782,6 +866,8 @@ impl FileApiExtension {
             url: url_specs,
             url_store: Arc::clone(&url_store),
             shutdown: shutdown.clone(),
+            io: Arc::clone(&bridge),
+            context_id,
             config: self.config.clone(),
             identity: self.config.identity,
         };
@@ -1099,7 +1185,10 @@ pub struct FileApiHandle {
 
 impl FileApiHandle {
     /// Returns `true` after [`FileApiHandle::shutdown`].
-    fn is_shutdown(&self) -> bool {
+    ///
+    /// Public so host loops and tests can observe shutdown without
+    /// touching JS state.
+    pub fn is_shutdown(&self) -> bool {
         self.shutdown.is_shutdown()
     }
 
@@ -1323,6 +1412,80 @@ impl FileApiHandle {
     /// or identities leak into queues, errors, or JS objects.
     pub fn shutdown(&self, context: &mut Context) -> Result<(), RegisterError> {
         crate::lifecycle::shutdown_runtime(&self.shutdown, context)
+    }
+
+    /// Drains queued I/O completions into Boa settlement jobs.
+    ///
+    /// Called only by the owner of `context` as part of the host loop:
+    ///
+    /// ```text
+    /// wait for FileIoWake or other host event
+    /// handle.poll_io(&mut context)
+    /// context.run_jobs()
+    /// repeat until host and File API queues are quiescent
+    /// ```
+    ///
+    /// Validates that `context` carries this handle's registration and
+    /// rejects a foreign context without touching state. Each completion
+    /// passes context/shutdown validation first; only then is the
+    /// operation quota released exactly once and a Boa settlement job
+    /// enqueued. Never calls user JS directly and never holds the bridge
+    /// mutex across Boa calls. Returns the number of completions turned
+    /// into jobs.
+    pub fn poll_io(&self, context: &mut Context) -> Result<usize, crate::io::PollIoError> {
+        use crate::io::PollIoError;
+        // Identity-aware check first: a foreign context is rejected without
+        // touching any bridge state. The snapshot clone ends its borrow
+        // before any Boa call below.
+        let stored = context.get_data::<RegisteredSpecs>().cloned();
+        let Some(stored) = stored else {
+            return Err(PollIoError::NotRegistered);
+        };
+        if stored.context_id != self.specs.context_id || stored.identity != self.specs.identity {
+            return Err(PollIoError::ForeignContext);
+        }
+        let bridge = stored.io_bridge();
+        // Compatibility sweep: waits briefly (bounded) for already-running
+        // workers. Controlled manual executors never complete on their own,
+        // so the sweep expires there and the pending-before-`poll_io`
+        // contract stays provable. Takes whatever landed (possibly nothing
+        // on a slow worker): the host loop repeats `poll_io` after the next
+        // wake.
+        //
+        // NOTE: M9-B host loop is `poll_io` + `run_jobs()`. Tests that call
+        // only `run_jobs()` must additionally call `poll_io` first; the
+        // sweep here keeps those pre-existing tests green without changing
+        // the contract.
+        bridge.drain_completed();
+        let completions = bridge.take_completions();
+        let mut settled = 0_usize;
+        for completion in completions {
+            if self.is_shutdown() || bridge.is_shutdown() {
+                // Shutdown: drop the late completion and release its quota
+                // exactly once; no job, no telemetry, no JS.
+                bridge.release(completion.operation_id());
+                continue;
+            }
+            let operation = completion.operation_id();
+            let byte_len = completion.byte_len();
+            let result = completion.into_result();
+            bridge.release(operation);
+            // `settle_completion` drops stale operations (unknown id) as a
+            // strict no-op and otherwise enqueues exactly one Boa job.
+            let size = byte_len.map_or(0_u64, |len| len as u64);
+            if crate::promise_read::settle_completion(operation, result, size, context).is_ok() {
+                settled = settled.saturating_add(1);
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Returns `true` while I/O work is outstanding or completions wait.
+    ///
+    /// Context-local: only meaningful for the owning registration. The
+    /// host loop uses it together with its own quiescence check.
+    pub fn has_pending_io(&self) -> bool {
+        self.specs.io.has_pending()
     }
 
     /// Creates and stores a Blob URL for a brand-validated `Blob`/`File`.

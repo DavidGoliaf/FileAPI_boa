@@ -68,9 +68,16 @@ fn eval_side_effect(context: &mut Context, source: &str) {
 }
 
 #[cfg(unix)]
-fn drain(context: &mut Context) {
+fn drain(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
     for _ in 0..16 {
+        let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
     }
 }
 
@@ -116,7 +123,7 @@ fn filesystem_mutation_after_creation() {
             "globalThis.raceVerdict = 'pending'; \
              raceFile.text().then(v => { globalThis.raceVerdict = v; }, e => { globalThis.raceVerdict = e.name; });",
         );
-        drain(&mut context);
+        drain(&mut context, &handle);
         let verdict = context
             .eval(Source::from_bytes("globalThis.raceVerdict"))
             .expect("verdict")

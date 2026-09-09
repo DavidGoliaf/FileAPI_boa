@@ -1405,7 +1405,12 @@ fn concurrent_read_quota_recovers_after_success_error_abort() {
 
 #[test]
 fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
-    let mut context = setup();
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
     assert_eval(
         &mut context,
         r"
@@ -1424,7 +1429,15 @@ fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    // M9-B host loop: `poll_io` turns the worker completion into a Boa
+    // job, then `run_jobs` settles it.
+    for _ in 0..64 {
+        let settled = handle.poll_io(&mut context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+    }
     assert_eval(&mut context, "globalThis.outcome === 'fulfilled:ok'");
 }
 
