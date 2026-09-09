@@ -1625,7 +1625,7 @@ fn mutation_snapshot_error_carries_no_partial_bytes() {
         executor.run_chunks();
         assert_eq!(js_log(&mut context), "");
         drive(&mut context, &handle);
-        assert_eq!(js_log(&mut context), "loadstart|error|loadend");
+        assert_eq!(event_types(&mut context), "loadstart|error|loadend");
         assert_eval(
             &mut context,
             "reader.result === null && (reader.error instanceof DOMException) \
