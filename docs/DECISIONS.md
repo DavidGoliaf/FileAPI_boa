@@ -965,7 +965,12 @@ identity/position/content API) с panic containment как у whole-blob
 (`settle_reader_completion` с generation/shutdown/stale валидацией);
 pump пакует инкрементально, шлёт `loadstart`/throttled `progress`/final
 progress/`load`/`error` (+ conditional `loadend`), сабмитит максимум
-один следующий чанк; `abort()` бампает generation, канцеллит токен,
+один следующий чанк; пустой Blob также submit-ит zero-length task: worker
+производит EOF без `ByteSource::read_range`, а `loadstart` появляется
+только после его completion через `poll_io`. Под «successful completion»
+в M9-C понимается успешная доставка completion в Boa loop: error-completion
+сохраняет историческую M4 последовательность `loadstart → error → loadend`.
+`abort()` бампает generation, канцеллит токен,
 релизит слот ровно один раз; stale completions дропаются без JS
 мутации/события/телеметрии/второго релиза. `set_poll_io_budget`
 ограничивает reader completions за один `poll_io` (leftovers re-wake).

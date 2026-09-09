@@ -69,10 +69,6 @@ impl ManualExecutor {
         self.whole.lock().expect("whole").len()
     }
 
-    fn pending_total(self: &Arc<Self>) -> usize {
-        self.pending_chunks() + self.pending_whole()
-    }
-
     fn take_chunks(self: &Arc<Self>) -> Vec<FileReaderChunkTask> {
         self.chunks.lock().expect("chunks").drain(..).collect()
     }
@@ -629,8 +625,12 @@ fn empty_blob_loadstart_final_progress_load_loadend() {
         &mut context,
         "reader.readAsArrayBuffer(new Blob([])); reader.readyState === 1",
     );
-    // Empty blobs settle without a worker round-trip.
-    assert_eq!(executor.pending_total(), 0);
+    // Empty blobs still use the executor/completion protocol. The worker
+    // derives EOF from the zero-length window without reading a source.
+    assert_eq!(executor.pending_chunks(), 1);
+    let task = executor.take_chunks().into_iter().next().expect("EOF task");
+    assert!(task.is_empty());
+    task.execute();
     drive(&mut context, &handle);
     assert_eq!(event_types(&mut context), "loadstart|progress|load|loadend");
     assert_eval(
@@ -1709,9 +1709,11 @@ fn no_late_telemetry_after_abort_or_shutdown() {
     use std::collections::{HashMap, HashSet};
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
     use tracing::{Event, Metadata, Subscriber};
 
     const TARGET: &str = "boa_fapi::file_api.operation";
+    type CapturedEvents = Arc<Mutex<Vec<(std::thread::ThreadId, HashMap<String, String>)>>>;
 
     #[derive(Debug, Default)]
     struct Capture {
@@ -1742,11 +1744,23 @@ fn no_late_telemetry_after_abort_or_shutdown() {
 
     #[derive(Debug, Clone, Default)]
     struct Collector {
-        events: Arc<Mutex<Vec<HashMap<String, String>>>>,
+        events: CapturedEvents,
     }
     impl Subscriber for Collector {
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            // `tracing` caches registration globally. This test must keep the
+            // telemetry callsite enabled even if another concurrently running
+            // test installed a subscriber that does not observe this target.
+            Interest::always()
+        }
+
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.target() == TARGET
+            // Callsite interest is cached globally by `tracing`. Returning
+            // `false` here lets an unrelated parallel test disable this
+            // callsite before this collector is installed. Filter in `event`
+            // instead, where the target is checked before recording.
+            let _ = metadata;
+            true
         }
         fn new_span(&self, _span: &Attributes<'_>) -> Id {
             Id::from_u64(1)
@@ -1760,19 +1774,24 @@ fn no_late_telemetry_after_abort_or_shutdown() {
             let mut capture = Capture::default();
             event.record(&mut capture);
             if let Ok(mut events) = self.events.lock() {
-                events.push(capture.fields);
+                events.push((std::thread::current().id(), capture.fields));
             }
         }
         fn enter(&self, _span: &Id) {}
         fn exit(&self, _span: &Id) {}
     }
 
-    let collector = Collector::default();
+    static GLOBAL_COLLECTOR: std::sync::OnceLock<Collector> = std::sync::OnceLock::new();
+    let collector = GLOBAL_COLLECTOR.get_or_init(|| {
+        let collector = Collector::default();
+        tracing::subscriber::set_global_default(collector.clone())
+            .expect("M9 telemetry collector must be installed once");
+        collector
+    });
     let events = Arc::clone(&collector.events);
-    // NOTE: `tracing::subscriber::with_default` is thread-local. The
-    // executor here is the controlled manual one (no background threads),
-    // so all emits below happen on this thread under the collector.
-    tracing::subscriber::with_default(collector, || {
+    let test_thread = std::thread::current().id();
+    let first_event = events.lock().expect("events").len();
+    {
         // Abort path: exactly one terminal event (`cancelled`), then the
         // late worker chunk emits nothing.
         let (mut context, handle, executor, _) = setup_manual();
@@ -1799,11 +1818,16 @@ fn no_late_telemetry_after_abort_or_shutdown() {
         let settled = handle2.poll_io(&mut context2).expect("poll_io");
         assert_eq!(settled, 0);
         context2.run_jobs().expect("run_jobs");
-    });
+    }
     let events = events.lock().expect("events").clone();
     let reader_events: Vec<_> = events
-        .iter()
-        .filter(|fields| fields.get("operation").map(String::as_str) == Some("filereader_read"))
+        .into_iter()
+        .skip(first_event)
+        .filter_map(|(thread, fields)| {
+            (thread == test_thread
+                && fields.get("operation").map(String::as_str) == Some("filereader_read"))
+            .then_some(fields)
+        })
         .collect();
     // Exactly the abort terminal; the stale chunk and the shutdown read
     // emitted nothing.

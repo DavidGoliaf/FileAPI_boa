@@ -430,7 +430,8 @@ fn blob_arg(args: &[JsValue]) -> JsResult<Arc<BlobData>> {
 /// the normal error path), snapshots the chunk ceiling, submits the first
 /// chunk request to the `FileIoExecutor`, and returns before it runs.
 /// `loadstart` fires only after the first worker completion is drained
-/// through `poll_io`, including immediate EOF of an empty blob.
+/// through `poll_io`, including EOF of an empty blob delivered by its
+/// zero-length worker task.
 fn start_read(
     this: &JsValue,
     args: &[JsValue],
@@ -556,26 +557,9 @@ fn start_read(
         final_progress_sent: false,
     };
     store_pump_state(context, operation_id.get(), initial);
-    // Empty blobs settle EOF without a worker round-trip: enqueue one
-    // pump job with an immediate EOF chunk. Non-empty blobs submit the
-    // first chunk request now; the pump applies it after `loadstart`.
-    if total == 0 {
-        let state = take_pump_state(context, operation_id.get())
-            .ok_or_else(|| type_error("the FileReader operation is unavailable"))?;
-        enqueue_reading_job(
-            context,
-            FileReadingJob {
-                reader: object,
-                generation,
-                operation: operation_id.get(),
-                step: JobStep::PumpChunk {
-                    state: Box::new(state),
-                    chunk: Some(crate::io::FileReaderChunkKind::Eof),
-                },
-            },
-        );
-        return Ok(JsValue::undefined());
-    }
+    // Every operation, including an empty Blob, goes through the executor
+    // completion protocol. Its zero-length task derives EOF on the worker
+    // without touching a source; the Boa job is queued only by `poll_io`.
     let first_len = (chunk_size as u64).min(total);
     let task = bridge.chunk_task_for(
         operation_id,

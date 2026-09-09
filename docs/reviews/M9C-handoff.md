@@ -15,8 +15,8 @@ Operation model (`crates/boa_fapi/src/filereader.rs`, `io.rs`):
   (`PendingReaderOps`: reader `JsObject` + generation, `Trace` для GC) +
   packaging state (`PumpStates`) + payload (`RegisteredSpecs::
   reader_payloads`) → submit первого чанка → возврат до его выполнения.
-  `loadstart` — только после первого worker completion (включая EOF
-  пустого Blob без worker round-trip).
+  `loadstart` — только после первого worker completion, включая EOF
+  пустого Blob через zero-length worker task (без source read).
 - Worker (`FileReaderChunkTask::execute`, только off-thread): ровно один
   bounded `read_range` для `[offset, offset+len)` через `read_blob_range`
   (`BlobData::segments_slice` — единственный новый core accessor),
@@ -41,8 +41,9 @@ Operation model (`crates/boa_fapi/src/filereader.rs`, `io.rs`):
 
 ## Доказательства
 
-Новый `crates/boa_fapi/tests/m9_filereader_io.rs` (25 тестов, manual
-executor, без `sleep` как oracle):
+Новый `crates/boa_fapi/tests/m9_filereader_io.rs` (24 default-feature
+теста; 25-й, telemetry, включается с `tracing`; manual executor, без
+`sleep` как oracle):
 
 - FR-01: `read_returns_before_io_and_settles_only_through_poll_io`
   (LOADING до I/O, `run_jobs` alone ничего не селит, unrelated job идёт,
@@ -51,7 +52,7 @@ executor, без `sleep` как oracle):
   usable, verdict pending; wake ровно 1); `chunked_source_call_path_
   absent_from_filereader_jobs` (статичный guard: в `filereader.rs` нет
   `.materialize(`/`read_range(`/`read_next(` вне `#[cfg(test)]`).
-- FR-02: empty Blob sequence; 3-chunk success (ровно 1 in-flight, ровно 3
+- FR-02: empty Blob через zero-length worker EOF; 3-chunk success (ровно 1 in-flight, ровно 3
   submits, final progress перед `load`, monotonic `loaded <= total`);
   error до первого чанка и между чанками (exact sequence, no partial,
   quota recovery).
@@ -102,9 +103,8 @@ M4-B, M8 observability (5), M9-A conformance (23), appendix-A, guards
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p boa_fapi --all-features --lib
-cargo test -p boa_fapi --all-features --test m4_filereader_async
-cargo test --package boa_fapi --test m9_filereader_io -- --test-threads 1 -- --nocapture
+cargo test --workspace --all-features
+cargo test --package boa_fapi --test m9_filereader_io -- --test-threads 1 --nocapture
 cargo test --package boa_fapi --test abort_races -- --nocapture
 cargo test --package boa_fapi --test abort_races_fs -- --nocapture
 cargo test --package boa_fapi --test m8_observability --all-features -- --nocapture
@@ -121,7 +121,12 @@ encoding-теста; полный прогон `--test-threads 1` занимае
 
 ## Отклонения
 
-Нет. `FileReaderSync` не изменён. Исторические M4/M7/M8 validation/
+Функциональных отклонений нет. Однако исходный diff M9-C относительно
+`f380abf` составляет 3 842 добавления и 296 удалений: он превышает
+лимит заказа в 3 000 строк. До формального принятия требуется либо
+разделить work order на state/event migration, либо получить явный
+waiver этого лимита. Внешний CI также остаётся pending до публикации
+ветки. `FileReaderSync` не изменён. Исторические M4/M7/M8 validation/
 handoff не переписаны; обновлены только `docs/spec-matrix.md` (M9C-FR
 строки), `docs/architecture.md` (Layer 2b/2d), `docs/host-integration.md`
 (M9-B/M9-C loop + budget), `crates/boa_fapi/README.md`, `docs/DECISIONS.md`
