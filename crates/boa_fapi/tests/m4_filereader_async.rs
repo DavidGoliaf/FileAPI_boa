@@ -130,6 +130,10 @@ fn drain_jobs(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
     for _ in 0..200 {
         let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs failed");
+        // The production executor completes on a worker thread. Yield before
+        // checking quiescence so this legacy threaded-fixture driver cannot
+        // exhaust its bounded host turns before that worker is scheduled.
+        std::thread::yield_now();
         if settled == 0 && !handle.has_pending_io() {
             context.run_jobs().expect("run_jobs failed");
             if !handle.has_pending_io() {
