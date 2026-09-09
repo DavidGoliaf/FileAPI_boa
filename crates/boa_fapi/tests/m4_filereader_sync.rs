@@ -583,7 +583,13 @@ fn sync_methods_return_without_jobs_or_events() {
 
 #[test]
 fn sync_reads_do_not_consume_async_quota() {
-    let mut context = setup_with_env(FileApiEnvironment::DedicatedWorker);
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .environment(FileApiEnvironment::DedicatedWorker)
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
     assert_eval(
         &mut context,
         r"
@@ -607,8 +613,26 @@ fn sync_reads_do_not_consume_async_quota() {
         })()
         ",
     );
-    context.run_jobs().expect("run_jobs failed");
-    context.run_jobs().expect("run_jobs failed");
+    // M9-C host loop: `poll_io` drains worker chunks into pump jobs.
+    for _ in 0..200 {
+        let settled = handle.poll_io(&mut context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs failed");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            for _ in 0..50 {
+                let _ = handle.poll_io(&mut context);
+                context.run_jobs().expect("run_jobs failed");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+        }
+    }
     assert_eval(
         &mut context,
         r"

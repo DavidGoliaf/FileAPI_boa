@@ -66,8 +66,8 @@ fn public_api_no_path_types() {
 
 // ──────────────────────────────────────────────
 // Public BlobData API guard: exactly the fixed M1 contract + M2
-// no-copy composition primitives + M3 bounded read + M3-B reader,
-// no test probes or content reads
+// no-copy composition primitives + M3 bounded read + M3-B reader + M9-C
+// bounded chunk-segment borrow, no test probes or content reads
 // ──────────────────────────────────────────────
 
 #[test]
@@ -85,6 +85,7 @@ fn blob_data_public_api_is_fixed() {
         "pub fn media_type(",
         "pub fn snapshot(",
         "pub fn segment_count(",
+        "pub fn segments_slice(",
         "pub fn concat_shared(",
         "pub fn push_shared(",
         "pub fn materialize(",
@@ -124,7 +125,10 @@ fn blob_data_public_api_is_fixed() {
         );
     }
     // Exactly one bounded byte-read primitive (M3) plus the bounded
-    // incremental reader (M3-B); no segments/probes/positions/sources.
+    // incremental reader (M3-B) plus the bounded chunk-segment borrow
+    // (M9-C); no positions/sources/probes. `segments_slice` is the only
+    // allowed `segments*` accessor (borrowed segment list for chunk
+    // workers; no content, identity, or position probe).
     for forbidden in [
         "pub fn segments(",
         "pub fn read_all(",

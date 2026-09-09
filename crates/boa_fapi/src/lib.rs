@@ -116,5 +116,6 @@ pub use extension::{
 };
 pub use io::{
     FileApiContextId, FileIoCompletion, FileIoExecutor, FileIoOperationId, FileIoSubmitError,
-    FileIoTask, FileIoWake, NoopWake, PollIoError, ThreadedFileIoExecutor,
+    FileIoTask, FileIoWake, FileReaderChunkCompletion, FileReaderChunkTask, NoopWake, PollIoError,
+    ThreadedFileIoExecutor,
 };

@@ -111,6 +111,11 @@ impl FileIoOperationId {
     pub fn get(&self) -> u64 {
         self.0
     }
+
+    /// Rebuilds the id from a stored raw value (reader bookkeeping only).
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 /// Typed failure of [`FileIoExecutor::submit`].
@@ -143,12 +148,21 @@ pub enum PollIoError {
     ForeignContext,
 }
 
-/// Host executor for [`FileIoTask`].
+/// Host executor for [`FileIoTask`] and [`FileReaderChunkTask`].
 ///
 /// Implementations run the task off the Boa thread and never touch Boa.
 /// The built-in [`ThreadedFileIoExecutor`] uses a fixed worker pool with a
 /// bounded queue; thread-per-read without a limit is forbidden by contract.
 /// Tests inject a controlled manual executor through the builder.
+///
+/// Both task kinds share one bounded queue: whole-blob promise tasks via
+/// `submit`, FileReader chunk tasks via `submit_reader`. A custom executor
+/// that only implements `submit` still works: `submit_reader` has a
+/// default body that runs the chunk task inline is forbidden — instead
+/// the default forwards through the same queue contract by executing the
+/// chunk task directly on the calling thread is also forbidden. The
+/// default therefore returns `WorkerLost` so custom executors must opt in
+/// explicitly; the built-in pool and the test manual executor handle both.
 pub trait FileIoExecutor: Send + Sync + 'static {
     /// Queues `task` for off-thread execution.
     ///
@@ -156,6 +170,19 @@ pub trait FileIoExecutor: Send + Sync + 'static {
     /// `QueueFull` and `WorkerLost` are typed and free the caller's quota
     /// exactly once through the normal error path.
     fn submit(&self, task: FileIoTask) -> Result<(), FileIoSubmitError>;
+
+    /// Queues a FileReader chunk `task` for off-thread execution.
+    ///
+    /// Same contract as `submit`: must not block the Boa thread, must not
+    /// run user JS, must execute exactly the chunk request (one bounded
+    /// `read_range`, no readahead, no whole-blob accumulation). The
+    /// default body reports `WorkerLost` so executors written before M9-C
+    /// fail closed through the typed terminal path instead of silently
+    /// dropping chunk work.
+    fn submit_reader(&self, task: FileReaderChunkTask) -> Result<(), FileIoSubmitError> {
+        let _ = task;
+        Err(FileIoSubmitError::WorkerLost)
+    }
 }
 
 /// Host wake hook signalled when a worker pushes a completion.
@@ -362,6 +389,250 @@ impl std::fmt::Debug for FileIoCompletion {
     }
 }
 
+/// One FileReader chunk window precomputed on the Boa thread.
+///
+/// Groups the `(generation, offset, len)` triple so chunk-task builders
+/// stay within the argument-count lint while keeping every field visible
+/// at the call site.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChunkWindow {
+    /// FileReader generation the chunk belongs to.
+    pub(crate) generation: u64,
+    /// Logical start offset of the chunk.
+    pub(crate) offset: u64,
+    /// Requested length of the chunk.
+    pub(crate) len: u64,
+}
+
+/// Rust-only chunk I/O result delivered to the Boa thread via `poll_io`.
+///
+/// Carries the FileReader `generation` alongside one chunk read: a chunk,
+/// EOF, or a typed [`FileApiError`]. Packaging into `ArrayBuffer` /
+/// binary-string / decoded text happens on the Boa thread after `poll_io`.
+/// `Debug` shows only ids, the generation, and the payload kind — never
+/// bytes, paths, or source detail.
+#[derive(Debug)]
+pub struct FileReaderChunkCompletion {
+    context_id: FileApiContextId,
+    operation_id: FileIoOperationId,
+    generation: u64,
+    kind: FileReaderChunkKind,
+}
+
+impl FileReaderChunkCompletion {
+    /// Returns the owning context id.
+    pub fn context_id(&self) -> FileApiContextId {
+        self.context_id
+    }
+
+    /// Returns the operation id (quota ownership / submission order).
+    pub fn operation_id(&self) -> FileIoOperationId {
+        self.operation_id
+    }
+
+    /// Returns the FileReader generation this chunk belongs to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Takes the chunk payload out of the completion.
+    pub(crate) fn into_kind(self) -> FileReaderChunkKind {
+        self.kind
+    }
+}
+
+/// Payload of one FileReader worker chunk.
+#[derive(Debug)]
+pub(crate) enum FileReaderChunkKind {
+    /// One chunk of `min(chunk_size, remaining)` bytes.
+    #[allow(dead_code)]
+    Chunk(bytes::Bytes),
+    /// End of input at dispatch time (`loaded == total`).
+    #[allow(dead_code)]
+    Eof,
+    /// Typed worker/bridge failure (`Cancelled`, source error, ...).
+    #[allow(dead_code)]
+    Error(FileApiError),
+}
+
+/// Send-only FileReader chunk request executed off the Boa thread.
+///
+/// Holds only Rust data: the owning context/operation ids, the FileReader
+/// generation, the immutable blob payload, the snapshot of limits, the
+/// read kind/encoding/media-type snapshot needed by the Boa-side
+/// packager, the logical position to read, and the shared completion
+/// bridge. Holds no `JsValue`, `JsObject`, `Context`, realm pointer, or
+/// host path. `Debug` shows only opaque ids, never content or paths.
+pub struct FileReaderChunkTask {
+    context_id: FileApiContextId,
+    operation_id: FileIoOperationId,
+    generation: u64,
+    data: Arc<BlobData>,
+    limits: FileApiLimits,
+    offset: u64,
+    len: u64,
+    cancel: CancellationToken,
+    bridge: Arc<IoBridge>,
+}
+
+impl FileReaderChunkTask {
+    /// Returns the owning context id.
+    pub fn context_id(&self) -> FileApiContextId {
+        self.context_id
+    }
+
+    /// Returns the operation id (quota ownership / submission order).
+    pub fn operation_id(&self) -> FileIoOperationId {
+        self.operation_id
+    }
+
+    /// Returns the FileReader generation this chunk belongs to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the logical start offset of this chunk.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the requested length of this chunk.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns `true` when the requested chunk length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Cancels the task's cooperative token (abort/shutdown path).
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Executes one bounded chunk read and pushes its completion.
+    ///
+    /// Runs only on a worker thread: performs exactly one
+    /// `ByteSource::read_range` for the precomputed `[offset, offset+len)`.
+    /// EOF is derived here (`offset == total`) so the bridge never
+    /// fabricates one. Panics from host sources are contained exactly like
+    /// whole-blob tasks and settle as a stable `Internal` error. The wake
+    /// hook fires after the bridge lock is released.
+    pub fn execute(self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.bridge.is_shutdown() || self.cancel.is_cancelled() {
+                let _ = self.data.size();
+                return Err(FileApiError::Cancelled);
+            }
+            if self.offset == self.data.size() {
+                return Ok(None);
+            }
+            let end = self.offset.saturating_add(self.len).min(self.data.size());
+            if end <= self.offset || end > self.data.size() {
+                return Err(FileApiError::InvalidRange);
+            }
+            match read_blob_range(&self.data, self.offset, end, &self.limits, &self.cancel) {
+                Ok(chunk) => {
+                    let expected = (end - self.offset) as usize;
+                    if chunk.len() != expected {
+                        Err(FileApiError::InvalidRange)
+                    } else {
+                        Ok(Some(chunk))
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }));
+        let kind = match result {
+            Ok(Ok(None)) => FileReaderChunkKind::Eof,
+            Ok(Ok(Some(chunk))) => FileReaderChunkKind::Chunk(chunk),
+            Ok(Err(error)) => FileReaderChunkKind::Error(error),
+            Err(_) => FileReaderChunkKind::Error(FileApiError::Internal),
+        };
+        self.bridge
+            .push_reader_completion(FileReaderChunkCompletion {
+                context_id: self.context_id,
+                operation_id: self.operation_id,
+                generation: self.generation,
+                kind,
+            });
+    }
+}
+
+impl std::fmt::Debug for FileReaderChunkTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileReaderChunkTask")
+            .field("context_id", &self.context_id.0)
+            .field("operation_id", &self.operation_id.0)
+            .field("generation", &self.generation)
+            .field("size", &self.data.size())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reads `[start, end)` of a blob without touching Boa or whole-blob
+/// accumulation.
+///
+/// Iterates the segment list like `BlobData::materialize` but returns only
+/// the requested logical sub-range. Every segment response must match its
+/// requested length exactly; short/long responses fail as `InvalidRange`
+/// with no partial bytes. `cancel` is observed before the first and before
+/// every segment read.
+fn read_blob_range(
+    data: &BlobData,
+    start: u64,
+    end: u64,
+    limits: &FileApiLimits,
+    cancel: &CancellationToken,
+) -> Result<bytes::Bytes, FileApiError> {
+    use boa_fapi_core::blob::BlobSegment;
+
+    let segments: &[BlobSegment] = data.segments_slice();
+    let requested = end.checked_sub(start).ok_or(FileApiError::InvalidRange)?;
+    if start > data.size() || end > data.size() || end < start {
+        return Err(FileApiError::InvalidRange);
+    }
+    let capacity = usize::try_from(requested).map_err(|_| {
+        FileApiError::ResourceLimit(boa_fapi_core::error::ResourceLimitKind::MaterializeBytes)
+    })?;
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(capacity).map_err(|_| {
+        FileApiError::ResourceLimit(boa_fapi_core::error::ResourceLimitKind::MaterializeBytes)
+    })?;
+    let mut cursor = 0_u64;
+    for seg in segments {
+        if cancel.is_cancelled() {
+            return Err(FileApiError::Cancelled);
+        }
+        let seg_start = cursor;
+        let seg_end = cursor.saturating_add(seg.len);
+        cursor = seg_end;
+        if seg_end <= start || seg_start >= end {
+            continue;
+        }
+        let take_start = start.max(seg_start);
+        let take_end = end.min(seg_end);
+        let source_offset = seg
+            .offset
+            .saturating_add(take_start.saturating_sub(seg_start));
+        let source_end = seg
+            .offset
+            .saturating_add(take_end.saturating_sub(seg_start));
+        let chunk = seg.source.read_range(source_offset..source_end, cancel)?;
+        let expected = (take_end - take_start) as usize;
+        if chunk.len() != expected {
+            return Err(FileApiError::InvalidRange);
+        }
+        out.extend_from_slice(&chunk);
+        let _ = limits;
+    }
+    if out.len() != capacity {
+        return Err(FileApiError::InvalidRange);
+    }
+    Ok(bytes::Bytes::from(out))
+}
+
 /// Reservation failure before any executor contact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReserveError {
@@ -406,6 +677,12 @@ struct BridgeState {
     /// as stale by `take_completions`.
     order: VecDeque<u64>,
     tokens: HashMap<u64, CancellationToken>,
+    /// FileReader chunk completions keyed by operation id. One reader
+    /// operation holds exactly one reserved slot (`tokens`/`order` shared
+    /// with promise reads); each chunk pushes one entry here, and the Boa
+    /// thread drains them in push order through `take_reader_completions`
+    /// (FIFO within one reader). Entries never contain JS values.
+    reader_completions: HashMap<u64, VecDeque<FileReaderChunkCompletion>>,
     /// When `true` no further ids can be minted (u64 space exhausted or a
     /// context id saturated): reservations fail as `QuotaFull` instead of
     /// reusing an id.
@@ -527,12 +804,14 @@ impl IoBridge {
     ///
     /// Used by the submit-failure path and by `take_completions` cleanup.
     /// Removes the operation from the submission order as well, so a stale
-    /// late completion can never match a future operation.
+    /// late completion can never match a future operation. Any queued
+    /// reader chunks for the operation are dropped with it.
     pub(crate) fn unreserve(&self, operation_id: FileIoOperationId) {
         if let Ok(mut state) = self.state.lock() {
             state.tokens.remove(&operation_id.0);
             state.completed.remove(&operation_id.0);
             state.completions.remove(&operation_id.0);
+            state.reader_completions.remove(&operation_id.0);
             if let Some(position) = state.order.iter().position(|id| *id == operation_id.0) {
                 state.order.remove(position);
             }
@@ -543,6 +822,43 @@ impl IoBridge {
     /// Releases one slot after a polled settlement (exactly once).
     pub(crate) fn release(&self, operation_id: FileIoOperationId) {
         self.unreserve(operation_id);
+    }
+
+    /// Builds the worker task for one FileReader chunk.
+    ///
+    /// The caller must hold a live reservation for `operation_id` (the
+    /// reader's single quota slot): the chunk borrows the reservation's
+    /// cancellation token without consuming quota itself, so one completion
+    /// can never create more than one next request. `offset`/`len` are
+    /// precomputed on the Boa thread from the reader's logical position.
+    /// `params` carries `(generation, offset, len)` as one chunk window.
+    pub(crate) fn chunk_task_for(
+        self: &Arc<Self>,
+        operation_id: FileIoOperationId,
+        token: CancellationToken,
+        data: Arc<BlobData>,
+        limits: FileApiLimits,
+        params: ChunkWindow,
+    ) -> FileReaderChunkTask {
+        FileReaderChunkTask {
+            context_id: self.context_id,
+            operation_id,
+            generation: params.generation,
+            data,
+            limits,
+            offset: params.offset,
+            len: params.len,
+            cancel: token,
+            bridge: Arc::clone(self),
+        }
+    }
+
+    /// Returns the cancellation token of a live reservation, if present.
+    pub(crate) fn token_for(&self, operation_id: FileIoOperationId) -> Option<CancellationToken> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.tokens.get(&operation_id.0).cloned())
     }
 
     /// Submits a task through the configured executor with panic containment.
@@ -556,6 +872,25 @@ impl IoBridge {
     pub(crate) fn submit_guarded(&self, task: FileIoTask) -> Result<(), FileIoSubmitError> {
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.executor.submit(task)));
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Err(FileIoSubmitError::WorkerLost),
+        }
+    }
+
+    /// Submits a FileReader chunk task with the same panic containment.
+    ///
+    /// `FileReaderChunkTask` travels through the same executor queue as
+    /// whole-blob tasks: submission order decides FIFO settlement order,
+    /// no readahead is created here, and a panicking executor reports
+    /// `WorkerLost` for the terminal error path.
+    pub(crate) fn submit_reader_guarded(
+        &self,
+        task: FileReaderChunkTask,
+    ) -> Result<(), FileIoSubmitError> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.executor.submit_reader(task)
+        }));
         match outcome {
             Ok(result) => result,
             Err(_) => Err(FileIoSubmitError::WorkerLost),
@@ -643,10 +978,112 @@ impl IoBridge {
         }
     }
 
+    /// Pushes a FileReader chunk completion; drops it safely when stale.
+    ///
+    /// The operation must hold a live reservation (`tokens`): completions
+    /// for unknown, already-released, or shut-down operations are dropped
+    /// as stale without touching quota. One reader operation queues at
+    /// most one chunk at a time (the Boa thread submits the next only
+    /// after draining the previous), so the per-operation queue stays
+    /// bounded by construction; the wake hook fires after the lock is
+    /// released and is panic-contained like whole-blob completions.
+    pub(crate) fn push_reader_completion(&self, completion: FileReaderChunkCompletion) {
+        let id = completion.operation_id().0;
+        let should_wake = if let Ok(mut state) = self.state.lock() {
+            if state.shutdown || self.shutdown.is_shutdown() {
+                return;
+            }
+            if !state.tokens.contains_key(&id) {
+                return;
+            }
+            state
+                .reader_completions
+                .entry(id)
+                .or_default()
+                .push_back(completion);
+            true
+        } else {
+            return;
+        };
+        if should_wake {
+            let wake_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.wake.wake(self.context_id);
+            }));
+            let _ = wake_result;
+        }
+    }
+
+    /// Drains every queued FileReader chunk completion.
+    ///
+    /// Boa thread only, via `poll_io`. Whole-blob FIFO order is preserved
+    /// by the separate `take_completions` prefix drain; reader chunks of
+    /// one operation arrive in execution order through their own FIFO
+    /// queue, so a late out-of-order worker completion can never overtake
+    /// an earlier chunk of the same reader. Completions whose operation
+    /// lost its reservation (abort/restart/shutdown/submit failure) are
+    /// dropped as stale here.
+    pub(crate) fn take_reader_completions(&self) -> Vec<FileReaderChunkCompletion> {
+        if let Ok(mut state) = self.state.lock() {
+            let mut out = Vec::new();
+            let ids: Vec<u64> = state.order.iter().copied().collect();
+            for id in ids {
+                if let Some(queue) = state.reader_completions.get_mut(&id) {
+                    while let Some(completion) = queue.pop_front() {
+                        out.push(completion);
+                    }
+                }
+            }
+            let live: std::collections::HashSet<u64> = state.order.iter().copied().collect();
+            state
+                .reader_completions
+                .retain(|id, queue| !queue.is_empty() && live.contains(id));
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Re-queues one FileReader chunk completion at the front of its queue.
+    ///
+    /// Used by the `poll_io` fairness budget: leftovers keep their FIFO
+    /// position for the next host-loop turn.
+    pub(crate) fn requeue_reader_completion(&self, completion: FileReaderChunkCompletion) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.shutdown || self.shutdown.is_shutdown() {
+                return;
+            }
+            let id = completion.operation_id().0;
+            if !state.tokens.contains_key(&id) {
+                return;
+            }
+            state
+                .reader_completions
+                .entry(id)
+                .or_default()
+                .push_front(completion);
+        }
+    }
+
+    /// Signals the host wake hook without touching Boa or the queue.
+    ///
+    /// Used after a budget-truncated `poll_io` so the host loop schedules
+    /// the next drain. Panic-contained like completion wakes.
+    pub(crate) fn wake_host(&self) {
+        let wake_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.wake.wake(self.context_id);
+        }));
+        let _ = wake_result;
+    }
+
     /// Returns `true` while work is outstanding or completions wait.
     pub(crate) fn has_pending(&self) -> bool {
         if let Ok(state) = self.state.lock() {
-            state.active > 0 || !state.completed.is_empty()
+            state.active > 0
+                || !state.completed.is_empty()
+                || state
+                    .reader_completions
+                    .values()
+                    .any(|queue| !queue.is_empty())
         } else {
             false
         }
@@ -670,6 +1107,7 @@ impl IoBridge {
             state.tokens.clear();
             state.completions.clear();
             state.completed.clear();
+            state.reader_completions.clear();
             state.order.clear();
             state.active = 0;
         }
@@ -679,10 +1117,11 @@ impl IoBridge {
 /// Built-in bounded file I/O executor (fixed workers, bounded queue).
 ///
 /// Spawns `worker_count` threads sharing one bounded queue of capacity
-/// `queue_cap`. `submit` never blocks: a full queue returns
+/// `queue_cap`. `submit`/`submit_reader` never block: a full queue returns
 /// [`FileIoSubmitError::QueueFull`]. Workers run [`FileIoTask::execute`]
-/// and exit when the executor is dropped. No thread-per-read, no unbounded
-/// growth, no Boa access from workers.
+/// or [`FileReaderChunkTask::execute`] and exit when the executor is
+/// dropped. No thread-per-read, no unbounded growth, no Boa access from
+/// workers.
 ///
 /// `poll_io` never waits: it only drains already-queued completions. Hosts
 /// that want prompt settlement wait on the [`FileIoWake`] signal (or their
@@ -692,8 +1131,14 @@ pub struct ThreadedFileIoExecutor {
     inner: Mutex<ExecutorInner>,
 }
 
+/// One queued request of the bounded pool.
+enum PoolRequest {
+    Whole(FileIoTask),
+    Chunk(FileReaderChunkTask),
+}
+
 struct ExecutorInner {
-    tx: Option<std::sync::mpsc::SyncSender<FileIoTask>>,
+    tx: Option<std::sync::mpsc::SyncSender<PoolRequest>>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -713,7 +1158,7 @@ impl ThreadedFileIoExecutor {
     pub fn new(worker_count: usize, queue_cap: usize) -> Self {
         let workers = worker_count.clamp(1, 32);
         let capacity = queue_cap.clamp(1, 4096);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<FileIoTask>(capacity);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PoolRequest>(capacity);
         let rx = Arc::new(Mutex::new(rx));
         let mut handles = Vec::new();
         let mut spawned_ok = true;
@@ -757,9 +1202,19 @@ impl Default for ThreadedFileIoExecutor {
 
 impl FileIoExecutor for ThreadedFileIoExecutor {
     fn submit(&self, task: FileIoTask) -> Result<(), FileIoSubmitError> {
-        let result = self.inner.lock().map(|inner| {
+        Self::send(&self.inner, PoolRequest::Whole(task))
+    }
+
+    fn submit_reader(&self, task: FileReaderChunkTask) -> Result<(), FileIoSubmitError> {
+        Self::send(&self.inner, PoolRequest::Chunk(task))
+    }
+}
+
+impl ThreadedFileIoExecutor {
+    fn send(inner: &Mutex<ExecutorInner>, request: PoolRequest) -> Result<(), FileIoSubmitError> {
+        let result = inner.lock().map(|inner| {
             if let Some(tx) = inner.tx.as_ref() {
-                match tx.try_send(task) {
+                match tx.try_send(request) {
                     Ok(()) => Ok(()),
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {
                         Err(FileIoSubmitError::QueueFull)
@@ -794,7 +1249,7 @@ impl Drop for ThreadedFileIoExecutor {
 }
 
 /// Worker body: receives tasks without holding the lock across I/O.
-fn worker_loop(rx: Arc<Mutex<std::sync::mpsc::Receiver<FileIoTask>>>) {
+fn worker_loop(rx: Arc<Mutex<std::sync::mpsc::Receiver<PoolRequest>>>) {
     loop {
         let task = {
             let guard = rx.lock();
@@ -808,8 +1263,10 @@ fn worker_loop(rx: Arc<Mutex<std::sync::mpsc::Receiver<FileIoTask>>>) {
                 Err(_) => return,
             }
         };
-        if let Some(task) = task {
-            task.execute();
+        match task {
+            Some(PoolRequest::Whole(task)) => task.execute(),
+            Some(PoolRequest::Chunk(task)) => task.execute(),
+            None => {}
         }
     }
 }

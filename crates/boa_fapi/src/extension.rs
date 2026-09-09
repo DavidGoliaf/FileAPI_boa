@@ -275,6 +275,24 @@ pub(crate) struct RegisteredSpecs {
     /// Context-local file I/O bridge (M9-B): quota, completion queue and
     /// executor/wake handles for promise reads.
     pub(crate) io: std::sync::Arc<crate::io::IoBridge>,
+    /// Immutable blob payloads of live FileReader operations (M9-C).
+    ///
+    /// Keyed by I/O operation id; inserted at `readAs*` time, removed at
+    /// terminal settlement, abort, or shutdown drain. The worker chunk
+    /// task clones the `Arc` (no copy, no Boa), and removal makes late
+    /// worker chunks stale. Holds no JS values.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) reader_payloads: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, std::sync::Arc<boa_fapi_core::blob::BlobData>>,
+        >,
+    >,
+    /// Fairness budget for FileReader chunk completions per `poll_io`
+    /// (M9-C): `None` drains everything queued; `Some(n)` settles at most
+    /// `n` reader chunks and re-queues the rest for the next host-loop
+    /// turn with a fresh wake.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) io_poll_budget: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
     /// Opaque identity of this registration's I/O context.
     pub(crate) context_id: crate::io::FileApiContextId,
     /// Extension configuration.
@@ -399,6 +417,44 @@ impl RegisteredSpecs {
     /// Returns the context-local I/O bridge.
     pub(crate) fn io_bridge(&self) -> std::sync::Arc<crate::io::IoBridge> {
         Arc::clone(&self.io)
+    }
+
+    /// Returns the `poll_io` reader-completion budget (`None` = unbounded).
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn io_poll_budget(&self) -> Option<usize> {
+        self.io_poll_budget.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Returns the immutable payload of a live FileReader operation.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn reader_payload(
+        &self,
+        operation: u64,
+    ) -> Option<std::sync::Arc<boa_fapi_core::blob::BlobData>> {
+        self.reader_payloads
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&operation).cloned())
+    }
+
+    /// Stores the immutable payload of a new FileReader operation.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn store_reader_payload(
+        &self,
+        operation: u64,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    ) {
+        if let Ok(mut map) = self.reader_payloads.lock() {
+            map.insert(operation, data);
+        }
+    }
+
+    /// Drops the payload of a settled FileReader operation.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn drop_reader_payload(&self, operation: u64) {
+        if let Ok(mut map) = self.reader_payloads.lock() {
+            map.remove(&operation);
+        }
     }
 
     /// Rebuilds the owning handle from a specs snapshot (test helper).
@@ -896,6 +952,12 @@ impl FileApiExtension {
             url_store: Arc::clone(&url_store),
             shutdown: shutdown.clone(),
             io: Arc::clone(&bridge),
+            #[cfg(feature = "dom-shim")]
+            reader_payloads: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "dom-shim")]
+            io_poll_budget: std::sync::Arc::new(std::sync::Mutex::new(None)),
             context_id,
             config: self.config.clone(),
             identity: self.config.identity,
@@ -1492,7 +1554,9 @@ impl FileApiHandle {
     /// rejects a foreign context without touching state. Each completion
     /// passes context/shutdown validation first; only then is the
     /// operation quota released exactly once and a Boa settlement job
-    /// enqueued. Never calls user JS directly and never holds the bridge
+    /// enqueued. FileReader chunk completions become at most one pump job
+    /// each (still through `poll_io`, never synchronously from a worker).
+    /// Never calls user JS directly and never holds the bridge
     /// mutex across Boa calls. Returns the number of completions turned
     /// into jobs.
     pub fn poll_io(&self, context: &mut Context) -> Result<usize, crate::io::PollIoError> {
@@ -1512,8 +1576,57 @@ impl FileApiHandle {
         // DTOs into Boa jobs. Slow workers stay invisible until their
         // completion lands; the host loop repeats `poll_io` after the next
         // wake (or its own event) until quiescent.
-        let completions = bridge.take_completions();
+        //
+        // M9-C FileReader chunk completions share the same bridge: they
+        // are drained first (FIFO within one reader) and each becomes at
+        // most one pump Boa job; a stale completion (abort/restart/
+        // shutdown) settles nothing. The host may bound completions per
+        // `poll_io` call (`poll_io_budget`) for fairness; leftover chunks
+        // stay queued and re-wake the host loop.
+        #[cfg(feature = "dom-shim")]
+        let budget = stored.io_poll_budget();
+        let reader_completions = bridge.take_reader_completions();
         let mut settled = 0_usize;
+        let mut reader_left = 0_usize;
+        for completion in reader_completions {
+            #[cfg(feature = "dom-shim")]
+            if budget.is_some_and(|limit| settled >= limit) {
+                reader_left += 1;
+                bridge.requeue_reader_completion(completion);
+                continue;
+            }
+            if self.is_shutdown() || bridge.is_shutdown() {
+                // Shutdown: drop the late chunk and release its quota
+                // exactly once; no job, no telemetry, no JS.
+                bridge.unreserve(completion.operation_id());
+                #[cfg(feature = "dom-shim")]
+                {
+                    stored.drop_reader_payload(completion.operation_id().get());
+                    crate::filereader::drop_pending_for_shutdown(
+                        context,
+                        completion.operation_id().get(),
+                    );
+                }
+                continue;
+            }
+            #[cfg(feature = "dom-shim")]
+            {
+                settled = settled.saturating_add(
+                    crate::filereader::settle_reader_completion(&stored, completion, context)
+                        .unwrap_or(0),
+                );
+            }
+            #[cfg(not(feature = "dom-shim"))]
+            {
+                let _ = completion;
+            }
+        }
+        // Re-queued leftovers (budget) keep the queue pending and re-wake
+        // the host so the next `poll_io` continues without starvation.
+        if reader_left > 0 {
+            bridge.wake_host();
+        }
+        let completions = bridge.take_completions();
         for completion in completions {
             if self.is_shutdown() || bridge.is_shutdown() {
                 // Shutdown: drop the late completion and release its quota
@@ -1533,6 +1646,25 @@ impl FileApiHandle {
             }
         }
         Ok(settled)
+    }
+
+    /// Bounds the FileReader chunk completions settled per `poll_io`.
+    ///
+    /// `None` (default) drains everything queued; `Some(n)` settles at
+    /// most `n` reader chunks per call and re-queues the rest for the next
+    /// host-loop turn, so one busy reader cannot starve promise reads or
+    /// other readers. Leftovers re-wake the host (`FileIoWake`).
+    pub fn set_poll_io_budget(&self, budget: Option<usize>) {
+        #[cfg(feature = "dom-shim")]
+        {
+            if let Ok(mut slot) = self.specs.io_poll_budget.lock() {
+                *slot = budget;
+            }
+        }
+        #[cfg(not(feature = "dom-shim"))]
+        {
+            let _ = budget;
+        }
     }
 
     /// Returns `true` while I/O work is outstanding or completions wait.

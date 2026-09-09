@@ -41,26 +41,26 @@ impl Clock for FixedClock {
 const FIXED_TIME: i64 = 1_700_000_000_000;
 
 /// Registers the extension into a fresh context.
-fn setup() -> Context {
+fn setup() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Registers the extension as a worker (for `FileReaderSync` packaging).
-fn setup_worker() -> Context {
+fn setup_worker() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .environment(FileApiEnvironment::DedicatedWorker)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Registers with tight blob-part/size ceilings for quota tests.
@@ -87,20 +87,43 @@ fn setup_quota(max_parts: usize, max_blob_size: u64) -> Context {
 
 /// Registers a worker context with a 16 KiB chunk ceiling (BOM-split
 /// coverage across FileReading jobs).
-fn setup_chunked_worker() -> Context {
+fn setup_chunked_worker() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     let limits = boa_fapi_core::limits::FileApiLimits {
         default_chunk_size: 16 * 1024,
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .environment(FileApiEnvironment::DedicatedWorker)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
+}
+
+/// Drives the M9-C host loop until quiescent (bounded).
+fn drain_host(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            for _ in 0..50 {
+                let _ = handle.poll_io(context);
+                context.run_jobs().expect("run_jobs");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Evaluates `source` and asserts the result is `true`.
@@ -134,7 +157,7 @@ fn assert_eval_type_error(context: &mut Context, source: &str) {
 
 #[test]
 fn m9a_idl_01_iterable_sequence_shapes() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     // Array, Set, generator, custom iterator, boxed String,
     // Uint8Array-as-outer-sequence all iterate; Blob/File share one path.
     assert_eval(context, "new Blob(['a', 'b']).size === 2");
@@ -176,7 +199,7 @@ fn m9a_idl_01_iterable_sequence_shapes() {
 
 #[test]
 fn m9a_idl_01_iterator_read_once_and_left_to_right() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     // `@@iterator` is read exactly once; elements convert left to right.
     assert_eval(
         context,
@@ -233,7 +256,7 @@ fn m9a_idl_01_iterator_read_once_and_left_to_right() {
 
 #[test]
 fn m9a_idl_02_abrupt_completion_propagates_without_close() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     // Throwing `@@iterator` propagates with its own class/message.
     assert_eval(
         context,
@@ -418,7 +441,7 @@ fn m9a_idl_02_quota_boundary_ends_infinite_iterator() {
 
 #[test]
 fn m9a_idl_03_union_fallback_for_primitive_and_object_values() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     assert_eval(context, "new Blob([123]).size === 3");
     assert_eval(context, "new Blob([true]).size === 4");
     assert_eval(context, "new Blob([false]).size === 5");
@@ -479,7 +502,7 @@ fn m9a_idl_03_union_fallback_for_primitive_and_object_values() {
 
 #[test]
 fn m9a_text_01_shared_encoding_selection() {
-    let context = &mut setup_worker();
+    let (context, _h) = &mut setup_worker();
     // Explicit label wins over the MIME charset.
     assert_eval(
         context,
@@ -589,7 +612,7 @@ fn m9a_text_01_shared_encoding_selection() {
 
 #[test]
 fn m9a_text_01_sync_matches_async_packaging() {
-    let context = &mut setup_worker();
+    let (context, h) = &mut setup_worker();
     assert_eval(
         context,
         r"
@@ -608,7 +631,7 @@ fn m9a_text_01_sync_matches_async_packaging() {
         .eval(Source::from_bytes("globalThis.m9aAsync"))
         .expect("async slot");
     // Pump the FileReading queue; the async result must equal sync.
-    let _ = context.run_jobs();
+    drain_host(context, h);
     assert_eval(context, "globalThis.m9aAsync === 'é'");
 }
 
@@ -619,7 +642,7 @@ fn m9a_text_01_sync_matches_async_packaging() {
 
 #[test]
 fn m9a_rw_02_bom_overrides_explicit_and_other_fallbacks() {
-    let context = &mut setup_worker();
+    let (context, _h) = &mut setup_worker();
     // Sync matrix: BOM wins over explicit windows-1252 and over the
     // UTF-8/MIME fallbacks; without a BOM the explicit label applies.
     assert_eval(
@@ -651,7 +674,7 @@ fn m9a_rw_02_bom_overrides_explicit_and_other_fallbacks() {
     // BOM lead — it buffers across the chunk edge — and sync/async agree
     // byte-for-byte. The BOM lands at offset 16383, so chunk 1 (16 KiB)
     // ends with EF and chunk 2 starts with BB BF 42.
-    let chunked = &mut setup_chunked_worker();
+    let (chunked, ch) = &mut setup_chunked_worker();
     assert_eval(
         chunked,
         r"
@@ -670,8 +693,8 @@ fn m9a_rw_02_bom_overrides_explicit_and_other_fallbacks() {
         })()
         ",
     );
-    let _ = chunked.run_jobs();
-    let _ = chunked.run_jobs();
+    drain_host(chunked, ch);
+    drain_host(chunked, ch);
     assert_eval(
         chunked,
         "globalThis.m9aSplitAsync === globalThis.m9aSplitSync",
@@ -684,7 +707,7 @@ fn m9a_rw_02_bom_overrides_explicit_and_other_fallbacks() {
 
 #[test]
 fn m9a_rw_02_bom_override_matches_async_path() {
-    let context = &mut setup_worker();
+    let (context, h) = &mut setup_worker();
     assert_eval(
         context,
         r"
@@ -699,13 +722,13 @@ fn m9a_rw_02_bom_override_matches_async_path() {
         })()
         ",
     );
-    let _ = context.run_jobs();
+    drain_host(context, h);
     assert_eval(context, "globalThis.m9aBomAsync === 'A'");
 }
 
 #[test]
 fn m9a_rw_13_utf8_bom_at_start_has_independent_expected_output() {
-    let context = &mut setup_chunked_worker();
+    let (context, ch2) = &mut setup_chunked_worker();
     assert_eval(
         context,
         r#"
@@ -726,7 +749,7 @@ fn m9a_rw_13_utf8_bom_at_start_has_independent_expected_output() {
         })()
         "#,
     );
-    let _ = context.run_jobs();
+    drain_host(context, ch2);
     assert_eval(
         context,
         "m9aBomAtStart.result === 'B' && m9aBomAtStart.events.join(',') === 'load'",
@@ -735,7 +758,7 @@ fn m9a_rw_13_utf8_bom_at_start_has_independent_expected_output() {
 
 #[test]
 fn m9a_rw_13_public_reader_preserves_split_multibyte_content() {
-    let context = &mut setup_chunked_worker();
+    let (context, ch2) = &mut setup_chunked_worker();
     assert_eval(
         context,
         r#"
@@ -763,7 +786,7 @@ fn m9a_rw_13_public_reader_preserves_split_multibyte_content() {
         })()
         "#,
     );
-    let _ = context.run_jobs();
+    drain_host(context, ch2);
     assert_eval(
         context,
         "m9aSplitBoundary.first === true && m9aSplitBoundary.second === true && m9aSplitBoundary.events.length === 2",
@@ -776,7 +799,7 @@ fn m9a_rw_13_public_reader_preserves_split_multibyte_content() {
 
 #[test]
 fn m9a_rw_03_arguments_convert_left_to_right() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     // throwing `fileBits[Symbol.iterator]` is observed before throwing
     // `fileName`.
     assert_eval(
@@ -869,7 +892,7 @@ fn m9a_rw_03_arguments_convert_left_to_right() {
 
 #[test]
 fn m9a_rw_04_conversion_snapshots_before_later_side_effects() {
-    let context = &mut setup_worker();
+    let (context, _h) = &mut setup_worker();
     // BufferSource bytes are copied at element-conversion time: a
     // `fileName.toString` mutating the buffer cannot change them.
     // (FileReaderSync is worker-only, so the Window-context check from
@@ -928,7 +951,7 @@ fn m9a_rw_04_conversion_snapshots_before_later_side_effects() {
 
 #[test]
 fn m9a_rw_07_decoder_consumes_expanding_and_incomplete_input() {
-    let context = &mut setup_worker();
+    let (context, h) = &mut setup_worker();
     assert_eval(
         context,
         r"
@@ -964,7 +987,7 @@ fn m9a_rw_07_decoder_consumes_expanding_and_incomplete_input() {
         })()
         ",
     );
-    let _ = context.run_jobs();
+    drain_host(context, h);
     assert_eval(
         context,
         "globalThis.m9aDecoderAsync.le === String.fromCharCode(0x0800).repeat(20000)",
@@ -983,7 +1006,7 @@ fn m9a_rw_07_decoder_consumes_expanding_and_incomplete_input() {
 
 #[test]
 fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
-    let context = &mut setup_worker();
+    let (context, h) = &mut setup_worker();
     assert_eval(
         context,
         r#"
@@ -1012,7 +1035,7 @@ fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
         })()
         "#,
     );
-    let _ = context.run_jobs();
+    drain_host(context, h);
     assert_eval(
         context,
         "m9aMimeAsync.events.join(',') === 'loadstart,progress,load,loadend' && m9aMimeAsync.result === 'é' && m9aMimeAsync.error === null",
@@ -1025,7 +1048,7 @@ fn m9a_rw_08_09_mime_parse_and_ascii_label_whitespace() {
 
 #[test]
 fn m9a_rw_10_prototype_lookup_follows_all_argument_conversions() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     assert_eval(
         context,
         r"
@@ -1055,7 +1078,7 @@ fn m9a_rw_10_prototype_lookup_follows_all_argument_conversions() {
 
 #[test]
 fn m9a_rw_10_prototype_is_not_read_after_earlier_conversion_throws() {
-    let context = &mut setup();
+    let (context, _h) = &mut setup();
     assert_eval(
         context,
         r"

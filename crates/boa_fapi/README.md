@@ -7,7 +7,7 @@ store with `URL` shim, structured-clone bridge. Web IDL conversions,
 brands, GC-safe native data.
 
 Explicit jobs loop (no background runtime): every async settlement runs
-only after the embedder drives the M9-B host loop:
+only after the embedder drives the M9-B/M9-C host loop:
 
 ```text
 wait for FileIoWake or other host event
@@ -21,6 +21,11 @@ no automatic integration with an arbitrary Boa `JobQueue` is claimed.
 Promise reads (`text()`/`arrayBuffer()`/`bytes()`) submit a Send-only
 task to the configured `FileIoExecutor` (default: bounded pool, 4
 workers / 128 queued) and settle only through a Boa job after `poll_io`.
+Async `FileReader.readAs*` submits one chunk request per drained
+completion through the same executor (no readahead, FIFO within one
+reader) and dispatches events only from `poll_io` pump jobs; the host may
+bound reader completions per `poll_io` with
+`handle.set_poll_io_budget(Some(n))` for fairness.
 
 Host File/capability boundary: filesystem `File` enters only via
 `FileApiHandle::file_from_resource` with a pre-opened registry slot; JS
@@ -50,6 +55,7 @@ Run:
 ```sh
 cargo test --package boa_fapi --all-features
 cargo test --package boa_fapi --test m9_promise_io -- --nocapture
+cargo test --package boa_fapi --test m9_filereader_io -- --nocapture
 cargo test --package boa_fapi --test m8_observability --all-features -- --nocapture
 ```
 

@@ -105,6 +105,38 @@ fn publish(context: &mut Context, name: &str, object: boa_engine::JsObject) {
         .expect("publish");
 }
 
+/// Drives the M9-B/M9-C host loop until quiescent (bounded).
+///
+/// FileReader chunk I/O completes on the executor: `poll_io` turns each
+/// drained chunk into a pump Boa job, then `run_jobs` delivers it. The
+/// bounded yield is a hang guard for the threaded pool only.
+fn drive_host(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs failed");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                context.run_jobs().expect("run_jobs failed");
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
 // ── Blob / File / FileList ──────────────────────────────────────────
 
 #[test]
@@ -252,7 +284,7 @@ fn streams_deliver_chunks_on_demand_after_jobs() {
 
 #[test]
 fn filereader_state_events_result() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         "var r = new FileReader(); \
@@ -270,8 +302,8 @@ fn filereader_state_events_result() {
         ))
         .expect("start read");
     assert_eval(&mut context, "globalThis.acceptReader.readyState === 1");
-    context.run_jobs().expect("run_jobs");
-    context.run_jobs().expect("run_jobs");
+    // M9-C host loop: `poll_io` turns the worker chunk into a pump job.
+    drive_host(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.acceptReader.readyState === 2 \
@@ -283,7 +315,7 @@ fn filereader_state_events_result() {
 
 #[test]
 fn filereader_abort_events_and_null_error() {
-    let (mut context, _handle) = setup();
+    let (mut context, handle) = setup();
     context
         .eval(Source::from_bytes(
             "globalThis.abortLog = []; \
@@ -294,8 +326,7 @@ fn filereader_abort_events_and_null_error() {
              globalThis.abortReader.abort();",
         ))
         .expect("abort");
-    context.run_jobs().expect("run_jobs");
-    context.run_jobs().expect("run_jobs");
+    drive_host(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.abortReader.readyState === 2 && globalThis.abortReader.result === null \

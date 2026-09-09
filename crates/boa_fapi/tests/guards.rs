@@ -596,9 +596,13 @@ fn no_out_of_scope_surface() {
     // capability; `boa_fapi` production code holds no `std::fs`/`std::path`
     // itself — the `fs` feature only wires the opaque `FileResource`
     // trait. `structuredClone` as a JS global never exists: the bridge is
-    // host-side only. M9-B owns the single allowed threading site: the
+    // host-side only. M9-B/M9-C own the single allowed threading site: the
     // `io.rs` executor/worker plus its documented compatibility yield may
-    // use `std::thread`; every other module must not.)
+    // use `std::thread`; every other module must not. `filereader.rs`
+    // production code holds no threading primitive at all: its
+    // `#[cfg(test)]` drain helper spins the non-blocking `poll_io` loop
+    // without sleep/yield (the scanner strips test modules, so the
+    // production assertion below stays exact).)
     let mut all = String::new();
     for entry in walk_rs(&src) {
         let name = entry

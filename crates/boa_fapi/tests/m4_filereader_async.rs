@@ -54,20 +54,20 @@ impl Clock for StepClock {
 const FIXED_TIME: i64 = 1_700_000_000_000;
 
 /// Creates a clean context with the extension registered (default limits).
-fn setup() -> Context {
+fn setup() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a context whose injected clock walks `schedule` on every read.
-fn setup_with_clock(schedule: Vec<i64>) -> Context {
+fn setup_with_clock(schedule: Vec<i64>) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(StepClock {
             schedule,
             cursor: std::sync::atomic::AtomicUsize::new(0),
@@ -75,42 +75,42 @@ fn setup_with_clock(schedule: Vec<i64>) -> Context {
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a context with a small chunk ceiling for multichunk reads.
 ///
 /// The M3-B chunk range (`16 KiB..=1 MiB`) is the smallest observable
 /// multichunk unit through public configuration.
-fn setup_with_chunk(chunk_size: usize) -> Context {
+fn setup_with_chunk(chunk_size: usize) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     let limits = boa_fapi_core::limits::FileApiLimits {
         default_chunk_size: chunk_size,
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a context with `max_data_url_output` overridden.
-fn setup_with_data_url_limit(max_data_url_output: u64) -> Context {
+fn setup_with_data_url_limit(max_data_url_output: u64) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     let limits = boa_fapi_core::limits::FileApiLimits {
         max_data_url_output,
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Evaluates `source` and asserts that the result is `true`.
@@ -125,14 +125,27 @@ fn assert_eval(context: &mut Context, source: &str) {
     );
 }
 
-/// Drives `context.run_jobs()` until quiescent.
-///
-/// One pass runs every queued FileReading job; the second pass settles
-/// promise reactions chained off those jobs (e.g. `then` continuations
-/// recording verdicts).
-fn drain_jobs(context: &mut Context) {
-    context.run_jobs().expect("run_jobs failed");
-    context.run_jobs().expect("run_jobs failed");
+/// Drives the M9-C host loop until quiescent (bounded).
+fn drain_jobs(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs failed");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            for _ in 0..50 {
+                let _ = handle.poll_io(context);
+                context.run_jobs().expect("run_jobs failed");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -141,7 +154,7 @@ fn drain_jobs(context: &mut Context) {
 
 #[test]
 fn dom_globals_have_exact_descriptors_and_prototypes() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -172,7 +185,7 @@ fn dom_globals_have_exact_descriptors_and_prototypes() {
 
 #[test]
 fn dom_constructors_have_exact_name_and_length() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -187,7 +200,7 @@ fn dom_constructors_have_exact_name_and_length() {
 
 #[test]
 fn event_target_listener_dedupe_removal_order_and_isolation() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -226,7 +239,7 @@ fn event_target_listener_dedupe_removal_order_and_isolation() {
 
 #[test]
 fn event_and_progress_event_attributes_are_exact() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -260,7 +273,7 @@ fn event_and_progress_event_attributes_are_exact() {
 
 #[test]
 fn dom_exception_names_and_error_inheritance() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -278,7 +291,7 @@ fn dom_exception_names_and_error_inheritance() {
 
 #[test]
 fn illegal_receivers_throw_type_error_synchronously() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     for source in [
         "EventTarget.prototype.addEventListener.call({}, 'x', () => {})",
         "EventTarget.prototype.dispatchEvent.call({}, new Event('x'))",
@@ -379,7 +392,7 @@ fn dom_shim_disabled_fails_before_global_mutation() {
 
 #[test]
 fn filereader_surface_descriptors_and_initial_state() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -419,7 +432,7 @@ fn filereader_surface_descriptors_and_initial_state() {
 
 #[test]
 fn filereader_constants_are_readonly() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -442,7 +455,7 @@ fn filereader_constants_are_readonly() {
 
 #[test]
 fn filereader_construction_and_receiver_brand_checks() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     // Direct call without `new` throws `TypeError`.
     for source in ["FileReader()", "Reflect.construct(FileReader, [], Object)"] {
         let _ = source;
@@ -496,7 +509,7 @@ fn filereader_construction_and_receiver_brand_checks() {
 
 #[test]
 fn read_as_array_buffer_is_exact_and_fresh() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -509,7 +522,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -547,7 +560,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -576,7 +589,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -591,7 +604,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         "new Uint8Array(globalThis.second)[0] === 97 && new Uint8Array(globalThis.first)[0] === 0",
@@ -600,7 +613,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
 
 #[test]
 fn read_as_binary_string_preserves_nuls_and_high_bytes() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -613,7 +626,7 @@ fn read_as_binary_string_preserves_nuls_and_high_bytes() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -629,7 +642,7 @@ fn read_as_binary_string_preserves_nuls_and_high_bytes() {
 
 #[test]
 fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     // UTF-8 default, BOM handling, replacement for malformed input.
     assert_eval(
         &mut context,
@@ -657,7 +670,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -671,7 +684,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
     // Split 2/3/4-byte sequences across chunk edges stay intact: build a
     // multichunk blob (2 × 16 KiB) with a multibyte char straddling the
     // first chunk edge.
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -690,7 +703,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     // 16383 ASCII + € (1 UTF-16 unit) + 'B' + the C-fill: the byte length
     // is 32768 but the string is 2 units shorter (3 bytes -> 1 unit).
     assert_eval(
@@ -715,7 +728,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.latin === 'é'");
     // Unknown explicit label falls through to MIME/UTF-8 (never
     // `EncodingError`): success path with the full event sequence, the
@@ -757,7 +770,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         "
             ),
         );
-        drain_jobs(&mut context);
+        drain_jobs(&mut context, &handle);
         assert_eval(
             &mut context,
             &format!(
@@ -772,7 +785,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
 
 #[test]
 fn read_as_data_url_exact_packaging() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -798,7 +811,7 @@ fn read_as_data_url_exact_packaging() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -818,7 +831,7 @@ fn read_as_data_url_exact_packaging() {
 
 #[test]
 fn empty_blob_full_event_sequence_is_exact() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -842,7 +855,7 @@ fn empty_blob_full_event_sequence_is_exact() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -859,7 +872,7 @@ fn empty_blob_full_event_sequence_is_exact() {
 
 #[test]
 fn multichunk_sequence_has_final_progress_before_load() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -879,7 +892,7 @@ fn multichunk_sequence_has_final_progress_before_load() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -905,7 +918,7 @@ fn progress_throttle_uses_injected_clock() {
     // plus the final progress fire. (The fast-clock twin uses per-pump
     // +50 ms steps; exact counts are asserted on loaded values in the
     // multichunk sequence test above.)
-    let mut slow = setup_with_clock(vec![0, 0, 0, 0, 0, 0, 0, 0]);
+    let (mut slow, slow_handle) = setup_with_clock(vec![0, 0, 0, 0, 0, 0, 0, 0]);
     slow.eval(Source::from_bytes(
         "globalThis.events = []; \
          globalThis.blob = new Blob([new Uint8Array(3 * 16384)]); \
@@ -918,7 +931,7 @@ fn progress_throttle_uses_injected_clock() {
          globalThis.reader.readAsArrayBuffer(globalThis.blob);",
     ))
     .expect("setup eval");
-    drain_jobs(&mut slow);
+    drain_jobs(&mut slow, &slow_handle);
     slow.eval(Source::from_bytes(
         "globalThis.count = globalThis.events.filter(t => t === 'progress').length;",
     ))
@@ -935,7 +948,7 @@ fn progress_throttle_uses_injected_clock() {
     // Slow-chunk exception: one progress per chunk when chunks arrive less
     // often than 50 ms. A single-chunk blob always emits exactly its final
     // progress even with a frozen clock.
-    let mut single = setup_with_clock(vec![0]);
+    let (mut single, single_handle) = setup_with_clock(vec![0]);
     single
         .eval(Source::from_bytes(
             "globalThis.single = []; \
@@ -944,7 +957,7 @@ fn progress_throttle_uses_injected_clock() {
              globalThis.reader.readAsText(new Blob(['hi']));",
         ))
         .expect("setup eval");
-    drain_jobs(&mut single);
+    drain_jobs(&mut single, &single_handle);
     assert_eval(&mut single, "globalThis.single.join(',') === '2'");
 }
 
@@ -954,7 +967,7 @@ fn progress_throttle_uses_injected_clock() {
 
 #[test]
 fn second_read_while_loading_throws_invalid_state() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -976,7 +989,7 @@ fn second_read_while_loading_throws_invalid_state() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.first === 'first' && globalThis.reader.readyState === 2",
@@ -985,7 +998,7 @@ fn second_read_while_loading_throws_invalid_state() {
 
 #[test]
 fn reentrant_load_starts_new_read_and_suppresses_old_loadend() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1009,8 +1022,8 @@ fn reentrant_load_starts_new_read_and_suppresses_old_loadend() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1026,7 +1039,7 @@ fn reentrant_load_starts_new_read_and_suppresses_old_loadend() {
 
 #[test]
 fn abort_before_first_job_emits_only_abort_loadend() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1046,13 +1059,13 @@ fn abort_before_first_job_emits_only_abort_loadend() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.log.join('|') === 'abort|loadend'");
 }
 
 #[test]
 fn abort_between_chunks_suppresses_stale_events() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -1074,8 +1087,8 @@ fn abort_between_chunks_suppresses_stale_events() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1089,13 +1102,19 @@ fn abort_between_chunks_suppresses_stale_events() {
 
 #[test]
 fn reentrant_error_handler_starts_new_read() {
-    // Reentrant `error` case through a public trigger (a short source
-    // response → `NotReadableError` via the unit-tested core path is not
-    // reachable from JS, so the error path is driven by the quota guard:
-    // the `error` handler starts a new read). Only the old `loadend` is
-    // suppressed; the new operation completes intact with its full event
-    // sequence.
-    let mut context = setup();
+    // Reentrant `error` case through a deterministic public trigger: a
+    // Data-URL preflight failure (`QuotaExceededError`, synchronous, no
+    // slot consumed) whose `error` handler starts a new read. Only the old
+    // `loadend` is suppressed; the new operation completes intact with its
+    // full event sequence.
+    //
+    // (The quota-saturation trigger cannot serve here under M9-C: `fail_fast`
+    // dispatches before the 64 threaded filler chunks complete, so a restart
+    // from the handler would racily hit the still-full quota. Quota recovery
+    // itself is covered by `concurrent_read_quota_recovers_after_success_…`.)
+    let prefix = "data:;base64,";
+    let limit = (prefix.len() + 4) as u64;
+    let (mut context, handle) = setup_with_data_url_limit(limit);
     assert_eval(
         &mut context,
         r"
@@ -1111,27 +1130,20 @@ fn reentrant_error_handler_starts_new_read() {
                     return function () { globalThis.log.push(t); };
                 })(type));
             }
-            // Saturate the concurrent-read quota, then fail fast with
-            // `SecurityError` through the normal error path.
-            globalThis.fillers = [];
-            for (var i = 0; i < 64; i++) {
-                var filler = new FileReader();
-                filler.onerror = function () {};
-                filler.readAsText(new Blob(['x']));
-                globalThis.fillers.push(filler);
-            }
-            globalThis.reader.readAsText(new Blob(['abc']));
+            // 4 bytes need prefix + 8 chars > limit: synchronous preflight
+            // failure, readyState DONE with `error` set, no load yet.
+            globalThis.reader.readAsDataURL(new Blob([new Uint8Array([1, 2, 3, 4])]));
             return globalThis.reader.readyState === 2
                 && (globalThis.reader.error instanceof DOMException);
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
-        globalThis.log.join('|') === 'error:SecurityError|loadstart|progress|load|loadend'
+        globalThis.log.join('|') === 'error:QuotaExceededError|loadstart|progress|load|loadend'
         && globalThis.reader.readyState === 2
         && globalThis.reader.result === 'recovered'
         && globalThis.reader.error === null
@@ -1144,7 +1156,7 @@ fn abort_handler_restart_after_mid_chunk_abort() {
     // Reentrant `abort` case: abort mid-operation (first progress of a
     // 3-chunk blob), then restart from the `abort` handler. The old
     // `loadend` is suppressed; the new operation completes intact.
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -1170,8 +1182,8 @@ fn abort_handler_restart_after_mid_chunk_abort() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1186,7 +1198,7 @@ fn abort_handler_restart_after_mid_chunk_abort() {
 
 #[test]
 fn abort_in_empty_or_done_state_is_silent() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1214,7 +1226,7 @@ fn abort_in_empty_or_done_state_is_silent() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1232,7 +1244,7 @@ fn abort_in_empty_or_done_state_is_silent() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.count === 0");
 }
 
@@ -1241,7 +1253,7 @@ fn stale_completion_after_new_operation_is_noop() {
     // Abort, then start a new operation from the abort handler: the stale
     // first-generation jobs must not emit progress/load/error/loadend, and
     // the new result stays intact.
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -1266,8 +1278,8 @@ fn stale_completion_after_new_operation_is_noop() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1281,7 +1293,7 @@ fn stale_completion_after_new_operation_is_noop() {
 
 #[test]
 fn gc_survives_queued_filereader_jobs() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1295,7 +1307,7 @@ fn gc_survives_queued_filereader_jobs() {
         ",
     );
     boa_gc::force_collect();
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     boa_gc::force_collect();
     assert_eval(&mut context, "globalThis.verdict === 'load:gc-alive'");
 }
@@ -1313,7 +1325,7 @@ fn data_url_quota_boundary() {
     // 4-byte blob needs prefix + 8 chars, so it fails in the synchronous
     // preflight (readyState DONE with `error` set, no load yet).
     let limit = (prefix.len() + 4) as u64;
-    let mut context = setup_with_data_url_limit(limit);
+    let (mut context, handle) = setup_with_data_url_limit(limit);
     assert_eval(
         &mut context,
         r"
@@ -1334,7 +1346,7 @@ fn data_url_quota_boundary() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         "typeof globalThis.ok === 'string' && globalThis.ok.indexOf('data:;base64,') === 0",
@@ -1352,7 +1364,7 @@ fn data_url_quota_boundary() {
 fn concurrent_read_quota_recovers_after_success_error_abort() {
     // 64 active reads succeed; the 65th emits SecurityError; slots recover
     // through success, error, and abort paths.
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1372,7 +1384,7 @@ fn concurrent_read_quota_recovers_after_success_error_abort() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1395,7 +1407,7 @@ fn concurrent_read_quota_recovers_after_success_error_abort() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.again.outcome === 'recovered'");
 }
 
@@ -1754,7 +1766,7 @@ fn bounded_operation_sequences_match_pure_model() {
                 model_stale_total += model.stale_jobs;
                 let expected = model.summary();
                 // Real JS execution in a fresh Context.
-                let mut context = setup();
+                let (mut context, handle) = setup();
                 let mut setup_js = String::from(
                     "var reader = new FileReader(); \
                      var blob = new Blob(['model']); \
@@ -1780,7 +1792,7 @@ fn bounded_operation_sequences_match_pure_model() {
                             .eval(Source::from_bytes(&script))
                             .expect("model stage eval");
                     }
-                    drain_jobs(&mut context);
+                    drain_jobs(&mut context, &handle);
                 }
                 let observed: String = context
                     .eval(Source::from_bytes(
@@ -1856,7 +1868,7 @@ fn excluded_m4b_apis_are_absent() {
     // of the M4-B sync surface, workers runtime, and full-DOM names. The
     // M6 `URL` namespace (with exactly `createObjectURL`/`revokeObjectURL`)
     // is the expected M6 addition and is pinned by the M6 suites instead.
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"

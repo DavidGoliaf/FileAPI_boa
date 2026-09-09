@@ -1,12 +1,13 @@
-# Host integration (M5 filesystem, M9-B I/O loop)
+# Host integration (M5 filesystem, M9-B/M9-C I/O loop)
 
-## Promise-read I/O loop (M9-B)
+## Promise-read and FileReader I/O loop (M9-B/M9-C)
 
 `Blob.prototype.text()`, `arrayBuffer()` and `bytes()` return a pending
-`Promise` before any blocking read runs. Filesystem work runs on a
-`FileIoExecutor`; the host turns completions into Boa jobs with
-`poll_io`, then settles them with `run_jobs()`. Repeat both until the
-host and the File API queues are quiescent:
+`Promise` before any blocking read runs. Async `FileReader.readAs*`
+likewise returns (with the reader in `LOADING`) before any chunk runs.
+Filesystem work runs on a `FileIoExecutor`; the host turns completions
+into Boa jobs with `poll_io`, then settles them with `run_jobs()`. Repeat
+both until the host and the File API queues are quiescent:
 
 ```text
 wait for FileIoWake or other host event
@@ -40,9 +41,19 @@ context.run_jobs().unwrap();
 ```
 
 The built-in executor is a fixed pool with a bounded queue
-(thread-per-read without a limit is forbidden); `submit` never blocks and
-a full queue surfaces as a typed resource error. `shutdown` cancels
-outstanding work, clears queued completions, and forbids late settlement.
+(thread-per-read without a limit is forbidden); `submit` (promise reads)
+and `submit_reader` (one FileReader chunk per request, no readahead, no
+whole-blob accumulation) never block and a full queue surfaces as a typed
+resource error. `shutdown` cancels outstanding work, clears queued
+completions, and forbids late settlement.
+
+FileReader fairness: one drained chunk becomes at most one pump Boa job,
+which submits at most one next chunk request. The host may bound reader
+completions per `poll_io` with `handle.set_poll_io_budget(Some(n))`
+(`None` drains everything): leftovers keep their FIFO position and
+re-wake the host (`FileIoWake`), so a busy reader cannot starve promise
+reads or other readers. Queue and active-operation counts stay bounded by
+`FileApiLimits` (`max_concurrent_reads_per_global`, chunk ceiling).
 
 ## Opening and authorizing a resource
 

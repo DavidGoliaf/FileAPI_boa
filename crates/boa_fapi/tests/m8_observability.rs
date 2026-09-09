@@ -444,7 +444,8 @@ fn tracing_emits_only_allowlisted_fields() {
         assert_eq!(eval(&mut context, "globalThis.chunks"), "9");
         assert_eq!(eval(&mut context, "globalThis.done"), "false");
 
-        // Async FileReader.
+        // Async FileReader (M9-C host loop: `poll_io` drains the worker
+        // chunk into a pump job).
         context
             .eval(Source::from_bytes(
                 "globalThis.text = null; \
@@ -453,7 +454,7 @@ fn tracing_emits_only_allowlisted_fields() {
                  reader.readAsText(new Blob(['async-ok']));",
             ))
             .expect("eval");
-        run_jobs_boa(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.text"), "async-ok");
 
         // Sync FileReaderSync (worker env).
@@ -603,7 +604,7 @@ fn tracing_emits_terminal_result_classes() {
             .expect("eval");
 
         // cancel: abort a LOADING FileReader.
-        let (mut cancel_context, _) = setup_default();
+        let (mut cancel_context, cancel_handle) = setup_default();
         cancel_context
             .eval(Source::from_bytes(
                 "globalThis.reader = new FileReader(); \
@@ -611,18 +612,18 @@ fn tracing_emits_terminal_result_classes() {
                  reader.abort();",
             ))
             .expect("eval");
-        run_jobs_boa(&mut cancel_context);
+        run_jobs(&mut cancel_context, &cancel_handle);
 
         // encoding: a label resolving to the replacement encoding still
         // succeeds (every byte decodes to U+FFFD) with class "encoding".
-        let (mut enc_context, _) = setup_default();
+        let (mut enc_context, enc_handle) = setup_default();
         enc_context
             .eval(Source::from_bytes(
                 "globalThis.reader2 = new FileReader(); \
                  reader2.readAsText(new Blob(['x']), 'csiso2022kr');",
             ))
             .expect("eval");
-        run_jobs_boa(&mut enc_context);
+        run_jobs(&mut enc_context, &enc_handle);
 
         // invalid range + snapshot-changed via fake resources (Unix live).
         // On Windows the import is refused (permission); both are allow-listed.

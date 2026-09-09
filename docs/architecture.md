@@ -126,8 +126,12 @@ owns the host bridge; `extension.rs` owns the entry points:
   settlement with exact-once quota release;
 - the built-in `ThreadedFileIoExecutor` is a fixed pool with a bounded
   queue (thread-per-read without a limit is forbidden); tests inject a
-  controlled manual executor. The protocol is designed so M9-C (FileReader)
-  and M9-D (streams) can migrate without special-casing.
+  controlled manual executor. M9-C (FileReader) reuses the same bridge:
+  one operation slot per read, one chunk request per drained completion
+  (no readahead), FIFO within one reader, stale generations dropped
+  before any JS mutation; the host may bound reader completions per
+  `poll_io` (`set_poll_io_budget`, leftovers re-wake) so a busy reader
+  cannot starve promise reads or other readers.
 
 ### Layer 2c: `boa_fapi` streams shim (M3-B)
 `streams.rs` owns the branded `ReadableStream` shim:
@@ -164,16 +168,26 @@ asynchronous `FileReader` state machine:
   `readyState`/`result`/`error`, 6 writable `on*` handlers; initial state
   exactly `(EMPTY, null, null)`; `result` only `null`/DOMString/fresh
   `ArrayBuffer`; `error` only `null`/same-realm `DOMException`;
-- one FileReading job per read, chained per operation through the ordinary
-  Boa promise-job queue drained by `context.run_jobs()` (no threads, no
-  `run_jobs()` inside jobs, no JS from source completion); `loadstart`/
-  `progress` dispatch synchronously inside their pump job, terminal
-  `load`/`error`/`abort` (+ conditional `loadend`) through queued dispatch
-  jobs; monotonic generations make stale completions strict no-ops;
-  `progress` throttled to once per 50 ms of the injected `Clock` (one per
-  chunk when chunks are rarer), final `progress(loaded=total)` always
-  before `load`; `max_concurrent_reads_per_global` quota with exact
-  release on every terminal/abort/stale path;
+- `readAs*` validates synchronously, sets `(LOADING, null, null)`,
+  reserves one `IoBridge` slot, and submits the first chunk request to
+  the `FileIoExecutor` before returning — never a source read on the Boa
+  thread (M9-C). A worker reads exactly one bounded `[offset, offset+len)`
+  range off-thread (`FileReaderChunkTask::execute` → `read_blob_range`,
+  panic-contained) and pushes a Rust-only `FileReaderChunkCompletion`
+  (generation + chunk/EOF/typed error, never a JS object);
+- `FileApiHandle::poll_io` drains reader chunks FIFO within one reader
+  and turns each into at most one pump Boa job; the job dispatches
+  `loadstart` on the first completion (including empty-blob EOF),
+  packages bytes/text incrementally, emits throttled `progress` with a
+  final `progress(loaded=total)` before `load`, then enqueues terminal
+  `load`/`error` (+ conditional `loadend`); at most one next chunk
+  request is submitted per drained chunk;
+- `abort()` bumps the generation, cancels the worker token, releases the
+  bridge slot exactly once, and queues `abort` (+ conditional `loadend`);
+  completions of older generations (after abort/restart/shutdown) are
+  dropped in `poll_io` with no JS mutation, event, telemetry, or second
+  release; quota mirrors the bridge (`active` counter) with the same
+  65th-reader `SecurityError` fast path;
 - `readAsText` decodes incrementally through `encoding_rs` (replacement,
   split sequences, BOM); `readAsDataURL` checks `max_data_url_output`
   with checked arithmetic before allocation; memory stays O(chunk + final

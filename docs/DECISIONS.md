@@ -934,3 +934,44 @@ toolchain; отдельный dependency-ADR не нужен); `cargo-deny` не
 Последствия: trace rows `M9B-IO-01…04`, `M9B-HOST-01`; M9-C/M9-D
 мигрируют на тот же protocol без special-casing; host loop
 `poll_io`/`run_jobs` задокументирован в `docs/host-integration.md`.
+
+## ADR-0043 (M9-C): async FileReader over the M9-B executor protocol
+
+Контекст: ТЗ M9-C требует перенести асинхронный `FileReader` на
+executor/completion protocol M9-B: `filereader::run_pump` и любой Boa job
+больше не должны вызывать `BlobReader::read_next`,
+`BlobData::materialize` или `ByteSource::read_range` для
+filesystem-backed data. JS state/event semantics, generation guards,
+quota, error mapping и observable FIFO сохраняются; `FileReaderSync` не
+меняется.
+
+Решение: `io.rs` получает `FileReaderChunkTask`/`FileReaderChunkCompletion`
+(`Send + 'static`, только Rust-данные: context/operation id, generation,
+immutable `BlobData`, snapshot лимитов, `[offset, len)`, токен отмены,
+bridge — без `JsValue`/`JsObject`/`Context`/путей) и `FileIoExecutor::
+submit_reader` (default — `WorkerLost`, старые executor fail closed).
+Воркер читает ровно один bounded range через `read_blob_range`
+(`BlobData::segments_slice` в core — единственный новый accessor, без
+identity/position/content API) с panic containment как у whole-blob
+тасков. `IoBridge` держит `reader_completions: HashMap<op, VecDeque>`
+(FIFO внутри одного reader) + общий `order` для cross-reader drain
+порядка; `take_reader_completions` отдаёт в submission order,
+`requeue_reader_completion`/`wake_host` обслуживают fairness-бюджет.
+`filereader.rs`: `start_read` валидирует синхронно, ставит `LOADING`,
+резервирует слот моста, регистрирует reader root
+(`PendingReaderOps`: reader + generation) и packaging state
+(`PumpStates`), сабмитит первый чанк и возвращается до его выполнения;
+`poll_io` дренит чанки и превращает каждый максимум в один pump Boa job
+(`settle_reader_completion` с generation/shutdown/stale валидацией);
+pump пакует инкрементально, шлёт `loadstart`/throttled `progress`/final
+progress/`load`/`error` (+ conditional `loadend`), сабмитит максимум
+один следующий чанк; `abort()` бампает generation, канцеллит токен,
+релизит слот ровно один раз; stale completions дропаются без JS
+мутации/события/телеметрии/второго релиза. `set_poll_io_budget`
+ограничивает reader completions за один `poll_io` (leftovers re-wake).
+Новых зависимостей нет; `cargo-deny` не меняется.
+
+Последствия: trace rows `M9C-FR-01…06`; M4-A/`abort_races`/`abort_races_fs`/
+M8 suites зелёные через тот же host loop (`poll_io` + `run_jobs`);
+доказательство отсутствия blocking source calls в Boa jobs — поведенческий
+blocking-source тест + статичный guard в `m9_filereader_io`.
