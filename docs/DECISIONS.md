@@ -980,3 +980,108 @@ progress/`load`/`error` (+ conditional `loadend`), сабмитит максим
 M8 suites зелёные через тот же host loop (`poll_io` + `run_jobs`);
 доказательство отсутствия blocking source calls в Boa jobs — поведенческий
 blocking-source тест + статичный guard в `m9_filereader_io`.
+
+## ADR-0044 (M9-D): ReadableStream chunk I/O over the M9-B executor protocol
+
+Контекст: ТЗ M9-D требует перенести `Blob.stream()`/
+`ReadableStreamDefaultReader.read()` на общий executor/completion protocol
+M9-B: ни Promise read, ни FileReader, ни stream read не выполняют
+filesystem `read_range` внутри Boa job. Минимальный Streams shim при этом
+не превращается в полную WHATWG Streams реализацию: capability boundaries,
+brand checks и descriptors сохраняются.
+
+Решение: `io.rs` получает `StreamChunkTask`/`StreamChunkCompletion`
+(`Send + 'static`, только Rust-данные: context/operation id, generation,
+immutable `BlobData`, snapshot лимитов, `[offset, len)`, токен отмены,
+bridge — без `JsValue`/`JsObject`/`Context`/путей) и
+`FileIoExecutor::submit_stream` (default — `WorkerLost`, старые executor
+fail closed, как `submit_reader` в M9-C). Воркер читает ровно один bounded
+range через общий `read_blob_range` с panic containment как у остальных
+тасков; EOF выводится на воркере (`offset == total`, без source read).
+`IoBridge` держит `stream_completions: HashMap<op, VecDeque>` (FIFO внутри
+одного стрима; при максимум одном in-flight чанке на стрим переупорядочивание
+невозможно по построению) + `chunk_reservations: BTreeSet<op>` (метка
+chunk-резерваций, чтобы `take_completions` пропускал живые chunk id при
+сканировании whole-blob префикса: chunk id никогда не несут whole-blob
+completion, поэтому не блокируют и не входят в promise FIFO — включая
+состояние после drain очереди, пока резервация жива: стримы держат слот
+после EOF, FileReader — между чанками). Built-in pool обслуживает третий
+вид запросов через ту же bounded очередь (`PoolRequest::Stream`).
+`streams.rs`: `create_stream` валидирует синхронно, чекает chunk ceiling
+контекста (`16 KiB..=1 MiB`), резервирует один слот моста на стрим,
+регистрирует stream root (`PendingStreamOps`) и payload
+(`RegisteredSpecs::stream_payloads`), сабмитит ничего — первый запрос
+уходит только по первому `read()`. Каждый `read()` создаёт pending Promise
+и FIFO demand slot (резолверы — в GC-traced `PendingStreamReads` до
+`poll_io`); при пустой очереди и отсутствии in-flight сабмитится ровно один
+bounded запрос (никакого read-ahead: N `read()` — максимум один in-flight).
+`poll_io` дренит stream completions и превращает каждый максимум в один
+settlement Boa job (`settle_stream_completion` с
+operation/generation/shutdown/stale валидацией + восстановлением
+slot+resolvers при generation-mismatch, чтобы demand не исчезал);
+`settle_stream_chunk` пакует чанк (свежий `Uint8Array`/инкрементальный
+UTF-8 без пустых `done:false`), двигает курсор и сабмитит следующий запрос
+при ожидающем спросе; `settle_stream_eof` отдаёт decoder flush как финальный
+value chunk (если непуст) и резолвит все queued/future reads done;
+`fail_stream_with` сохраняет mapped класс (центральный `dom::map_core_error`)
+и реджектит все queued reads + replay для future без новых source reads.
+`cancel()` (stream/reader) выигрывает синхронно на вызывающем стеке:
+сеттлит queued reads done через их jobs, бампает generation, канцеллит
+токен, релизит слот ровно один раз; поздний воркер дропается как stale.
+`releaseLock` отказывает при queued/in-flight demand (late completion не
+теряется). Shutdown дропает pending roots/resolvers без JS и телеметрии.
+Текстовый режим без пустых чанков: чанк без текста re-queue'ит тот же demand
+с тем же sequence key до следующего воркер-чанка. Новых зависимостей нет;
+`cargo-deny` не меняется. Поведенческое отличие от M3-B зафиксировано:
+`cancel()` до I/O сеттлит queued read done (`done:true`), а не чанком —
+M3-B тест `reader_cancel_makes_queued_and_future_reads_done` обновлён под
+нормативный M9-D контракт с объяснением в handoff.
+
+Последствия: trace rows `M9D-STR-01…05`; M3-B/M3-A/M4-A/M4-B/M5/appendix/M8
+suites зелёные через host loop (`poll_io` + `run_jobs`; M3-B сюита
+мигрирована с `run_jobs`-only на host loop без ослабления assertions);
+доказательство отсутствия blocking source calls в Boa jobs — поведенческий
+blocking-source тест + статичный guard `stream_has_no_sync_read_fallback`
+в `guards.rs` (+ дублирующий тест в `m9_stream_io`).
+
+## ADR-0045 (M9-D-R1): terminal EOF lifecycle для Streams I/O
+
+Контекст: приёмка M9-D выявила два P0-дефекта EOF lifecycle в `streams.rs`.
+P0-1: `settle_stream_eof` намеренно оставлял `IoBridge` reservation живой,
+что противоречит M9-D §3 (quota/active counter освобождается ровно один раз
+на EOF/error/cancel/drop): при малом `max_concurrent_reads` следующий stream
+блокируется, пока жив первый объект. P0-2: text-tail EOF (непустой
+`decoder.flush()`) возвращался раньше, не устанавливая terminal state
+(`data = None`, `in_flight = false`, завершение reservation), поэтому
+следующий `read()` не брал корректный terminal fast path и lifecycle
+расходился с обычным EOF.
+
+Решение: общая `transition_stream_eof(shared, operation, context)` в
+`streams.rs` — единственная terminal-EOF transition для обоих путей
+(обычный EOF и text-tail EOF): очистка payload-курсора (`data = None`,
+`in_flight = false`), удаление live operation root и payload, ровно один
+`IoBridge::unreserve` — всё до постановки Promise jobs. Идемпотентна:
+когда operation root уже удалён (late completion в гонке с transition),
+drop payload и bridge release пропускаются, поэтому двойной release и
+второй drop невозможны. Tail остаётся единственным финальным
+`{ value, done: false }` для текущего demand; queued demands получают
+`{ value: undefined, done: true }` FIFO через `drain_queue_done`. После
+transition future `read()` резолвится `done: true` через существующий
+terminal fast path (`data.is_none()`) без worker task, source read, нового
+reservation или telemetry-дубликата (late completion после EOF упирается в
+unknown-operation guard в `settle_stream_completion`: strict no-op без JS
+mutation, telemetry и второго release). Stale-guard в
+`settle_stream_completion` при generation-mismatch больше не восстанавливает
+slot/resolvers и не пересабмитит: demand после terminal transition уже
+засеттлен, восстановление воскресило бы его и погнало бы worker I/O за
+terminal state — теперь strict no-op. Contracts cancel/error/releaseLock,
+public descriptors и Streams capability boundary не меняются; scheduling/
+backpressure за пределами terminal EOF не меняются. Новых зависимостей нет;
+`cargo-deny` не меняется.
+
+Последствия: trace rows `M9D-STR-02` (terminal EOF + text-tail EOF) и
+`M9D-STR-04` (quota recovery именно после EOF, без cancel/drop);
+`quota_recovery_after_eof_error_and_cancel` переписан: доказывает recovery
+после EOF, затем после error, затем после cancel (до R1 доказывал только
+cancel-recovery); новые тесты `text_tail_eof_terminates_state_and_frees_quota`
+и `eof_late_completion_is_strict_noop_without_second_telemetry`.

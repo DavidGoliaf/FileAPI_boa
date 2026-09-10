@@ -133,19 +133,35 @@ owns the host bridge; `extension.rs` owns the entry points:
   `poll_io` (`set_poll_io_budget`, leftovers re-wake) so a busy reader
   cannot starve promise reads or other readers.
 
-### Layer 2c: `boa_fapi` streams shim (M3-B)
+### Layer 2c: `boa_fapi` streams shim (M3-B surface, M9-D I/O)
 `streams.rs` owns the branded `ReadableStream` shim:
 
 - `Blob.prototype.stream()`/`textStream()` (Blob-brand only, inherited by
-  `File`) create fresh unlocked streams backed by a bounded `BlobReader`;
-  nothing is read until `reader.read()`;
-- each `read()` creates one pending promise and enqueues exactly one
-  `PromiseJob` that pumps at most one `read_next()` chunk: fresh
-  `Uint8Array` or incremental UTF-8 string, `{value, done}` settlement,
-  EOF with decoder flush, sticky terminal error/cancel states;
+  `File`) create fresh unlocked streams that reserve one `IoBridge` slot
+  and register a stream root; nothing is read until `reader.read()`;
+- each `read()` creates one pending promise plus one FIFO demand slot and
+  submits at most one bounded `StreamChunkTask` when nothing is in flight
+  (no read-ahead): the worker reads exactly one `[loaded, loaded+chunk)`
+  range off-thread through `read_blob_range` and pushes a Rust-only
+  `StreamChunkCompletion` (chunk/EOF/typed error, never a JS object);
+- `FileApiHandle::poll_io` drains stream completions FIFO per stream and
+  turns each into at most one settlement Boa job (fresh `Uint8Array` or
+  incremental UTF-8 string, `{value, done}` settlement, EOF with decoder
+  flush and queued/future done, sticky terminal error/cancel states with
+  stored mapped `DOMException` replay and no further source reads);
+- at most one chunk is in flight per stream; chunk reservations are tracked
+  in `IoBridge::chunk_reservations` so whole-blob promise FIFO never blocks
+  behind live streams; every terminal path (EOF, error, cancel, shutdown)
+  frees its quota exactly once via a shared terminal-EOF transition
+  (`transition_stream_eof`: payload cursor cleared, operation root and
+  payload removed, one `IoBridge::unreserve`, all before any Promise job is
+  queued; idempotent, so a late completion can never double-release). After
+  terminal EOF future `read()` calls resolve done without worker contact;
 - `ReadableStream`/`ReadableStreamDefaultReader` constructors reject direct
-  `new`; `getReader` locks, `releaseLock` unlocks only with no queued read,
-  stream/reader `cancel()` resolve `undefined` idempotently through jobs;
+  `new`; `getReader` locks, `releaseLock` unlocks only with no queued read
+  and no in-flight I/O, stream/reader `cancel()` settle queued reads done
+  synchronously on the calling stack (cancel promise resolves `undefined`
+  through one Boa job) and make the in-flight chunk stale;
 - after M4-A stream errors reject with the central mapped `DOMException`
   (same mapping as promise reads and FileReader), not a plain `Error`.
 

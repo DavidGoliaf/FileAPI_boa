@@ -17,7 +17,9 @@
 //! `DOMException` mapping.
 //!
 //! M3-B adds the capability-checked `ReadableStream` shim for
-//! `Blob.prototype.stream()`/`textStream()`.
+//! `Blob.prototype.stream()`/`textStream()` (M9-D: chunk I/O runs
+//! off-thread on the M9-B executor; settlement runs through
+//! `FileApiHandle::poll_io` + `Context::run_jobs()`).
 //!
 //! M4-A adds the minimal self-contained `dom-shim` (`EventTarget`, `Event`,
 //! `ProgressEvent`, `DOMException`) and the asynchronous `FileReader` for
@@ -117,5 +119,5 @@ pub use extension::{
 pub use io::{
     FileApiContextId, FileIoCompletion, FileIoExecutor, FileIoOperationId, FileIoSubmitError,
     FileIoTask, FileIoWake, FileReaderChunkCompletion, FileReaderChunkTask, NoopWake, PollIoError,
-    ThreadedFileIoExecutor,
+    StreamChunkCompletion, StreamChunkTask, ThreadedFileIoExecutor,
 };

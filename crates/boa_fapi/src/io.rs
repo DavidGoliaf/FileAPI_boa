@@ -148,21 +148,23 @@ pub enum PollIoError {
     ForeignContext,
 }
 
-/// Host executor for [`FileIoTask`] and [`FileReaderChunkTask`].
+/// Host executor for [`FileIoTask`], [`FileReaderChunkTask`] and
+/// [`StreamChunkTask`].
 ///
 /// Implementations run the task off the Boa thread and never touch Boa.
 /// The built-in [`ThreadedFileIoExecutor`] uses a fixed worker pool with a
 /// bounded queue; thread-per-read without a limit is forbidden by contract.
 /// Tests inject a controlled manual executor through the builder.
 ///
-/// Both task kinds share one bounded queue: whole-blob promise tasks via
-/// `submit`, FileReader chunk tasks via `submit_reader`. A custom executor
-/// that only implements `submit` still works: `submit_reader` has a
-/// default body that runs the chunk task inline is forbidden — instead
-/// the default forwards through the same queue contract by executing the
-/// chunk task directly on the calling thread is also forbidden. The
-/// default therefore returns `WorkerLost` so custom executors must opt in
-/// explicitly; the built-in pool and the test manual executor handle both.
+/// All task kinds share one bounded queue: whole-blob promise tasks via
+/// `submit`, FileReader chunk tasks via `submit_reader`, stream chunk tasks
+/// via `submit_stream`. A custom executor that only implements `submit`
+/// still works: `submit_reader`/`submit_stream` have a default body that
+/// runs the chunk task inline is forbidden — instead the default forwards
+/// through the same queue contract by executing the chunk task directly on
+/// the calling thread is also forbidden. The default therefore returns
+/// `WorkerLost` so custom executors must opt in explicitly; the built-in
+/// pool and the test manual executor handle all three.
 pub trait FileIoExecutor: Send + Sync + 'static {
     /// Queues `task` for off-thread execution.
     ///
@@ -180,6 +182,19 @@ pub trait FileIoExecutor: Send + Sync + 'static {
     /// fail closed through the typed terminal path instead of silently
     /// dropping chunk work.
     fn submit_reader(&self, task: FileReaderChunkTask) -> Result<(), FileIoSubmitError> {
+        let _ = task;
+        Err(FileIoSubmitError::WorkerLost)
+    }
+
+    /// Queues a stream chunk `task` for off-thread execution (M9-D).
+    ///
+    /// Same contract as `submit_reader`: must not block the Boa thread,
+    /// must not run user JS, must execute exactly the chunk request (one
+    /// bounded `read_range`, no readahead, no whole-blob accumulation).
+    /// The default body reports `WorkerLost` so executors written before
+    /// M9-D fail closed through the typed terminal path instead of
+    /// silently dropping stream chunk work.
+    fn submit_stream(&self, task: StreamChunkTask) -> Result<(), FileIoSubmitError> {
         let _ = task;
         Err(FileIoSubmitError::WorkerLost)
     }
@@ -571,6 +586,169 @@ impl std::fmt::Debug for FileReaderChunkTask {
     }
 }
 
+/// Rust-only stream chunk I/O result delivered to the Boa thread via
+/// `poll_io` (M9-D).
+///
+/// Carries the stream `generation` alongside one chunk read: a chunk, EOF,
+/// or a typed [`FileApiError`]. Packaging into a fresh `Uint8Array` (or
+/// decoding into a string) happens on the Boa thread after `poll_io`.
+/// `Debug` shows only ids, the generation, and the payload kind — never
+/// bytes, paths, or source detail.
+#[derive(Debug)]
+pub struct StreamChunkCompletion {
+    context_id: FileApiContextId,
+    operation_id: FileIoOperationId,
+    generation: u64,
+    kind: StreamChunkKind,
+}
+
+impl StreamChunkCompletion {
+    /// Returns the owning context id.
+    pub fn context_id(&self) -> FileApiContextId {
+        self.context_id
+    }
+
+    /// Returns the operation id (quota ownership / submission order).
+    pub fn operation_id(&self) -> FileIoOperationId {
+        self.operation_id
+    }
+
+    /// Returns the stream generation this chunk belongs to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Takes the chunk payload out of the completion.
+    pub(crate) fn into_kind(self) -> StreamChunkKind {
+        self.kind
+    }
+}
+
+/// Payload of one stream worker chunk (M9-D).
+#[derive(Debug)]
+pub(crate) enum StreamChunkKind {
+    /// One chunk of `min(chunk_size, remaining)` bytes.
+    Chunk(bytes::Bytes),
+    /// End of input at dispatch time (`loaded == total`).
+    Eof,
+    /// Typed worker/bridge failure (`Cancelled`, source error, ...).
+    Error(FileApiError),
+}
+
+/// Send-only stream chunk request executed off the Boa thread (M9-D).
+///
+/// Holds only Rust data: the owning context/operation ids, the stream
+/// generation, the immutable blob payload, the snapshot of limits, the
+/// logical position to read, and the shared completion bridge. Holds no
+/// `JsValue`, `JsObject`, `Context`, realm pointer, or host path. `Debug`
+/// shows only opaque ids, never content or paths.
+pub struct StreamChunkTask {
+    context_id: FileApiContextId,
+    operation_id: FileIoOperationId,
+    generation: u64,
+    data: Arc<BlobData>,
+    limits: FileApiLimits,
+    offset: u64,
+    len: u64,
+    cancel: CancellationToken,
+    bridge: Arc<IoBridge>,
+}
+
+impl StreamChunkTask {
+    /// Returns the owning context id.
+    pub fn context_id(&self) -> FileApiContextId {
+        self.context_id
+    }
+
+    /// Returns the operation id (quota ownership / stream order).
+    pub fn operation_id(&self) -> FileIoOperationId {
+        self.operation_id
+    }
+
+    /// Returns the stream generation this chunk belongs to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the logical start offset of this chunk.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the requested length of this chunk.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns `true` when the requested chunk length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Cancels the task's cooperative token (cancel/shutdown path).
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Executes one bounded chunk read and pushes its completion.
+    ///
+    /// Runs only on a worker thread: performs exactly one bounded
+    /// `read_blob_range` for the precomputed `[offset, offset+len)`.
+    /// EOF is derived here (`offset == total`) so the bridge never
+    /// fabricates one. Panics from host sources are contained exactly like
+    /// whole-blob tasks and settle as a stable `Internal` error. The wake
+    /// hook fires after the bridge lock is released.
+    pub fn execute(self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.bridge.is_shutdown() || self.cancel.is_cancelled() {
+                let _ = self.data.size();
+                return Err(FileApiError::Cancelled);
+            }
+            if self.offset == self.data.size() {
+                return Ok(None);
+            }
+            let end = self.offset.saturating_add(self.len).min(self.data.size());
+            if end <= self.offset || end > self.data.size() {
+                return Err(FileApiError::InvalidRange);
+            }
+            match read_blob_range(&self.data, self.offset, end, &self.limits, &self.cancel) {
+                Ok(chunk) => {
+                    let expected = (end - self.offset) as usize;
+                    if chunk.len() != expected {
+                        Err(FileApiError::InvalidRange)
+                    } else {
+                        Ok(Some(chunk))
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }));
+        let kind = match result {
+            Ok(Ok(None)) => StreamChunkKind::Eof,
+            Ok(Ok(Some(chunk))) => StreamChunkKind::Chunk(chunk),
+            Ok(Err(error)) => StreamChunkKind::Error(error),
+            Err(_) => StreamChunkKind::Error(FileApiError::Internal),
+        };
+        self.bridge.push_stream_completion(StreamChunkCompletion {
+            context_id: self.context_id,
+            operation_id: self.operation_id,
+            generation: self.generation,
+            kind,
+        });
+    }
+}
+
+impl std::fmt::Debug for StreamChunkTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamChunkTask")
+            .field("context_id", &self.context_id.0)
+            .field("operation_id", &self.operation_id.0)
+            .field("generation", &self.generation)
+            .field("size", &self.data.size())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Reads `[start, end)` of a blob without touching Boa or whole-blob
 /// accumulation.
 ///
@@ -683,6 +861,22 @@ struct BridgeState {
     /// thread drains them in push order through `take_reader_completions`
     /// (FIFO within one reader). Entries never contain JS values.
     reader_completions: HashMap<u64, VecDeque<FileReaderChunkCompletion>>,
+    /// Stream chunk completions keyed by operation id (M9-D). One stream
+    /// holds exactly one reserved slot (`tokens`/`order` shared with
+    /// promise reads and FileReader); at most one chunk is in flight per
+    /// stream, so each queue holds at most one entry by construction.
+    /// Entries never contain JS values.
+    stream_completions: HashMap<u64, VecDeque<StreamChunkCompletion>>,
+    /// Operation ids owned by chunk (FileReader/stream) reservations.
+    ///
+    /// Marked at the first chunk push for the id and cleared at
+    /// `unreserve`/`shutdown`. Lets `take_completions` skip live chunk
+    /// reservations when scanning the whole-blob prefix: chunk ids never
+    /// carry a whole-blob completion, so they must neither block nor join
+    /// the promise-read FIFO prefix — including after their chunk queue
+    /// drained while the reservation stays live (streams hold their slot
+    /// past EOF; FileReader holds its slot across chunks).
+    chunk_reservations: BTreeSet<u64>,
     /// When `true` no further ids can be minted (u64 space exhausted or a
     /// context id saturated): reservations fail as `QuotaFull` instead of
     /// reusing an id.
@@ -738,6 +932,11 @@ impl IoBridge {
     /// full, ids are exhausted, or the runtime is shut down. Ids are never
     /// reused: once the u64 space is exhausted every further reservation
     /// fails as `QuotaFull` (the runtime must be recreated).
+    ///
+    /// M9-D quota model: stream operations release their reservation at
+    /// terminal EOF (see `settle_stream_eof`), so a second stream over the
+    /// same blob reserves a fresh id — ids are consumed per stream, not
+    /// per context lifetime.
     pub(crate) fn reserve(&self) -> Result<(FileIoOperationId, CancellationToken), ReserveError> {
         if self.shutdown.is_shutdown() {
             return Err(ReserveError::Shutdown);
@@ -805,13 +1004,15 @@ impl IoBridge {
     /// Used by the submit-failure path and by `take_completions` cleanup.
     /// Removes the operation from the submission order as well, so a stale
     /// late completion can never match a future operation. Any queued
-    /// reader chunks for the operation are dropped with it.
+    /// reader/stream chunks for the operation are dropped with it.
     pub(crate) fn unreserve(&self, operation_id: FileIoOperationId) {
         if let Ok(mut state) = self.state.lock() {
             state.tokens.remove(&operation_id.0);
             state.completed.remove(&operation_id.0);
             state.completions.remove(&operation_id.0);
             state.reader_completions.remove(&operation_id.0);
+            state.stream_completions.remove(&operation_id.0);
+            state.chunk_reservations.remove(&operation_id.0);
             if let Some(position) = state.order.iter().position(|id| *id == operation_id.0) {
                 state.order.remove(position);
             }
@@ -897,6 +1098,54 @@ impl IoBridge {
         }
     }
 
+    /// Submits a stream chunk task with the same panic containment (M9-D).
+    ///
+    /// `StreamChunkTask` travels through the same executor queue as
+    /// whole-blob and FileReader tasks: at most one chunk is in flight per
+    /// stream, no readahead is created here, and a panicking executor
+    /// reports `WorkerLost` for the terminal error path.
+    pub(crate) fn submit_stream_guarded(
+        &self,
+        task: StreamChunkTask,
+    ) -> Result<(), FileIoSubmitError> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.executor.submit_stream(task)
+        }));
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Err(FileIoSubmitError::WorkerLost),
+        }
+    }
+
+    /// Builds the worker task for one stream chunk (M9-D).
+    ///
+    /// The caller must hold a live reservation for `operation_id` (the
+    /// stream's single quota slot): the chunk borrows the reservation's
+    /// cancellation token without consuming quota itself, so one demand can
+    /// never create more than one in-flight request. `offset`/`len` are
+    /// precomputed on the Boa thread from the stream's logical position.
+    /// `params` carries `(generation, offset, len)` as one chunk window.
+    pub(crate) fn stream_task_for(
+        self: &Arc<Self>,
+        operation_id: FileIoOperationId,
+        token: CancellationToken,
+        data: Arc<BlobData>,
+        limits: FileApiLimits,
+        params: ChunkWindow,
+    ) -> StreamChunkTask {
+        StreamChunkTask {
+            context_id: self.context_id,
+            operation_id,
+            generation: params.generation,
+            data,
+            limits,
+            offset: params.offset,
+            len: params.len,
+            cancel: token,
+            bridge: Arc::clone(self),
+        }
+    }
+
     /// Pushes a worker completion; drops it safely after shutdown.
     ///
     /// By construction (one reserved completion slot per active operation
@@ -937,26 +1186,64 @@ impl IoBridge {
         }
     }
 
-    /// Drains the longest in-order prefix of queued completions.
+    /// Drains the longest in-order prefix of queued whole-blob completions.
     ///
-    /// Boa thread only, via `poll_io`. Completions are keyed by operation
-    /// id; only the prefix starting at the oldest outstanding operation is
-    /// released, in submission order, so a later-finishing worker can never
-    /// overtake an earlier submission (FIFO settlement). A completion for
-    /// an unknown id (stale or post-shutdown) is dropped without settling.
+    /// Boa thread only, via `poll_io`. Whole-blob completions are keyed by
+    /// operation id; only the prefix starting at the oldest outstanding
+    /// whole-blob operation is released, in whole-blob submission order, so
+    /// a later-finishing worker can never overtake an earlier submission
+    /// (FIFO settlement). Chunk operations (FileReader/stream) hold
+    /// reservations in the shared `order` queue but complete through their
+    /// own per-operation queues: they neither block nor join this prefix —
+    /// only whole-blob ids participate. A completion for an unknown id
+    /// (stale or post-shutdown) is dropped without settling.
     pub(crate) fn take_completions(&self) -> Vec<FileIoCompletion> {
         if let Ok(mut state) = self.state.lock() {
             let mut out = Vec::new();
-            while let Some(front) = state.order.front().copied() {
-                if !state.completed.contains(&front) {
+            // Whole-blob submission order: ids in `order` that are not
+            // chunk operations (chunk ops drain through their own queues).
+            // A chunk id is one that currently owns a chunk queue entry OR
+            // holds no whole-blob completion while a chunk queue exists for
+            // context bookkeeping: `stream_completions`/`reader_completions`
+            // entries are created only by chunk pushes, but an entry may
+            // have been drained already while the reservation stays live
+            // (streams hold their slot past EOF). Such ids must not block
+            // the whole-blob prefix either: they never carry a whole-blob
+            // completion, so the prefix scan skips them.
+            //
+            // Distinguishing rule: an id participates in the whole-blob
+            // prefix only while it has no chunk-queue entry AND (it has a
+            // whole-blob completion queued OR no chunk completion was ever
+            // pushed for it in this reservation). The bridge does not track
+            // "ever pushed" per id — instead chunk settlement removes the
+            // id from `order` at terminal chunk settlement is wrong (slots
+            // stay live past EOF by design).
+            //
+            // Practical invariant that keeps both M9-B FIFO and M9-D
+            // liveness: an id with a queued whole-blob completion always
+            // participates; an id without one participates only when it is
+            // not a live chunk reservation. A live chunk reservation is an
+            // id present in `tokens` whose most recent drain came from a
+            // chunk queue. Track that explicitly below via
+            // `chunk_reservations`.
+            let whole_ids: Vec<u64> = state
+                .order
+                .iter()
+                .copied()
+                .filter(|id| !state.chunk_reservations.contains(id))
+                .collect();
+            for id in whole_ids {
+                if !state.completed.contains(&id) {
                     break;
                 }
-                let _ = state.order.pop_front();
-                if let Some(completion) = state.completions.remove(&front) {
-                    state.completed.remove(&front);
+                if let Some(position) = state.order.iter().position(|slot| *slot == id) {
+                    state.order.remove(position);
+                }
+                if let Some(completion) = state.completions.remove(&id) {
+                    state.completed.remove(&id);
                     out.push(completion);
                 } else {
-                    state.completed.remove(&front);
+                    state.completed.remove(&id);
                 }
             }
             // Opportunistically drop completions that lost their order slot
@@ -996,6 +1283,7 @@ impl IoBridge {
             if !state.tokens.contains_key(&id) {
                 return;
             }
+            state.chunk_reservations.insert(id);
             state
                 .reader_completions
                 .entry(id)
@@ -1064,6 +1352,69 @@ impl IoBridge {
         }
     }
 
+    /// Pushes a stream chunk completion; drops it safely when stale (M9-D).
+    ///
+    /// The operation must hold a live reservation (`tokens`): completions
+    /// for unknown, already-released, or shut-down operations are dropped
+    /// as stale without touching quota. At most one chunk is in flight per
+    /// stream, so the per-operation queue stays bounded by construction;
+    /// the wake hook fires after the lock is released and is
+    /// panic-contained like whole-blob completions.
+    pub(crate) fn push_stream_completion(&self, completion: StreamChunkCompletion) {
+        let id = completion.operation_id().0;
+        let should_wake = if let Ok(mut state) = self.state.lock() {
+            if state.shutdown || self.shutdown.is_shutdown() {
+                return;
+            }
+            if !state.tokens.contains_key(&id) {
+                return;
+            }
+            state.chunk_reservations.insert(id);
+            state
+                .stream_completions
+                .entry(id)
+                .or_default()
+                .push_back(completion);
+            true
+        } else {
+            return;
+        };
+        if should_wake {
+            let wake_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.wake.wake(self.context_id);
+            }));
+            let _ = wake_result;
+        }
+    }
+
+    /// Drains every queued stream chunk completion (M9-D).
+    ///
+    /// Boa thread only, via `poll_io`. Stream chunks of one operation
+    /// arrive in execution order through their own FIFO queue; with at most
+    /// one in-flight chunk per stream, reordering is impossible by
+    /// construction. Completions whose operation lost its reservation
+    /// (cancel/error/shutdown/submit failure) are dropped as stale here.
+    pub(crate) fn take_stream_completions(&self) -> Vec<StreamChunkCompletion> {
+        if let Ok(mut state) = self.state.lock() {
+            let mut out = Vec::new();
+            let ids: Vec<u64> = state.order.iter().copied().collect();
+            for id in ids {
+                if let Some(queue) = state.stream_completions.get_mut(&id) {
+                    while let Some(completion) = queue.pop_front() {
+                        out.push(completion);
+                    }
+                }
+            }
+            let live: std::collections::HashSet<u64> = state.order.iter().copied().collect();
+            state
+                .stream_completions
+                .retain(|id, queue| !queue.is_empty() && live.contains(id));
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Signals the host wake hook without touching Boa or the queue.
     ///
     /// Used after a budget-truncated `poll_io` so the host loop schedules
@@ -1082,6 +1433,10 @@ impl IoBridge {
                 || !state.completed.is_empty()
                 || state
                     .reader_completions
+                    .values()
+                    .any(|queue| !queue.is_empty())
+                || state
+                    .stream_completions
                     .values()
                     .any(|queue| !queue.is_empty())
         } else {
@@ -1108,6 +1463,8 @@ impl IoBridge {
             state.completions.clear();
             state.completed.clear();
             state.reader_completions.clear();
+            state.stream_completions.clear();
+            state.chunk_reservations.clear();
             state.order.clear();
             state.active = 0;
         }
@@ -1135,6 +1492,7 @@ pub struct ThreadedFileIoExecutor {
 enum PoolRequest {
     Whole(FileIoTask),
     Chunk(FileReaderChunkTask),
+    Stream(StreamChunkTask),
 }
 
 struct ExecutorInner {
@@ -1208,6 +1566,10 @@ impl FileIoExecutor for ThreadedFileIoExecutor {
     fn submit_reader(&self, task: FileReaderChunkTask) -> Result<(), FileIoSubmitError> {
         Self::send(&self.inner, PoolRequest::Chunk(task))
     }
+
+    fn submit_stream(&self, task: StreamChunkTask) -> Result<(), FileIoSubmitError> {
+        Self::send(&self.inner, PoolRequest::Stream(task))
+    }
 }
 
 impl ThreadedFileIoExecutor {
@@ -1266,6 +1628,7 @@ fn worker_loop(rx: Arc<Mutex<std::sync::mpsc::Receiver<PoolRequest>>>) {
         match task {
             Some(PoolRequest::Whole(task)) => task.execute(),
             Some(PoolRequest::Chunk(task)) => task.execute(),
+            Some(PoolRequest::Stream(task)) => task.execute(),
             None => {}
         }
     }
@@ -1306,5 +1669,46 @@ mod tests {
         assert!(matches!(bridge.reserve(), Err(ReserveError::QuotaFull)));
         // The counter is saturated: another reservation cannot wrap to 1.
         assert!(matches!(bridge.reserve(), Err(ReserveError::QuotaFull)));
+    }
+
+    #[test]
+    fn late_stream_completion_after_eof_release_is_a_strict_noop() {
+        let bridge = IoBridge::new(
+            FileApiContextId(8),
+            1,
+            Arc::new(RejectingExecutor),
+            Arc::new(NoopWake),
+            crate::lifecycle::ShutdownFlag::new(),
+        );
+        let reserved = bridge.reserve();
+        assert!(reserved.is_ok(), "first reservation must succeed");
+        let Ok((eof_operation, _)) = reserved else {
+            return;
+        };
+        // This models the EOF transition: the operation is terminal and its
+        // slot is free before any late worker completion can be accepted.
+        bridge.unreserve(eof_operation);
+        let replacement = bridge.reserve();
+        assert!(replacement.is_ok(), "replacement reservation must succeed");
+        let Ok((live_operation, _)) = replacement else {
+            return;
+        };
+
+        bridge.push_stream_completion(StreamChunkCompletion {
+            context_id: FileApiContextId(8),
+            operation_id: eof_operation,
+            generation: 1,
+            kind: StreamChunkKind::Eof,
+        });
+
+        assert!(
+            bridge.take_stream_completions().is_empty(),
+            "late completion must not be delivered to poll_io"
+        );
+        assert!(
+            matches!(bridge.state.lock().map(|state| state.active), Ok(1)),
+            "late completion must not release the replacement stream slot"
+        );
+        bridge.unreserve(live_operation);
     }
 }

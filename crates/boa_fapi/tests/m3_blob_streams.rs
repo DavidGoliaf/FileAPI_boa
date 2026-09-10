@@ -2,14 +2,13 @@
 //!
 //! Every test uses a fresh real `boa_engine::Context`, registers the
 //! extension, executes JavaScript, and drives settlement explicitly with
-//! `context.run_jobs()` (streams settle through Boa jobs alone). Demand,
-//! FIFO order, EOF, cancellation, and error paths are proven through
-//! JS-observable state only. Garbage-collection safety of pending reads is
-//! proven by the deterministic `boa_gc` path in `streams::tests`
-//! (resolvers live in job captures, never in shared state).
-//!
-//! The one body that additionally awaits a promise read
-//! (`two_streams_are_independent`) drives the M9-B host loop instead.
+//! the M9-D host loop (`handle.poll_io(&mut context)` +
+//! `context.run_jobs()`): stream chunks are produced off-thread by the
+//! `FileIoExecutor` worker and settle only through `poll_io` Boa jobs.
+//! Demand, FIFO order, EOF, cancellation, and error paths are proven
+//! through JS-observable state only. Garbage-collection safety of pending
+//! reads is proven by the deterministic `boa_gc` path in `streams::tests`
+//! (resolvers live in the GC-traced pending table, never in shared state).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -33,30 +32,72 @@ impl Clock for FixedClock {
 const FIXED_TIME: i64 = 1_700_000_000_000;
 
 /// Creates a clean context with the extension registered (default limits).
-fn setup() -> Context {
+fn setup() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a clean context with `default_chunk_size` overridden.
-fn setup_with_chunk(chunk_size: usize) -> Context {
+fn setup_with_chunk(chunk_size: usize) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     let limits = boa_fapi_core::limits::FileApiLimits {
         default_chunk_size: chunk_size,
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
+}
+
+/// Drives the M9-D host loop until quiescent: `poll_io` turns worker
+/// completions into Boa jobs, `run_jobs` settles them.
+///
+/// `poll_io` is strictly non-blocking, so with the default threaded
+/// executor the loop additionally yields briefly (bounded, hang-guard
+/// only) while I/O is still outstanding before moving to the next pass.
+fn drive_host_loop(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        // Settlement jobs (async continuations awaiting a read) may have
+        // queued new demand after `run_jobs`: drain again before checking
+        // quiescence, so interleaved stream + promise reads converge.
+        let settled2 = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && settled2 == 0 && !handle.has_pending_io() {
+            // A just-settled continuation may still enqueue a job without
+            // I/O: one more probe before declaring quiescence.
+            context.run_jobs().expect("run_jobs failed");
+            let _ = handle.poll_io(context);
+            context.run_jobs().expect("run_jobs failed");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                context.run_jobs().expect("run_jobs failed");
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 /// Evaluates `source` and asserts that the result is `true`.
@@ -71,8 +112,8 @@ fn assert_eval(context: &mut Context, source: &str) {
     );
 }
 
-/// Evaluates a boolean async body, drives jobs, and asserts fulfillment.
-fn assert_async_body(context: &mut Context, body: &str) {
+/// Evaluates a boolean async body, drives the host loop, and asserts fulfillment.
+fn assert_async_body(context: &mut Context, handle: &boa_fapi::FileApiHandle, body: &str) {
     let source = format!("(async () => {{ {body} }})()");
     let value = context
         .eval(Source::from_bytes(&source))
@@ -80,7 +121,7 @@ fn assert_async_body(context: &mut Context, body: &str) {
     let promise = value
         .as_object()
         .unwrap_or_else(|| panic!("expected a promise from {source}"));
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(context, handle);
     let state = boa_engine::object::builtins::JsPromise::from_object(promise)
         .expect("promise object")
         .state();
@@ -110,7 +151,7 @@ fn assert_eval_type_error(context: &mut Context, source: &str) {
 
 #[test]
 fn stream_surface_descriptors_and_inheritance() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -158,7 +199,7 @@ fn stream_surface_descriptors_and_inheritance() {
 
 #[test]
 fn shim_constructors_and_receivers_reject_synchronously() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval_type_error(&mut context, "new ReadableStream()");
     assert_eval_type_error(&mut context, "new ReadableStreamDefaultReader()");
     assert_eval_type_error(&mut context, "Object.create(Blob.prototype).stream()");
@@ -183,7 +224,7 @@ fn shim_constructors_and_receivers_reject_synchronously() {
 fn full_streams_api_absent() {
     // M4-A adds exactly the DOM/FileReader surface; full WHATWG Streams
     // stays absent.
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -260,7 +301,7 @@ fn non_extensible_global_rejects_streams_atomically() {
 
 #[test]
 fn reads_are_pending_until_run_jobs_with_fifo_order() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -280,6 +321,7 @@ fn reads_are_pending_until_run_jobs_with_fifo_order() {
     // Pump the queue until both reactions are observable, then read the
     // log through a fresh eval (which itself may enqueue jobs, so poll).
     for _ in 0..50 {
+        let _ = handle.poll_io(&mut context);
         context.run_jobs().expect("run_jobs failed");
         let snapshot: String = context
             .eval(Source::from_bytes("globalThis.log.join(',')"))
@@ -301,9 +343,10 @@ fn reads_are_pending_until_run_jobs_with_fifo_order() {
 
 #[test]
 fn eof_repeats_without_source_reads() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var reader = new Blob(['ab']).stream().getReader();
         var first = await reader.read();
@@ -318,9 +361,10 @@ fn eof_repeats_without_source_reads() {
 
 #[test]
 fn empty_blob_resolves_done_first_read() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var out = await new Blob().stream().getReader().read();
         if (out.done !== true || out.value !== undefined) return false;
@@ -336,9 +380,10 @@ fn empty_blob_resolves_done_first_read() {
 
 #[test]
 fn byte_chunks_concatenate_exactly_with_fresh_backing() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var bytes = [];
         for (var i = 0; i < 600; i++) bytes.push(i % 251);
@@ -368,9 +413,10 @@ fn byte_chunks_concatenate_exactly_with_fresh_backing() {
 
 #[test]
 fn sixteen_kib_boundary_yields_exact_chunks() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var n = 16 * 1024;
         var blob = new Blob([new Uint8Array(n)]);
@@ -385,9 +431,10 @@ fn sixteen_kib_boundary_yields_exact_chunks() {
 
 #[test]
 fn composed_and_sliced_blobs_stream_in_order() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var composed = new Blob([new Blob(['he']), 'llo', new Uint8Array([33])]);
         var reader = composed.stream().getReader();
@@ -413,7 +460,7 @@ fn composed_and_sliced_blobs_stream_in_order() {
 
 #[test]
 fn second_chunk_not_read_before_second_demand() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -427,7 +474,7 @@ fn second_chunk_not_read_before_second_demand() {
         })()
         ",
     );
-    context.run_jobs().expect("run_jobs failed");
+    drive_host_loop(&mut context, &handle);
     // Exactly one 16 KiB chunk was produced for one demand.
     assert_eval(
         &mut context,
@@ -467,30 +514,11 @@ fn two_streams_are_independent() {
     let promise = value
         .as_object()
         .unwrap_or_else(|| panic!("expected a promise from {source}"));
-    // M9-B host loop: `poll_io` turns the worker completion into a Boa
-    // job, then `run_jobs` settles it (streams need only `run_jobs`).
-    // `poll_io` is strictly non-blocking, so the loop yields briefly
-    // (bounded, hang-guard only) while threaded I/O is outstanding.
-    for _ in 0..200 {
-        let settled = handle.poll_io(&mut context).unwrap_or(0);
-        context.run_jobs().expect("run_jobs failed");
-        if settled == 0 && !handle.has_pending_io() {
-            break;
-        }
-        if handle.has_pending_io() {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
-            while handle.has_pending_io() {
-                let _ = handle.poll_io(&mut context);
-                if !handle.has_pending_io() {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::yield_now();
-            }
-        }
-    }
+    // M9-D host loop: `poll_io` turns worker completions into Boa jobs,
+    // then `run_jobs` settles them. Reuse the shared driver (it drains
+    // continuations that queue new demand, so the interleaved stream +
+    // promise reads converge).
+    drive_host_loop(&mut context, &handle);
     let state = boa_engine::object::builtins::JsPromise::from_object(promise)
         .expect("promise object")
         .state();
@@ -507,9 +535,10 @@ fn two_streams_are_independent() {
 
 #[test]
 fn cancel_before_first_read_resolves_done() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var reader = new Blob(['hello']).stream().getReader();
         await reader.cancel();
@@ -525,7 +554,7 @@ fn cancel_before_first_read_resolves_done() {
 
 #[test]
 fn locked_stream_cancel_rejects_with_type_error() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -542,6 +571,7 @@ fn locked_stream_cancel_rejects_with_type_error() {
         ",
     );
     for _ in 0..50 {
+        let _ = handle.poll_io(&mut context);
         context.run_jobs().expect("run_jobs failed");
         let snapshot: String = context
             .eval(Source::from_bytes("globalThis.outcome"))
@@ -558,7 +588,7 @@ fn locked_stream_cancel_rejects_with_type_error() {
 
 #[test]
 fn reader_cancel_makes_queued_and_future_reads_done() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -572,6 +602,7 @@ fn reader_cancel_makes_queued_and_future_reads_done() {
         ",
     );
     for _ in 0..50 {
+        let _ = handle.poll_io(&mut context);
         context.run_jobs().expect("run_jobs failed");
         let snapshot: String = context
             .eval(Source::from_bytes("globalThis.results.join(',')"))
@@ -579,24 +610,27 @@ fn reader_cancel_makes_queued_and_future_reads_done() {
             .as_string()
             .expect("string")
             .to_std_string_escaped();
-        if snapshot == "q:false,cancelled" {
+        // M9-D: `cancel()` wins synchronously on the calling stack, so the
+        // already-queued read settles done (`q:true`), never with a chunk.
+        if snapshot == "q:true,cancelled" {
             break;
         }
     }
     assert_eval(
         &mut context,
-        "globalThis.results.join(',') === 'q:false,cancelled'",
+        "globalThis.results.join(',') === 'q:true,cancelled'",
     );
     // Future reads after cancellation are done as well.
     assert_async_body(
         &mut context,
+        &handle,
         "var out = await globalThis.reader.read(); return out.done === true;",
     );
 }
 
 #[test]
 fn release_lock_with_queued_read_throws_without_state_change() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval_type_error(
         &mut context,
         r"
@@ -622,7 +656,7 @@ fn release_lock_with_queued_read_throws_without_state_change() {
 
 #[test]
 fn released_reader_read_throws_synchronously() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval_type_error(
         &mut context,
         r"
@@ -649,9 +683,10 @@ fn released_reader_read_throws_synchronously() {
 
 #[test]
 fn release_lock_then_new_reader_works() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var stream = new Blob(['hi']).stream();
         var first = stream.getReader();
@@ -676,9 +711,10 @@ fn short_source_response_rejects_without_partial_chunk() {
     // proven through `reader()` on a valid blob plus a cancelled shared
     // state: the mechanism (terminal error, no partial chunk, same-class
     // replay) is identical for short/long/source errors.
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var reader = new Blob(['hello']).stream().getReader();
         await reader.cancel();
@@ -690,12 +726,13 @@ fn short_source_response_rejects_without_partial_chunk() {
 
 #[test]
 fn stream_core_error_rejects_plain_error_and_stays_terminal() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     // Force the terminal path with a valid blob: cancel mid-stream, then
     // prove every later read is done without new source reads, while a
     // sibling stream keeps working.
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var blob = new Blob(['abcdef']);
         var a = blob.stream().getReader();
@@ -720,9 +757,10 @@ fn stream_error_path_rejects_with_plain_error_not_range_error() {
     // a controlled failing source (unreachable via public constructors,
     // which validate ranges up front); here the JS-realm assertion shape
     // is pinned on the cancel-terminal sibling path.
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         var reader = new Blob(['x']).stream().getReader();
         await reader.cancel('reason-ignored');
@@ -783,9 +821,10 @@ fn chunk_size_config_bounds_rejected() {
     // on a valid registration always succeeds, and the bounds below stream
     // exact bytes.
     for good in [16 * 1024, 64 * 1024, 1024 * 1024] {
-        let mut context = setup_with_chunk(good);
+        let (mut context, handle) = setup_with_chunk(good);
         assert_async_body(
             &mut context,
+            &handle,
             "var r = await new Blob(['x']).stream().getReader().read(); \
              return r.done === false && r.value.length === 1;",
         );
@@ -794,9 +833,10 @@ fn chunk_size_config_bounds_rejected() {
 
 #[test]
 fn text_stream_decodes_split_multibyte_without_early_replacement() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_async_body(
         &mut context,
+        &handle,
         r"
         // U+1F600 is 4 bytes; force it to straddle the first chunk edge.
         var prefix = [];
@@ -820,9 +860,10 @@ fn text_stream_decodes_split_multibyte_without_early_replacement() {
 
 #[test]
 fn text_stream_split_at_every_boundary() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         // 'é' (2 bytes) placed so every split offset 0..3 is exercised
         // through sliced single-byte-blob streams.
@@ -854,9 +895,10 @@ fn text_stream_split_at_every_boundary() {
 
 #[test]
 fn text_stream_invalid_flush_and_no_spurious_chunks() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_async_body(
         &mut context,
+        &handle,
         r"
         // Lone 0xFF decodes immediately; truncated tail flushes at EOF.
         var reader = new Blob([new Uint8Array([65, 255, 195])]).textStream().getReader();

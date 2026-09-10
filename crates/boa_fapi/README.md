@@ -7,7 +7,7 @@ store with `URL` shim, structured-clone bridge. Web IDL conversions,
 brands, GC-safe native data.
 
 Explicit jobs loop (no background runtime): every async settlement runs
-only after the embedder drives the M9-B/M9-C host loop:
+only after the embedder drives the M9-B/M9-C/M9-D host loop:
 
 ```text
 wait for FileIoWake or other host event
@@ -25,7 +25,14 @@ Async `FileReader.readAs*` submits one chunk request per drained
 completion through the same executor (no readahead, FIFO within one
 reader) and dispatches events only from `poll_io` pump jobs; the host may
 bound reader completions per `poll_io` with
-`handle.set_poll_io_budget(Some(n))` for fairness.
+`handle.set_poll_io_budget(Some(n))` for fairness. Stream `read()` submits
+at most one bounded chunk request per demand (at most one in flight per
+stream, no readahead) through `submit_stream` and settles only through a
+Boa job after `poll_io`: one completion settles one demand, EOF runs a
+shared terminal transition (state cleared, quota released exactly once,
+before any Promise job is queued) and then resolves queued/future reads
+done, source errors reject with the stored mapped
+`DOMException` and perform no further reads.
 
 Host File/capability boundary: filesystem `File` enters only via
 `FileApiHandle::file_from_resource` with a pre-opened registry slot; JS
@@ -56,6 +63,7 @@ Run:
 cargo test --package boa_fapi --all-features
 cargo test --package boa_fapi --test m9_promise_io -- --nocapture
 cargo test --package boa_fapi --test m9_filereader_io -- --nocapture
+cargo test --package boa_fapi --test m9_stream_io -- --nocapture
 cargo test --package boa_fapi --test m8_observability --all-features -- --nocapture
 ```
 

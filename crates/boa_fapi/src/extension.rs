@@ -287,6 +287,19 @@ pub(crate) struct RegisteredSpecs {
             std::collections::HashMap<u64, std::sync::Arc<boa_fapi_core::blob::BlobData>>,
         >,
     >,
+    /// Immutable blob payloads of live stream operations (M9-D).
+    ///
+    /// Keyed by I/O operation id; inserted at `stream()`/`textStream()`
+    /// time, removed at terminal settlement (EOF/error), at `cancel()`, or
+    /// at shutdown drain. The worker chunk task clones the `Arc` (no copy,
+    /// no Boa), and removal makes late worker chunks stale. Holds no JS
+    /// values.
+    #[cfg(feature = "streams-shim")]
+    pub(crate) stream_payloads: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, std::sync::Arc<boa_fapi_core::blob::BlobData>>,
+        >,
+    >,
     /// Fairness budget for FileReader chunk completions per `poll_io`
     /// (M9-C): `None` drains everything queued; `Some(n)` settles at most
     /// `n` reader chunks and re-queues the rest for the next host-loop
@@ -453,6 +466,38 @@ impl RegisteredSpecs {
     #[cfg(feature = "dom-shim")]
     pub(crate) fn drop_reader_payload(&self, operation: u64) {
         if let Ok(mut map) = self.reader_payloads.lock() {
+            map.remove(&operation);
+        }
+    }
+
+    /// Returns the immutable payload of a live stream operation (M9-D).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn stream_payload(
+        &self,
+        operation: u64,
+    ) -> Option<std::sync::Arc<boa_fapi_core::blob::BlobData>> {
+        self.stream_payloads
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&operation).cloned())
+    }
+
+    /// Stores the immutable payload of a new stream operation (M9-D).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn store_stream_payload(
+        &self,
+        operation: u64,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    ) {
+        if let Ok(mut map) = self.stream_payloads.lock() {
+            map.insert(operation, data);
+        }
+    }
+
+    /// Drops the payload of a settled stream operation (M9-D).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn drop_stream_payload(&self, operation: u64) {
+        if let Ok(mut map) = self.stream_payloads.lock() {
             map.remove(&operation);
         }
     }
@@ -954,6 +999,10 @@ impl FileApiExtension {
             io: Arc::clone(&bridge),
             #[cfg(feature = "dom-shim")]
             reader_payloads: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "streams-shim")]
+            stream_payloads: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "dom-shim")]
@@ -1555,6 +1604,7 @@ impl FileApiHandle {
     /// passes context/shutdown validation first; only then is the
     /// operation quota released exactly once and a Boa settlement job
     /// enqueued. FileReader chunk completions become at most one pump job
+    /// each, stream chunk completions become at most one settlement job
     /// each (still through `poll_io`, never synchronously from a worker).
     /// Never calls user JS directly and never holds the bridge
     /// mutex across Boa calls. Returns the number of completions turned
@@ -1583,6 +1633,12 @@ impl FileApiHandle {
         // shutdown) settles nothing. The host may bound completions per
         // `poll_io` call (`poll_io_budget`) for fairness; leftover chunks
         // stay queued and re-wake the host loop.
+        //
+        // M9-D stream chunk completions share the same bridge as well: they
+        // drain after FileReader chunks (submission-order within the
+        // shared queue is preserved per operation kind) and each becomes at
+        // most one settlement Boa job; a stale completion (cancel/error/
+        // shutdown) settles nothing.
         #[cfg(feature = "dom-shim")]
         let budget = stored.io_poll_budget();
         let reader_completions = bridge.take_reader_completions();
@@ -1625,6 +1681,37 @@ impl FileApiHandle {
         // the host so the next `poll_io` continues without starvation.
         if reader_left > 0 {
             bridge.wake_host();
+        }
+        // M9-D stream chunks drain next, in submission order per stream.
+        // Shutdown drops the late chunk and releases its quota exactly
+        // once; a stale completion (unknown operation/generation) settles
+        // nothing inside `settle_stream_completion`.
+        #[cfg(feature = "streams-shim")]
+        {
+            let stream_completions = bridge.take_stream_completions();
+            for completion in stream_completions {
+                if self.is_shutdown() || bridge.is_shutdown() {
+                    bridge.unreserve(completion.operation_id());
+                    stored.drop_stream_payload(completion.operation_id().get());
+                    crate::streams::drop_pending_for_shutdown(
+                        context,
+                        completion.operation_id().get(),
+                    );
+                    continue;
+                }
+                settled = settled.saturating_add(
+                    crate::streams::settle_stream_completion(&stored, completion, context)
+                        .unwrap_or(0),
+                );
+            }
+        }
+        #[cfg(not(feature = "streams-shim"))]
+        {
+            // Without the shim no stream task can exist; any queued entry
+            // would be foreign — drain defensively without settling.
+            for completion in bridge.take_stream_completions() {
+                bridge.unreserve(completion.operation_id());
+            }
         }
         let completions = bridge.take_completions();
         for completion in completions {

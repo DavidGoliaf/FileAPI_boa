@@ -316,10 +316,10 @@ fn run_jobs(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
     }
 }
 
-/// Boa-only drain for FileReader/stream paths (no promise I/O involved).
-fn run_jobs_boa(context: &mut Context) {
-    context.run_jobs().expect("run_jobs");
-    context.run_jobs().expect("run_jobs");
+/// Host-loop drain for stream paths (M9-D worker I/O).
+#[allow(dead_code)]
+fn run_jobs_boa(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    run_jobs(context, handle);
 }
 
 fn eval(context: &mut Context, source: &str) -> String {
@@ -431,7 +431,8 @@ fn tracing_emits_only_allowlisted_fields() {
         run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.n"), "3");
 
-        // Stream read (one demand chunk + EOF).
+        // Stream read (one demand chunk + EOF): M9-D host loop (`poll_io`
+        // turns the worker completion into a Boa job).
         context
             .eval(Source::from_bytes(
                 "globalThis.chunks = 0; globalThis.done = false; \
@@ -440,7 +441,7 @@ fn tracing_emits_only_allowlisted_fields() {
                      globalThis.chunks = r.value.length; globalThis.done = r.done; });",
             ))
             .expect("eval");
-        run_jobs_boa(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.chunks"), "9");
         assert_eq!(eval(&mut context, "globalThis.done"), "false");
 

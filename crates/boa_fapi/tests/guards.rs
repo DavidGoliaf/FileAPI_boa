@@ -442,6 +442,62 @@ fn promise_read_has_no_sync_filesystem_fallback() {
 }
 
 #[test]
+fn stream_has_no_sync_read_fallback() {
+    // M9-D: `streams.rs` (Boa thread) must never call the blocking
+    // primitives itself. `BlobData::materialize`, `ByteSource::read_range`
+    // and `BlobReader::read_next` may appear only in comments/docs and in
+    // the `#[cfg(test)]` module (controlled unit sources); the worker entry
+    // lives in `io.rs` (`StreamChunkTask::execute` → `read_blob_range`).
+    // Behaviourally this is proven by
+    // `m9_stream_io::blocking_source_never_runs_inside_boa_job` with a
+    // gated blocking source; this guard keeps the call path absent by
+    // construction.
+    let content = read(&workspace_root().join("crates/boa_fapi/src/streams.rs"));
+    let stripped = strip_test_modules(&content);
+    for forbidden in [".materialize(", "read_range(", "read_next(", ".execute("] {
+        let mut hits = 0;
+        for line in stripped.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "streams.rs must not contain {forbidden}");
+    }
+    // The worker entry point itself is asserted present in `io.rs`, so the
+    // guard above cannot go vacuous (a rename would fail loudly here).
+    let io = read(&workspace_root().join("crates/boa_fapi/src/io.rs"));
+    for required in [
+        "struct StreamChunkTask",
+        "struct StreamChunkCompletion",
+        "fn submit_stream",
+        "fn push_stream_completion",
+        "fn take_stream_completions",
+        "fn stream_task_for",
+        "fn submit_stream_guarded",
+        "read_blob_range(&self.data",
+        "StreamChunkKind::Chunk",
+    ] {
+        assert!(io.contains(required), "io.rs must contain `{required}`");
+    }
+    // `poll_io` must drain stream completions through the Boa-thread
+    // settlement entry; docs still describe the worker contract.
+    let extension = read(&workspace_root().join("crates/boa_fapi/src/extension.rs"));
+    assert!(
+        extension.contains("settle_stream_completion"),
+        "extension.rs poll_io must settle stream completions"
+    );
+    let stream_docs = read(&workspace_root().join("crates/boa_fapi/src/streams.rs"));
+    assert!(
+        stream_docs.contains("worker"),
+        "streams.rs docs must describe the worker path"
+    );
+}
+
+#[test]
 fn sync_surface_is_bounded() {
     // M4-B registers exactly: the `FileReaderSync` global (worker
     // environments only), four prototype methods with `length = 1`, and
