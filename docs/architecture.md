@@ -166,27 +166,30 @@ owns the host bridge; `extension.rs` owns the entry points:
   sides (`StreamShared::stream_registered` / `reader_registered`, plain
   `bool`s — never counters, never `Rc::strong_count`) plus a lease
   (`StreamLease { context, operation, generation, terminal, released }` —
-  opaque ids only, no GC pointers). Claims live in the native data
-  (`StreamNative::dropped` / `ReaderNative::dropped: Cell<bool>`, the
-  latter shared with `releaseLock()` via `take_lease`): exactly one of
-  (finalize, drop, releaseLock) owns each side, so a released reader can
-  never clear the stream side and no hook decrements both sides at once.
-  Each native object captures a clone of its owning context's cleanup
-  queue at creation; the drop/finalize pair only flips its own flag and
-  publishes a `(context, operation, generation)` record into that clone
-  (no `Context`, no JS, no I/O, no global registry; the queue is
-  unbounded because at most one record per live operation can exist —
-  bounded by `max_concurrent_reads_per_global` itself). `poll_io`
-  validates each record (live op root, same generation, not terminal,
-  zero registered sides, empty queue, not in-flight; live demand is
-  demand-first with the table/bridge views as defense-in-depth) and runs
-  the single abandoned transition (token cancel, cursor clear, op root +
-  payload removal, one conditional quota release, one `stream_read`
-  event in the existing `cancelled` class — no JS event/error, no new
-  telemetry class), plus a sweep for sideless demand-less epochs that
-  never published a record. Live read-promise demand outlives endpoint
-  drops and settles first; post-settlement drains re-arm abandonment. All
-  terminal paths (EOF/error/cancel/abandoned/shutdown) arbitrate one
+  opaque ids only, no GC pointers). Publish-claims live in the native
+  data (`StreamNative::published` / `ReaderNative::published:
+  Cell<bool>`, the latter shared with `releaseLock()` via `take_lease`);
+  `Finalize`/`Drop` only lock-free publish one packed-`u64` intent into
+  the owning context's slot ring (`StreamDropIntentStack`: 4096
+  `AtomicU64` slots, CAS `0 -> packed`; no `Mutex`, no allocation, no
+  `RefCell`, no `unsafe`, no lock wait of any kind). Native data holds no
+  `Rc<RefCell>` at all — only identity integers plus the stack clone.
+  `poll_io` (the only transition site) first applies the announced side
+  clearings (with requeue-retry while the shared cell is borrowed
+  elsewhere — contention delays but never loses a clearing), then
+  validates (live op root, same generation, not terminal, zero sides,
+  empty queue, not in-flight; demand-first with the table/bridge views
+  as defense-in-depth) and runs the single abandoned transition (token
+  cancel, cursor clear, op root + payload removal, one conditional quota
+  release, one `stream_read` event in the existing `cancelled` class —
+  no JS event/error, no new telemetry class), plus a sweep for sideless
+  demand-less epochs. Live read-promise demand outlives endpoint drops
+  and settles first (terminal-lease check runs AFTER the slot pop);
+  post-settlement drains re-arm abandonment. Error replay for future
+  `read()` calls survives the op entry removal (`PendingStreamErrors`,
+  plain name/message); terminal `read()`/`cancel()`/`releaseLock()`
+  after entry removal stay idempotent and never throw "no longer live".
+  All terminal paths (EOF/error/cancel/abandoned/shutdown) arbitrate one
   exactly-once ownership; `IoBridge::unreserve` is
   conditional-idempotent (repeat release of an unknown id never touches
   another slot); creation failures after `reserve()` roll back

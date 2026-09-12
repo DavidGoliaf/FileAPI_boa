@@ -32,37 +32,54 @@ new Blob(["second"]).stream(); // было ошибочно quota-blocked
 - Стороны вместо счётчиков: `StreamShared::stream_registered` /
   `reader_registered` (plain `bool`) + lease `StreamLease { context,
   operation, generation, terminal, released }` (только opaque ids).
-  Claim живёт в native data (`StreamNative::dropped` /
-  `ReaderNative::dropped: Cell<bool>`, последний shared с
+  Publish-claim живёт в native data (`StreamNative::published` /
+  `ReaderNative::published: Cell<bool>`, последний shared с
   `releaseLock()` через `take_lease`): ровно один из путей (finalize,
-  drop, releaseLock) владеет снятием своей стороны. Повторный
-  `releaseLock()` на том же объекте видит `released` первым и бросает
-  `TypeError`, не трогая shared флаги, — провал "hook уменьшает обе
-  стороны включая уже released reader" невозможен по построению.
-  Drop одной стороны не завершает operation, пока зарегистрирована
-  другая. Pending read Promise — самостоятельный живой demand
+  drop, releaseLock) публикует lock-free intent своей стороны.
+  КРИТИЧНО: claim покрывает только ПУБЛИКАЦИЮ — снятие флага стороны
+  происходит исключительно в `poll_io` (`apply_stream_drop_intent` с
+  retry при занятом `RefCell`: intent requeue, никогда потеря).
+  Повторный `releaseLock()` на том же объекте видит `released` первым
+  и бросает `TypeError`, не трогая shared флаги. Drop одной стороны не
+  завершает operation, пока зарегистрирована другая. Native data НЕ
+  хранит `Rc<RefCell<StreamShared>>` вообще (только identity-инты и
+  клон intent-стека): brand gates (`require_stream`/`require_reader`)
+  резолвят shared из context-таблиц, финаčajзер не может застать
+  занятый borrow. Pending read Promise — самостоятельный живой demand
   (advisory probe `IoBridge::stream_live_demand` + проверка
   `PendingStreamReads`): endpoints могут уйти, а owed promise всё равно
-  settles chunk/error первым (demand-first settlement); после settlement
-  post-drain перевооружает abandonment. `Rc::strong_count` не
-  используется (технические `Rc` в таблицах).
-- Finalizer boundary: GC finalizer не мутирует `Context` и не исполняет
-  JS — только смена своего флага и cleanup record `(context, operation,
-  generation)` в клон очереди owning context, захваченный при создании
-  объекта (`StreamCleanupQueue`, `Arc<Mutex<VecDeque>>` в native data).
-  Очередь unbounded: не более одной записи на живую операцию
-  (публикует только переход последней стороны в ноль), длина ограничена
-  самим `max_concurrent_reads_per_global` — фиксированный cap удалён как
-  противоречащий unbounded limits (`limits.rs:75` не ставит верхней
-  границы). Процесс-широкий registry и orphan-очередь удалены:
-  маршрутизация — клоном, не глобальным реестром. `poll_io` валидирует
-  каждую запись (живой op root, та же generation, не terminal, ноль
-  сторон, пустая очередь, не in-flight; demand — demand-first с
-  табличным/bridge views как defense-in-depth) и выполняет single
-  abandoned transition (token cancel, cursor clear, op root + payload
-  removal, conditional release, один `stream_read` event в существующем
-  классе `cancelled` — без JS event/error, без нового класса), плюс
-  sweep сторон-без-demand без записи. Stale записи — strict no-op.
+  settles chunk/error первым (demand-first settlement: terminal-lease
+  проверка идёт ПОСЛЕ pop слота); после settlement post-drain
+  перевооружает abandonment. `Rc::strong_count` не используется
+  (технические `Rc` в таблицах).
+- Finalizer boundary (§3.2.1–3.2.4 буквально): GC finalizer не мутирует
+  `Context`, не исполняет JS, не делает I/O/worker join и НЕ ЖДЁТ
+  НИКАКОГО lock — только lock-free publish одного packed-`u64` intent
+  `(context:15, operation:32, generation:16, is_reader:1)` в слот-ринг
+  owning context (`StreamDropIntentStack`: 4096 `AtomicU64` слотов,
+  CAS `0 -> packed`, без `Mutex`, без аллокации, без `RefCell`, без
+  `unsafe`). Переполнение структурно невозможно (слотов >> живых
+  эпох ≤ quota; плюс sweep sideless-эпох без записи; плюс stale no-op).
+  Глобального registry/orphan-очереди нет: маршрутизация — клоном стека
+  в native data. `poll_io` (единственное место transition): сначала
+  применяет снятия сторон (retry через requeue), затем валидирует
+  (живой op root, та же generation, не terminal, ноль сторон, пустая
+  очередь, не in-flight; demand — demand-first с табличным/bridge views
+  как defense-in-depth) и выполняет single abandoned transition (token
+  cancel, cursor clear, op root + payload removal, conditional release,
+  один `stream_read` event в существующем классе `cancelled` — без JS
+  event/error, без нового класса), плюс sweep. Stale intents —
+  strict no-op.
+- Exactly-once: EOF/error/cancel/abandoned/shutdown конкурируют за одну
+  transition (флаги `terminal`/`released`); только победитель релизит и
+  эмитит. `IoBridge::unreserve`/`release` — условно-идемпотентны
+  (`-> bool`): повторный release неизвестного id не трогает чужой slot.
+  Late completion после abandoned — strict no-op. Terminal
+  `read()`/`cancel()`/`releaseLock()` после удаления op entry НЕ
+  бросают "no longer live": error replay живёт в собственной context
+  таблице (`PendingStreamErrors`, plain name/message), done — через
+  общий `settle_terminal_outcome` job; cancel идемпотентно резолвит
+  `undefined`.
 - Exactly-once: EOF/error/cancel/abandoned/shutdown конкурируют за одну
   transition (флаги `terminal`/`released`); только победитель релизит и
   эмитит. `IoBridge::unreserve`/`release` — условно-идемпотентны
@@ -139,46 +156,45 @@ count-only diagnostics (`io_active_count`, `stream_payload_count`,
 - `docs/architecture.md`: Layer 2c переписан под rework.
 - Исторический `M9D-EOF-LIFECYCLE-handoff` не переписан.
 
-## Retrospective review (rework, перед commit)
+## Retrospective review (rework + P1 rework, перед commit)
 
-Первый вариант (отклонён) и исправления:
+Первый вариант (отклонён) и исправления — см. выше. Повторная приёмка
+нашла два новых P1 (CI run 34711094697), оба закрыты здесь:
+
+- P1-A (Mutex в Finalize, §3.2.4): `push_stream_cleanup_record` делал
+  blocking `Mutex::lock()` прямо из `Finalize`/`Drop`. Исправлено:
+  intent-стек — 4096 `AtomicU64` слотов, publish = pack + CAS
+  `0 -> packed` (без `Mutex`, без аллокации, без `RefCell`, без
+  `unsafe`); в финализаторе нет никакого ожидания — только CAS-ретрай
+  при гонке слотов, что не является lock wait. `cargo clippy -D warnings`
+  подтверждает отсутствие `unsafe_code`; structural guard подтверждает
+  отсутствие `.lock()`/`try_lock`/`borrow` в `Finalize`/`Drop` путях.
+- P1-B (потеря claim при занятом RefCell): claim `dropped=true`
+  ставился ДО `try_borrow_mut()`, и занятый borrow навсегда оставлял
+  сторону registered (phantom owner + утечка quota). Исправлено
+  архитектурно: claim покрывает только ПУБЛИКАЦИЮ intent; снятие флага
+  стороны происходит исключительно в `poll_io`
+  (`apply_stream_drop_intent`) с retry через requeue при занятом borrow
+  — intent переживает contention и применяется позже. Native data
+  больше не хранит `Rc<RefCell>` вообще (только identity-инты + клон
+  стека), так что финаčajзер не может застать занятый borrow через
+  собственные данные; brand gates резолвят shared из context-таблиц.
+  Попутно terminal `read()`/`cancel()`/`releaseLock()` после удаления
+  op entry больше не бросают "no longer live": error replay живёт в
+  `PendingStreamErrors`, done — через общий `settle_terminal_outcome`,
+  cancel идемпотентно резолвит `undefined` (поймано упавшими
+  M3-тестами `cancel_before_first_read_resolves_done`,
+  `source_error_rejects_queued...` — все 26+28 зелёные после фикса).
+
+Плюс из первого rework (сохранено):
 
 1. `Trace` derive генерирует собственный `Drop` — ручной `Drop` без
-   `#[boa_gc(unsafe_no_drop)]` не компилируется (E0119). Сохранено:
-   оба native типа — `#[derive(Trace)] + #[boa_gc(unsafe_no_drop)]` +
-   ручной `Finalize` + ручной `Drop` с тем же claim.
-2. Ручной `unsafe impl Trace` запрещён `#![deny(unsafe_code)]`.
-   Сохранено: только derive.
-3. ЗАМЕЧАНИЕ 1 (releaseLock-hook): общий hook декрементировал обе
-   стороны включая released reader. Исправлено: стороны — `bool` флаги,
-   claim — в native data (`take_lease`), `released` проверяется до
-   shared флагов; добавлен регрессионный assert (второй `releaseLock()`
-   → `TypeError`, triple неизменна).
-4. ЗАМЕЧАНИЕ 2 (GC-06): блок "missing prototype" выполнял успешное
-   создание. Исправлено: блок удалён; в scope честно зафиксировано
-   отсутствие достижимого post-`reserve()` отказа при включённом шиме;
-   rollback helpers — для disabled-shim сборок.
-5. ЗАМЕЧАНИЕ 3 (cap 1024): противоречил unbounded
-   `max_concurrent_reads_per_global`. Исправлено: cap, registry и
-   orphans удалены; очередь — unbounded клон в native data, длина ≤
-   числу живых операций ≤ quota.
-6. ЗАМЕЧАНИЯ 4–5 (подмена GC + недостоверность): `__test_*` hook и
-   `delete globalThis.*` давали ложные PASS. Исправлено: hook удалён
-   полностью; тесты — только block-scope evals + настоящий
-   `force_collect()` (native `Finalize`) + настоящий `poll_io`;
-   demand-first settlement + post-settlement re-arm + sweep закрывают
-   GC-03/GC-04 формы, где demand откладывал публикацию, а settlement
-   уже всё дренировал.
-7. `poll_io` shutdown path оставлял op root/payload (тройка
-   `(0,1,1)`). Сохранено: `shutdown_runtime` дренит таблицы,
-   quota — через bridge closer.
-8. Clippy `-D warnings`: `collapsible_if`,
-   `unnecessary_lazy_evaluations` (`.then` → `.then_some`),
-   `manual_inspect` (`map_err` → `inspect_err`),
-   `doc_lazy_continuation` — исправлено.
-9. M3-B `reads_are_pending_until_run_jobs_with_fifo_order` флапал при
-   полном параллельном прогоне; при `--test-threads=1` стабилен —
-   приёмка требует `--test-threads=1` для stream suites.
+   `#[boa_gc(unsafe_no_drop)]` не компилируется (E0119). Оба native
+   типа — `#[derive(Trace)] + #[boa_gc(unsafe_no_drop)]` + ручной
+   `Finalize` + ручной `Drop` с тем же publish-claim.
+2. Ручной `unsafe impl Trace` запрещён `#![deny(unsafe_code)]`:
+   только derive; intent-стек — safe `AtomicU64` + `Arc`, без
+   `unsafe impl Send/Sync`, без raw pointers.
 
 ## Внешний CI run 34708491031 (не блокирует код)
 

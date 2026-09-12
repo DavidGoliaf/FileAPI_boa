@@ -308,32 +308,29 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) io_poll_budget: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
     /// Opaque identity of this registration's I/O context.
     pub(crate) context_id: crate::io::FileApiContextId,
-    /// Context-pinned sink for stream endpoint-drop cleanup records
+    /// Context-pinned sink for stream endpoint-drop intent notices
     /// (M9-D-R2).
     ///
-    /// Native `Drop`/`Finalize` impls (`StreamNative`/`ReaderNative`)
-    /// cannot touch `Context`, so they publish their
-    /// `(context, operation, generation)` triple through a clone of this
-    /// `Arc` captured at object creation time (see
-    /// [`push_stream_cleanup_record`]). The queue is drained only by
-    /// `poll_io` on the owning Boa thread, which validates every record
-    /// against the live tables before running the single abandoned
-    /// transition. Holds only opaque ids — no bytes, paths, or JS values.
+    /// Native `Finalize`/`Drop` impls (`StreamNative`/`ReaderNative`)
+    /// cannot touch `Context`, JS, locks, or the shared state, so they
+    /// publish a plain-integer intent through a clone of this lock-free
+    /// stack captured at object creation time (see
+    /// [`StreamDropIntents`]). The stack is drained only by `poll_io` on
+    /// the owning Boa thread, which first applies the announced side
+    /// clearings (with retry while the shared cell is borrowed elsewhere)
+    /// and then runs the single abandoned transition for eligible
+    /// operations. Holds only opaque ids — no bytes, paths, or JS values.
     ///
-    /// The queue is intentionally unbounded: at most one record per live
-    /// operation can exist (only the transition of the last registered
-    /// side to zero publishes; duplicates are impossible by construction
-    /// and any stale record collapses into a strict no-op at drain time),
-    /// so its length never exceeds the number of live stream operations,
-    /// which is itself bounded by
-    /// `max_concurrent_reads_per_global`. A fixed extra cap (like the
-    /// previous 1024) would contradict that limit: with a host-configured
-    /// quota above the cap, legitimate abandonments would be dropped while
-    /// quota is still held. Shared (not duplicated) between specs and
-    /// handle so drops observe the same queue `poll_io` drains.
+    /// The stack is intentionally unbounded: at most a handful of intents
+    /// per live operation can exist (finalize + drop per side, each
+    /// guarded by the native-data publish claim), so its length never
+    /// exceeds a small multiple of the live stream operation count, which
+    /// is itself bounded by `max_concurrent_reads_per_global`. A fixed
+    /// extra cap would contradict that host-configured limit. Shared (not
+    /// duplicated) between specs and handle so drops observe the same
+    /// stack `poll_io` drains.
     #[cfg(feature = "streams-shim")]
-    pub(crate) stream_cleanups:
-        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64, u64)>>>,
+    pub(crate) stream_drop_intents: StreamDropIntents,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
     /// Opaque identity stored at registration time: a repeat `register`
@@ -342,31 +339,18 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) identity: RegistrationIdentity,
 }
 
-/// Publishes one native cleanup record for a deregistered stream endpoint
-/// (M9-D-R2 finalizer boundary).
+/// Lock-free stack of stream endpoint-drop intent notices, shared by one
+/// context (M9-D-R2 finalizer boundary).
 ///
-/// Drop-safe: takes only opaque ids plus a clone of the owning context's
-/// cleanup queue captured when the stream object was created — never
-/// touches `Context`, never runs JS, never blocks on I/O. `poll_io`
-/// drains the same queue on the owning Boa thread and validates every
-/// record before acting. Poisoned locks fail closed (the record is
-/// dropped; the operation stays reserved until an explicit terminal path
-/// or shutdown releases it — never a silent double free).
+/// Alias of the intrusive stack owned by `streams.rs`
+/// ([`crate::streams::StreamDropIntentStack`]): native `Finalize`/`Drop`
+/// impls push plain-integer intents through a clone captured at object
+/// creation — never touching `Context`, JS, locks, or the shared state —
+/// and `poll_io` drains the same stack on the owning Boa thread. See the
+/// stack docs for the wait-free argument, the ABA argument, and the
+/// memory bound.
 #[cfg(feature = "streams-shim")]
-pub(crate) fn push_stream_cleanup_record(
-    queue: &StreamCleanupQueue,
-    context: u64,
-    operation: u64,
-    generation: u64,
-) {
-    if let Ok(mut queue) = queue.lock() {
-        queue.push_back((context, operation, generation));
-    }
-}
-
-#[cfg(feature = "streams-shim")]
-pub(crate) type StreamCleanupQueue =
-    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64, u64)>>>;
+pub(crate) type StreamDropIntents = std::sync::Arc<crate::streams::StreamDropIntentStack>;
 
 impl RegisteredSpecs {
     /// Returns the Blob interface prototype.
@@ -554,21 +538,31 @@ impl RegisteredSpecs {
         }
     }
 
-    /// Takes every queued stream endpoint-drop cleanup record for this
+    /// Swaps out every queued stream endpoint-drop intent for this
     /// context (M9-D-R2).
     ///
-    /// Drains the context-pinned queue. Called only from `poll_io` on the
-    /// owning Boa thread; every record is validated by the caller before
-    /// acting.
+    /// Lock-free swap; owns every intent exclusively afterwards. Called
+    /// only from `poll_io` on the owning Boa thread; every intent is
+    /// validated by the caller before acting.
     #[cfg(feature = "streams-shim")]
-    pub(crate) fn take_stream_cleanup_records(&self) -> Vec<(u64, u64, u64)> {
-        let mut out = Vec::new();
-        if let Ok(mut queue) = self.stream_cleanups.lock() {
-            while let Some(record) = queue.pop_front() {
-                out.push(record);
-            }
+    pub(crate) fn take_stream_drop_intents(&self) -> Vec<crate::streams::StreamDropIntent> {
+        self.stream_drop_intents.take_all()
+    }
+
+    /// Requeues intents whose side clearing hit a contended shared-cell
+    /// borrow (M9-D-R2 retry).
+    ///
+    /// Boa thread only (`poll_io`). Pushing back through the same
+    /// lock-free stack preserves every notice until it is applied — a
+    /// contended borrow delays, never loses, the side clearing.
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn requeue_stream_drop_intents(
+        &self,
+        intents: Vec<crate::streams::StreamDropIntent>,
+    ) {
+        for intent in intents {
+            self.stream_drop_intents.push(intent);
         }
-        out
     }
 
     /// Rebuilds the owning handle from a specs snapshot (test helper).
@@ -1050,17 +1044,17 @@ impl FileApiExtension {
             shutdown.track(move || bridge.shutdown());
         }
         #[cfg(feature = "streams-shim")]
-        let stream_cleanups: StreamCleanupQueue =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let stream_drop_intents: StreamDropIntents =
+            std::sync::Arc::new(crate::streams::StreamDropIntentStack::new());
         #[cfg(feature = "streams-shim")]
         {
-            let queue = Arc::clone(&stream_cleanups);
+            let intents = Arc::clone(&stream_drop_intents);
             shutdown.track(move || {
-                // Shutdown drops pending cleanup records: every live
+                // Shutdown drops pending drop intents: every live
                 // operation releases through the shutdown path instead.
-                if let Ok(mut queue) = queue.lock() {
-                    queue.clear();
-                }
+                // `take_all` also frees every leaked intent node, so no
+                // allocation outlives the context.
+                let _ = intents.take_all();
             });
         }
         let specs = RegisteredSpecs {
@@ -1089,7 +1083,7 @@ impl FileApiExtension {
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "streams-shim")]
-            stream_cleanups: Arc::clone(&stream_cleanups),
+            stream_drop_intents: Arc::clone(&stream_drop_intents),
             #[cfg(feature = "dom-shim")]
             io_poll_budget: std::sync::Arc::new(std::sync::Mutex::new(None)),
             context_id,

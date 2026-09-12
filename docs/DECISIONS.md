@@ -1122,33 +1122,30 @@ cleanup boundary + exactly-once arbitration, без `unsafe` и без новы�
    post-settlement drain перевооружает abandonment. На `Rc::strong_count`
    не полагаемся: context tables и pending entries держат технические
    `Rc`, не равные JS ownership.
-2. Finalizer-to-Boa-thread cleanup boundary: GC finalizer не мутирует
-   `Context` и не исполняет JS. Claim живёт в native data
-   (`StreamNative::dropped` / `ReaderNative::dropped: Cell<bool>`,
-   последний shared с `releaseLock()` через `take_lease`): ровно один из
-   путей (finalize, drop, releaseLock) владеет снятием своей стороны.
-   Снятие выполняет только смену своего флага и публикует native cleanup
-   record `(context, operation, generation)` в клон очереди owning
-   context, захваченный при создании объекта (`StreamCleanupQueue`,
-   `Arc<Mutex<VecDeque>>` в native data) — без bytes/paths/JS values,
-   без блокировок на I/O, без неограниченного lock wait. Очередь
-   намеренно unbounded: не более одной записи на живую операцию может
-   существовать (публикует только переход последней стороны в ноль;
-   stale записи схлопываются в strict no-op), поэтому длина никогда не
-   превышает числа живых операций, ограниченного самим
-   `max_concurrent_reads_per_global` — фиксированный cap (ранее 1024)
-   противоречил бы host-конфигурируемому лимиту и удалён по замечанию
-   приёмки (см. rework §5). Процесс-широкий registry и orphan-очередь
-   удалены за ненадобностью: запись маршрутизируется клоном, а не
-   глобальным реестром. `poll_io` (Boa thread) дренит записи до и после
-   stream chunks, валидирует каждую (живой op root, та же generation, не
-   terminal, ноль зарегистрированных сторон, пустая очередь, не
-   in-flight; live demand — demand-first: очередь/in-flight эпохи
-   авторитетны, табличный и bridge views — только defense-in-depth, stale
-   probe в одиночку abandonment не блокирует) и только тогда выполняет
-   single abandoned transition; плюс sweep эпох без сторон и без demand,
-   не опубликовавших запись (demand откладывал публикацию, settlement
-   уже всё дренировал). Stale записи — strict no-op.
+2. Finalizer-to-Boa-thread cleanup boundary (§3.2 буквально): GC
+   finalizer не мутирует `Context`, не исполняет JS, не делает I/O/worker
+   join и НЕ ЖДЁТ НИКАКОГО lock — только lock-free publish одного
+   packed-`u64` intent `(context:15, operation:32, generation:16,
+   is_reader:1)` в слот-ринг owning context (`StreamDropIntentStack`:
+   4096 `AtomicU64` слотов, CAS `0 -> packed`; без `Mutex`, без аллокации,
+   без `RefCell`, без `unsafe`). Переполнение структурно невозможно
+   (слотов >> живых эпох ≤ quota; плюс sweep sideless-эпох без записи;
+   плюс stale no-op). Глобального registry/orphan-очереди нет:
+   маршрутизация — клоном стека в native data. КРИТИЧНО (P1 rework):
+   claim покрывает только ПУБЛИКАЦИЮ — снятие флага стороны происходит
+   исключительно в `poll_io` (`apply_stream_drop_intent`) с retry через
+   requeue при занятом `RefCell`, так что contention откладывает, но
+   никогда не теряет снятие (прежний дизайн терял claim: `dropped=true`
+   до `try_borrow_mut()` + пропуск при занятости = вечный phantom
+   owner). Native data не хранит `Rc<RefCell>` вообще (только
+   identity-инты + клон стека); brand gates резолвят shared из
+   context-таблиц. `poll_io` (Boa thread, единственное место transition)
+   дренит intents до и после stream chunks: сначала применяет снятия
+   сторон (retry), затем валидирует (живой op root, та же generation, не
+   terminal, ноль сторон, пустая очередь, не in-flight; demand —
+   demand-first с табличным/bridge views как defense-in-depth) и только
+   тогда выполняет single abandoned transition; плюс sweep. Stale intents
+   — strict no-op.
 3. Exactly-once arbitration и conditional release: EOF, text-tail EOF,
    error, cancel, abandoned/drop и shutdown конкурируют за одну terminal
    ownership transition (флаги `terminal`/`released` в op entry + lease).
