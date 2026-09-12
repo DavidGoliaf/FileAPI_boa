@@ -196,23 +196,80 @@ count-only diagnostics (`io_active_count`, `stream_payload_count`,
    только derive; intent-стек — safe `AtomicU64` + `Arc`, без
    `unsafe impl Send/Sync`, без raw pointers.
 
-## Внешний CI run 34708491031 (не блокирует код)
+## Внешний CI run 34714298795 (не блокирует код, детализация вместо прежней записи)
 
-Три падения — все на workflow-уровне, вне кода ветки:
+Три красных job — все в WPT-шагах workflow, после зелёных Rust-тестов.
+Ни один не затрагивает код ветки (`git diff task/m9e...HEAD --name-only`
+не содержит `ci.yml`/`wpt-manifest.json`/`corpus`/`inventory`/
+`expectations.json`; шард `task/m9d-gc-drop-lifecycle` на
+`1a1cd2ac8ce8620aac355a196919d116bbc856e1`, в ногу с
+`origin/task/m9d-gc-drop-lifecycle`):
 
-- Ubuntu: неправильный corpus path (WPT checkout кладёт `FileAPI/`
-  не туда, куда смотрит `--upstream-root target/pinned-wpt`);
-- Windows: upstream hash drift (пин `0968c868…` больше не совпадает с
-  upstream содержимым — дрейф вне репозитория);
-- macOS: negative-control ожидаемо вернул nonzero (мутированный
-  upstream обязан падать), но workflow трактовал nonzero шага как
-  падение job вместо `expect-failure` паттерна.
+- Ubuntu (`exit 2`): `WPT smoke run` упал с
+  `boa_fapi_wpt: invalid corpus path
+  'corpus/filereader_readasarraybuffer.js'`. Механизм точный: casing
+  manifest-vs-disk. В `wpt-manifest.json` пять `path` в нижнем регистре
+  (`corpus/filereader_readasarraybuffer.js`,
+  `..._readasbinarystring.js`, `..._readasdataurl.js`,
+  `..._readastext.js`, `..._readastext_blob_type_charset.js`), а на
+  диске лежат camelCase-файлы
+  (`crates/boa_fapi_wpt/corpus/filereader_readAsArrayBuffer.js` и т.д.).
+  На case-sensitive Ubuntu `resolve_corpus_path` не находит файл; на
+  Windows/macOS тот же mismatch маскируется case-insensitive FS. Источник
+  mismatch — наследие `task/m9e`, не эта ветка. Фикс — только за scope
+  заказа (переименовать либо manifest entries, либо файлы + `sha256`,
+  с учётом `.gitattributes` `corpus/*.js text eol=lf` для hash-стабильности).
+- Windows (`exit 1`): smoke прошёл
+  (`374 upstream passed, 6 smoke passed, 5 defects, 32 exclusions,
+  0 unexpected`), `WPT strict run` упал до report-check с
+  `boa_fapi_wpt: upstream hash drift for
+  'FileAPI/blob/Blob-array-buffer.any.js'`. Строго перед этим —
+  `WPT upstream checkout (pinned commit, FileAPI scope)` через
+  `git init target/pinned-wpt` + `fetch --depth 1
+  0968c868d8095217d18d86b34c7f21dccae58768` + `checkout FETCH_HEAD --
+  FileAPI/`. Значит drift касается свежевыкачанного upstream-дерева
+  против `upstream_sha256` в `wpt-manifest.json`/`wpt-inventory.json`.
+  Прежняя запись в handoff о дрейфе пина подтверждается дословным текстом
+  ошибки. Hash-цепочка локально не воспроизводится без сети, но путь
+  доказательства оставлен: сверить `sha256` файла в `target/pinned-wpt`
+  с `wpt-manifest.json` и `wpt-inventory.json` для
+  `FileAPI/blob/Blob-array-buffer.any.js`.
+- macOS: smoke и оба strict run прошли
+  (`WPT_STRICT: 374 upstream passed, 6 smoke passed, 5 defects,
+  35 exclusions, 0 unexpected`; determinism-check threads 1/2 — pass),
+  затем `WPT negative control` вывел ожидаемое
+  `boa_fapi_wpt: upstream hash drift for
+  'FileAPI/blob/Blob-slice.any.js'` для мутированного `target/mutated-wpt`
+  и завершился `Process completed with exit code 1`. То есть отрицательный
+  контроль сработал как задумано (мутация обязана давать nonzero), но шаг
+  workflow (`Copy-Item ...; cargo run ... --upstream-root
+  target/mutated-wpt ...; if ($LASTEXITCODE -eq 0) { throw ... }` в
+  `ci.yml:121-127`) не имеет `expect-failure` паттерна: ненулевой exit
+  самого `cargo run` помечает весь job красным до/вне зависимости от
+  последующего `throw`. Статус шага определяется exit-кодом мутированного
+  прогона, а не результатом проверки. Фикс — только в workflow
+  (например, `continue-on-error` + явная проверка артефакта/кода, либо
+  инверсия через wrapper), отдельно от lifecycle-ветки.
 
-Ни одно не связано с GC/drop lifecycle: локальный gate
-(fmt/clippy/m9_stream_io/m3_blob_streams/workspace/doc/deny/hack/diff)
-зелёный (см. ниже). CI-фиксы — отдельным изменением workflow, не этой
-веткой (заказ прямо запрещает расширять scope за lifecycle
-stream/reader).
+Дополнительно в ubuntu-логе виден `thread 'boa-fapi-io-0' panicked ...
+failed to join thread: Resource deadlock avoided (os error 35)` рядом с
+`m5_file_fs` (19:32:25Z). Это stdout-шум одного worker thread внутри иначе
+прошедшего шага: job продолжил все последующие Rust-тесты вплоть до smoke
+и упал только на smoke-мismatch выше. Отдельной `test result: FAILED`
+строки этот panic не дал; классифицировать его как причину красного CI
+нельзя, но приёмщику оставлен след для отдельного разбора вне заказа.
+
+Локальный gate заказа на этом же SHA зелёный (Windows, свежий прогон):
+fmt exit 0; clippy чисто; `m9_stream_io` 26/26; `m3_blob_streams` 28/28;
+`cargo test --workspace --all-features -- --test-threads=1` — все suites
+`ok`, ни одного FAILED; `cargo doc` с `-Dwarnings` exit 0; `cargo deny
+check` ok; `cargo hack check --feature-powerset --depth 2` exit 0;
+`git diff --check` exit 0. M9D-GC-01…06 идут только через блочный eval
+scope + настоящий `boa_gc::force_collect()` + настоящий host `poll_io`;
+`__test_*` отсутствуют в коде/тестах/guards (grep по
+`crates/boa_fapi/{src,tests}` пуст, guards-дифф добавляет лишь
+count-only diagnostics). CI-фиксы — отдельным изменением workflow, не этой
+веткой (заказ §1 и §«Вне scope»: WPT gate чинить запрещено здесь).
 
 ## Приёмка
 
@@ -228,6 +285,8 @@ cargo hack check --feature-powerset --depth 2
 git diff --check
 ```
 
-SHA на момент handoff: см. commit ветки `task/m9d-gc-drop-lifecycle`.
+SHA на момент handoff: `1a1cd2ac8ce8620aac355a196919d116bbc856e1`
+(`task/m9d-gc-drop-lifecycle`, в ногу с origin; рабочих изменений поверх
+нет, кроме неотслеживаемых `tasks/*.md`, не входящих в заказ).
 M9-E-R1 в этой ветке не начинать. Дождаться внешнего CI, затем
 остановиться для отдельной приёмки.
