@@ -162,25 +162,35 @@ owns the host bridge; `extension.rs` owns the entry points:
   and no in-flight I/O, stream/reader `cancel()` settle queued reads done
   synchronously on the calling stack (cancel promise resolves `undefined`
   through one Boa job) and make the in-flight chunk stale;
-- GC/drop lifecycle (M9-D-R2): every stream epoch owns an explicit
-  endpoint lease (`StreamShared::live_endpoints`/`live_readers` +
-  `StreamLease { context, operation, generation, terminal, released }` —
-  opaque ids only, no GC pointers). Stream/reader native data deregister
-  their endpoint in both the GC finalizer and the Rust drop path
-  (per-endpoint exactly-once claims, no `Rc::strong_count`): the
-  deregistration only publishes a bounded `(context, operation,
-  generation)` cleanup record into the context-pinned queue. `poll_io`
-  validates each record (own context, live op root, same generation, not
-  terminal, zero endpoints, empty queue, not in-flight, no live demand)
-  and runs the single abandoned transition (token cancel, cursor clear, op
-  root + payload removal, one conditional quota release, one `stream_read`
+- GC/drop lifecycle (M9-D-R2): every stream epoch owns two explicit
+  sides (`StreamShared::stream_registered` / `reader_registered`, plain
+  `bool`s — never counters, never `Rc::strong_count`) plus a lease
+  (`StreamLease { context, operation, generation, terminal, released }` —
+  opaque ids only, no GC pointers). Claims live in the native data
+  (`StreamNative::dropped` / `ReaderNative::dropped: Cell<bool>`, the
+  latter shared with `releaseLock()` via `take_lease`): exactly one of
+  (finalize, drop, releaseLock) owns each side, so a released reader can
+  never clear the stream side and no hook decrements both sides at once.
+  Each native object captures a clone of its owning context's cleanup
+  queue at creation; the drop/finalize pair only flips its own flag and
+  publishes a `(context, operation, generation)` record into that clone
+  (no `Context`, no JS, no I/O, no global registry; the queue is
+  unbounded because at most one record per live operation can exist —
+  bounded by `max_concurrent_reads_per_global` itself). `poll_io`
+  validates each record (live op root, same generation, not terminal,
+  zero registered sides, empty queue, not in-flight; live demand is
+  demand-first with the table/bridge views as defense-in-depth) and runs
+  the single abandoned transition (token cancel, cursor clear, op root +
+  payload removal, one conditional quota release, one `stream_read`
   event in the existing `cancelled` class — no JS event/error, no new
-  telemetry class). Live read-promise demand outlives endpoint drops and
-  settles first; post-settlement drains re-arm abandonment. All terminal
-  paths (EOF/error/cancel/abandoned/shutdown) arbitrate one exactly-once
-  ownership; `IoBridge::unreserve` is conditional-idempotent (repeat
-  release of an unknown id never touches another slot); creation failures
-  after `reserve()` roll back synchronously (no hidden slots);
+  telemetry class), plus a sweep for sideless demand-less epochs that
+  never published a record. Live read-promise demand outlives endpoint
+  drops and settles first; post-settlement drains re-arm abandonment. All
+  terminal paths (EOF/error/cancel/abandoned/shutdown) arbitrate one
+  exactly-once ownership; `IoBridge::unreserve` is
+  conditional-idempotent (repeat release of an unknown id never touches
+  another slot); creation failures after `reserve()` roll back
+  synchronously (no hidden slots);
 - after M4-A stream errors reject with the central mapped `DOMException`
   (same mapping as promise reads and FileReader), not a plain `Error`.
 

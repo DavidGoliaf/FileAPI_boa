@@ -1815,51 +1815,43 @@ fn no_late_stream_telemetry_after_cancel_or_shutdown() {
 
 // ── M9-D-R2: GC/drop lifecycle (M9D-GC-01…06) ──
 //
-// Every test below uses the REAL GC/drop path: JS roots are dropped with
-// real `delete globalThis.*` (the explicit-drop boundary observes the
-// native-data drop), the supported deterministic `boa_gc::force_collect()`
-// runs the collector, and the REAL host cleanup/`poll_io` loop drains the
-// bounded cleanup records. No test-only cleanup hook exists: `poll_io` is
-// the only transition site, exactly as in production. Baselines assert
-// the triple (quota slots, stored payloads, live operations) together.
+// Every test below uses ONLY the real GC/finalizer path: JS roots are
+// dropped inside a dedicated eval scope (block-scoped `let` bindings go
+// out of scope when the eval returns, so no `globalThis` property keeps
+// the object alive), the supported deterministic
+// `boa_gc::force_collect()` runs the collector (which runs the native
+// `Finalize` impls that publish the cleanup records), and the REAL host
+// `poll_io` loop drains them. No test-only cleanup hook exists anywhere:
+// `poll_io` is the only transition site, exactly as in production.
+// Baselines assert the triple (quota slots, stored payloads, live
+// operations) together.
+//
+// Why scoped evals instead of `delete globalThis.*`: deleting a global
+// property detaches the reference, but the engine may keep the object
+// reachable through `Context` roots beyond `force_collect()`, which made
+// the results nondeterministic. A block scope (`{ let s = ...; }`)
+// releases the last JS reference when the eval completes, so the very
+// next `force_collect()` observes an unreachable object
+// deterministically on every platform. Each test additionally proves the
+// KEY property through a second creation: after the abandoned transition
+// the quota is free, so a new stream creates and reads successfully.
 
-/// Removes every listed JS root, runs the deterministic collector, and
-/// drains the real host cleanup/`poll_io` loop until quiescent.
-///
-/// The engine may keep an object reachable through `Context` roots beyond
-/// `force_collect()` even after `delete globalThis.*`. The production
-/// explicit-drop path is therefore ALSO exercised directly: after the
-/// real collector run, the test drops the exact native endpoint lease of
-/// every still-live operation through the same `deregister_*` arbitration
-/// the GC finalizer performs (same counters, same terminal/demand checks,
-/// same bounded record). This models "the last JS endpoint becomes
-/// unreachable" deterministically without inventing a separate cleanup:
-/// `poll_io` remains the only transition site, and the collector path is
-/// always executed first.
+/// Drops the last JS reference (block scope ends with the eval), runs the
+/// deterministic collector (native `Finalize` publishes the cleanup
+/// record), and drains the real host `poll_io` loop until quiescent.
 fn gc_drop_cleanup(
     context: &mut Context,
     handle: &boa_fapi::FileApiHandle,
     executor: &Arc<ManualExecutor>,
-    roots: &[&str],
 ) {
-    for root in roots {
-        context
-            .eval(Source::from_bytes(&format!(
-                "delete globalThis.{root}; true"
-            )))
-            .unwrap_or_else(|error| panic!("drop root {root}: {error}"));
-    }
-    // Deleting a global property only detaches the reference: the native
-    // data drop (and the bounded cleanup record) happens on collection.
+    // No JS roots are held across this call by construction: every test
+    // creates its streams inside a scoped eval (see above), so this first
+    // collection observes the unreachable objects deterministically.
     boa_gc::force_collect();
     context.run_jobs().expect("run_jobs");
-    // Explicit-drop model of "last JS endpoint unreachable": runs the
-    // production finalizer arbitration for still-live operations.
-    handle.__test_drop_live_stream_endpoints(context);
     drive_until_settled(context, handle, executor);
     boa_gc::force_collect();
     context.run_jobs().expect("run_jobs");
-    handle.__test_drop_live_stream_endpoints(context);
     drive_until_settled(context, handle, executor);
 }
 
@@ -1873,22 +1865,24 @@ fn stream_counts(context: &mut Context, handle: &boa_fapi::FileApiHandle) -> (us
 }
 
 /// M9D-GC-01: an unread stream frees its quota once its last JS reference
-/// is dropped (real GC/drop path, quota = 1).
+/// is dropped (real GC/finalizer path, quota = 1).
 #[test]
 fn gc_unread_stream_frees_quota_without_read_or_cancel() {
     let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
     let baseline = stream_counts(&mut context, &handle);
     assert_eq!(baseline, (0, 0, 0));
+    // Block scope: `tmp` stops being reachable when this eval returns, so
+    // the next `force_collect()` observes an unreachable object.
     context
         .eval(Source::from_bytes(
-            "globalThis.tmp = new Blob(['first']).stream(); true",
+            "{ let tmp = new Blob(['first']).stream(); } true",
         ))
         .expect("create stream");
     // One slot/payload/operation held by the unread stream.
     assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
     assert!(handle.has_pending_io());
-    // Drop the last JS reference and run the real GC/drop + cleanup loop.
-    gc_drop_cleanup(&mut context, &handle, &executor, &["tmp"]);
+    // Real GC/finalizer + cleanup loop frees everything.
+    gc_drop_cleanup(&mut context, &handle, &executor);
     // Quota, payload and operation counts return to baseline: the second
     // stream creates and reads successfully without cancel/shutdown.
     assert_eq!(stream_counts(&mut context, &handle), baseline);
@@ -1896,22 +1890,30 @@ fn gc_unread_stream_frees_quota_without_read_or_cancel() {
     context
         .eval(Source::from_bytes(
             "globalThis.verdict = 'pending'; \
-             globalThis.reader = new Blob(['second']).stream().getReader(); \
-             globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length + ':' + r.done; }); \
-             true",
+             { let reader = new Blob(['second']).stream().getReader(); \
+               reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length + ':' + r.done; }); \
+             } true",
         ))
         .expect("second stream must create after GC/drop");
     drive_until_settled(&mut context, &handle, &executor);
     assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:6:false");
-    gc_drop_cleanup(&mut context, &handle, &executor, &["reader"]);
+    gc_drop_cleanup(&mut context, &handle, &executor);
     assert_eq!(stream_counts(&mut context, &handle), baseline);
 }
 
 /// M9D-GC-02: endpoint ownership — stream/reader drops, releaseLock, generations.
+///
+/// Every sub-case keeps the SURVIVING side reachable from `globalThis`
+/// while the dropped side goes out of scope inside a block eval: the
+/// assertions below therefore prove real per-side ownership (the live
+/// side alone keeps the operation alive), not a hook result. The final
+/// cleanup of each sub-case drops the survivor the same way (scoped eval
+/// + `force_collect()` + `poll_io`).
 #[test]
 fn gc_endpoint_ownership_stream_reader_release_lock_generations() {
     // Drop stream while the reader is live: the operation stays (the
-    // reader still settles its demand through the host loop).
+    // reader still settles its demand through the host loop). The reader
+    // is the global root here; the stream exists only inside the block.
     {
         let (mut context, handle, executor, _) = setup_manual();
         publish_blob(
@@ -1927,23 +1929,31 @@ fn gc_endpoint_ownership_stream_reader_release_lock_generations() {
         );
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.verdict = 'pending'; \
-                 globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
-                 delete globalThis.stream; true",
+                "globalThis.verdict = 'pending'; \
+                 { let stream = srcBlob.stream(); \
+                   globalThis.reader = stream.getReader(); \
+                   globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 } true",
             ))
             .expect("setup");
         boa_gc::force_collect();
-        // The reader endpoint keeps the operation alive: real demand still
+        // The reader side alone keeps the operation alive: real demand still
         // settles exactly once with the exact chunk.
         drive_until_settled(&mut context, &handle, &executor);
         assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:8");
-        gc_drop_cleanup(&mut context, &handle, &executor, &["reader"]);
+        // Now drop the surviving reader the same real way: block scope ends
+        // with this eval, then GC + poll_io frees everything.
+        context
+            .eval(Source::from_bytes(
+                "{ let reader = globalThis.reader; globalThis.reader = undefined; } true",
+            ))
+            .expect("drop reader");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Drop reader while the stream is live: the operation stays (a new
-    // reader can still be acquired and read).
+    // reader can still be acquired and read). The stream is the global
+    // root here; the reader exists only inside the block.
     {
         let (mut context, handle, executor, _) = setup_manual();
         publish_blob(
@@ -1960,8 +1970,7 @@ fn gc_endpoint_ownership_stream_reader_release_lock_generations() {
         context
             .eval(Source::from_bytes(
                 "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 delete globalThis.reader; true",
+                 { let reader = globalThis.stream.getReader(); } true",
             ))
             .expect("setup");
         boa_gc::force_collect();
@@ -1972,33 +1981,48 @@ fn gc_endpoint_ownership_stream_reader_release_lock_generations() {
         // A new reader works on the still-live stream and reads exactly.
         context
             .eval(Source::from_bytes(
-                "globalThis.reader2 = globalThis.stream.getReader(); \
-                 globalThis.verdict = 'pending'; \
-                 globalThis.reader2.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
-                 true",
+                "globalThis.verdict = 'pending'; \
+                 { let reader2 = globalThis.stream.getReader(); \
+                   reader2.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 } true",
             ))
             .expect("second reader");
         drive_until_settled(&mut context, &handle, &executor);
         assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:8");
-        // Dropping the last endpoint (stream + reader2) frees everything.
-        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader2"]);
+        // Dropping the surviving stream the real way frees everything.
+        context
+            .eval(Source::from_bytes(
+                "{ let stream = globalThis.stream; globalThis.stream = undefined; } true",
+            ))
+            .expect("drop stream");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
-    // Drop the last endpoint: the operation frees.
+    // Drop the last side: the operation frees. Both objects live only
+    // inside the block; nothing reachable survives the eval.
     {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = new Blob(['last']).stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 delete globalThis.stream; delete globalThis.reader; true",
+                "{ let stream = new Blob(['last']).stream(); \
+                   let reader = stream.getReader(); } true",
             ))
             .expect("setup");
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
-        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader"]);
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // releaseLock(): no phantom owner (stream stays usable, then drop frees).
+    //
+    // The released reader is dropped INSIDE the same block eval (it goes
+    // out of scope together with the eval), while the stream + second
+    // reader survive as globals. If `releaseLock()` left a phantom owner
+    // on the released reader side, the later real drop of stream+reader2
+    // would leak one side and the triple would stay (1,1,1) — it does not.
+    // A second `releaseLock()` on the same object observes `released` and
+    // throws without touching any shared flag (regression for the
+    // "hook decrements both sides including an already-released reader"
+    // acceptance finding).
     {
         let (mut context, handle, executor, _) = setup_manual();
         publish_blob(
@@ -2015,49 +2039,73 @@ fn gc_endpoint_ownership_stream_reader_release_lock_generations() {
         context
             .eval(Source::from_bytes(
                 "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.reader.releaseLock(); \
+                 { let reader = globalThis.stream.getReader(); \
+                   reader.releaseLock(); \
+                   let second = (() => { try { reader.releaseLock(); return 'released'; } catch (e) { return 'threw:' + (e instanceof TypeError); } })(); \
+                   if (second !== 'threw:true') throw new Error('second releaseLock must throw TypeError, got ' + second); \
+                 } \
                  globalThis.reader2 = globalThis.stream.getReader(); \
                  globalThis.verdict = 'pending'; \
                  globalThis.reader2.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
-                 delete globalThis.reader; true",
+                 true",
             ))
             .expect("releaseLock");
         // The released first reader left no phantom owner: the stream read
         // through the second reader settles exactly.
         drive_until_settled(&mut context, &handle, &executor);
         assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:4");
-        // The released reader object itself is droppable without effect;
-        // dropping stream + reader2 frees the operation exactly once.
-        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader2"]);
+        // Drop the survivors the real way; the already-released first
+        // reader contributes nothing more.
+        context
+            .eval(Source::from_bytes(
+                "{ let s = globalThis.stream; let r = globalThis.reader2; \
+                   globalThis.stream = undefined; globalThis.reader2 = undefined; } true",
+            ))
+            .expect("drop survivors");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Several reader generations: repeated getReader/releaseLock cycles
     // never double-release (quota stays exactly one until the last drop).
+    // Released readers go out of scope inside the block; only the stream
+    // + final reader survive as globals.
     {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         context
             .eval(Source::from_bytes(
                 "globalThis.stream = new Blob(['gen']).stream(); \
-                 globalThis.r1 = globalThis.stream.getReader(); \
-                 globalThis.r1.releaseLock(); \
-                 globalThis.r2 = globalThis.stream.getReader(); \
-                 globalThis.r2.releaseLock(); \
+                 { let r1 = globalThis.stream.getReader(); \
+                   r1.releaseLock(); \
+                   let r2 = globalThis.stream.getReader(); \
+                   r2.releaseLock(); } \
                  globalThis.r3 = globalThis.stream.getReader(); \
                  true",
             ))
             .expect("generations");
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
-        // Dropping released readers changes nothing (leases moved back).
-        gc_drop_cleanup(&mut context, &handle, &executor, &["r1", "r2"]);
+        boa_gc::force_collect();
+        drive_until_settled(&mut context, &handle, &executor);
+        // Released readers changed nothing (their sides were claimed once
+        // by releaseLock; their drops are strict no-ops).
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
-        // Dropping the last endpoints frees exactly once.
-        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "r3"]);
+        // Dropping the last sides frees exactly once.
+        context
+            .eval(Source::from_bytes(
+                "{ let s = globalThis.stream; let r = globalThis.r3; \
+                   globalThis.stream = undefined; globalThis.r3 = undefined; } true",
+            ))
+            .expect("drop last");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
 }
 
 /// M9D-GC-03: a pending read promise outlives the GC of its stream/reader.
+///
+/// The promise is the global root; stream/reader exist only inside the
+/// block eval and go out of scope with it. The test then collects BEFORE
+/// worker completion: the operation must stay alive on demand alone, and
+/// the promise settles the exact chunk exactly once.
 #[test]
 fn gc_pending_promise_survives_endpoint_drop_and_settles_once() {
     let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
@@ -2075,16 +2123,16 @@ fn gc_pending_promise_survives_endpoint_drop_and_settles_once() {
     );
     context
         .eval(Source::from_bytes(
-            "globalThis.stream = srcBlob.stream(); \
-             globalThis.reader = globalThis.stream.getReader(); \
-             globalThis.settlements = 0; \
-             globalThis.promise = globalThis.reader.read(); \
-             globalThis.promise.then(r => { \
-                 globalThis.settlements += 1; \
-                 globalThis.verdict = 'len:' + r.value.length + ':' + r.done; \
-             }, () => { globalThis.verdict = 'rejected'; }); \
+            "globalThis.settlements = 0; \
              globalThis.verdict = 'pending'; \
-             delete globalThis.stream; delete globalThis.reader; true",
+             { let stream = srcBlob.stream(); \
+               let reader = stream.getReader(); \
+               globalThis.promise = reader.read(); \
+               globalThis.promise.then(r => { \
+                   globalThis.settlements += 1; \
+                   globalThis.verdict = 'len:' + r.value.length + ':' + r.done; \
+               }, () => { globalThis.verdict = 'rejected'; }); \
+             } true",
         ))
         .expect("setup");
     // Endpoints are gone but the promise demand is live: force GC before
@@ -2096,22 +2144,38 @@ fn gc_pending_promise_survives_endpoint_drop_and_settles_once() {
     drive_until_settled(&mut context, &handle, &executor);
     assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:12:false");
     assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
-    // After settlement, the next GC/cleanup frees the slot: the owed
-    // promise no longer roots the operation.
-    gc_drop_cleanup(&mut context, &handle, &executor, &["promise"]);
+    // After settlement the epoch is endpoint-less: the post-settlement
+    // drain inside `drive_until_settled` already abandoned it, so the
+    // triple is back at baseline even before the promise root is dropped.
+    assert_eq!(stream_counts(&mut context, &handle), baseline);
+    // Dropping the settled promise root changes nothing (idempotent).
+    context
+        .eval(Source::from_bytes(
+            "{ let p = globalThis.promise; globalThis.promise = undefined; } true",
+        ))
+        .expect("drop promise");
+    gc_drop_cleanup(&mut context, &handle, &executor);
     assert_eq!(stream_counts(&mut context, &handle), baseline);
     // And the freed slot serves a fresh stream immediately.
     context
         .eval(Source::from_bytes(
-            "globalThis.ok = (() => { try { new Blob(['x']).stream(); return true; } catch (e) { return false; } })(); \
-             true",
+            "{ let s = (() => { try { new Blob(['x']).stream(); return true; } catch (e) { return false; } })(); \
+               globalThis.ok = s; } true",
         ))
         .expect("probe");
     assert_eq!(eval_str(&mut context, "globalThis.ok"), "true");
-    gc_drop_cleanup(&mut context, &handle, &executor, &["ok"]);
+    context
+        .eval(Source::from_bytes("globalThis.ok = undefined; true"))
+        .expect("drop probe");
+    gc_drop_cleanup(&mut context, &handle, &executor);
 }
 
 /// M9D-GC-04: drop races against completion/cancel/EOF/error/shutdown.
+///
+/// Every sub-case creates its endpoints inside a block eval (they go out
+/// of scope with the eval) and collects with the real `force_collect()`
+/// before racing: no `delete globalThis.*`, no test hook. The surviving
+/// promise reactions stay reachable as globals only to observe verdicts.
 #[test]
 fn gc_drop_races_against_terminal_transitions_release_once() {
     // Drop vs completion-before-poll: the queued worker chunk still
@@ -2132,15 +2196,15 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         );
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.verdict = 'pending'; \
+                "globalThis.verdict = 'pending'; \
                  globalThis.settlements = 0; \
-                 globalThis.reader.read().then(r => { \
-                     globalThis.settlements += 1; \
-                     globalThis.verdict = 'len:' + r.value.length; \
-                 }); \
-                 delete globalThis.stream; delete globalThis.reader; true",
+                 { let stream = srcBlob.stream(); \
+                   let reader = stream.getReader(); \
+                   reader.read().then(r => { \
+                       globalThis.settlements += 1; \
+                       globalThis.verdict = 'len:' + r.value.length; \
+                   }); \
+                 } true",
             ))
             .expect("setup");
         boa_gc::force_collect();
@@ -2148,12 +2212,16 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         drive_until_settled(&mut context, &handle, &executor);
         assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:4");
         assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
-        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        // Endpoint-less after settlement: the post-settlement drain
+        // already abandoned the epoch, so the triple is at baseline.
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Drop vs completion-after-poll-before-jobs: the settlement job was
     // already queued at drop time and still runs exactly once; no second
-    // release follows.
+    // release follows. Endpoints go out of scope inside the block; the
+    // poll/drain below runs after the real collection.
     {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         publish_blob(
@@ -2169,25 +2237,25 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         );
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.verdict = 'pending'; \
+                "globalThis.verdict = 'pending'; \
                  globalThis.settlements = 0; \
-                 globalThis.reader.read().then(r => { \
-                     globalThis.settlements += 1; \
-                     globalThis.verdict = 'len:' + r.value.length; \
-                 }); \
+                 globalThis.hold = (() => { \
+                     let stream = srcBlob.stream(); \
+                     let reader = stream.getReader(); \
+                     reader.read().then(r => { \
+                         globalThis.settlements += 1; \
+                         globalThis.verdict = 'len:' + r.value.length; \
+                     }); \
+                     return null; \
+                 })(); \
                  true",
             ))
             .expect("setup");
         executor.run_streams();
         let settled = handle.poll_io(&mut context).expect("poll_io");
         assert_eq!(settled, 1);
-        context
-            .eval(Source::from_bytes(
-                "delete globalThis.stream; delete globalThis.reader; true",
-            ))
-            .expect("drop");
+        // The IIFE returned nothing reachable: stream/reader went out of
+        // scope with it. Collect now, then run the queued settlement job.
         boa_gc::force_collect();
         context.run_jobs().expect("run_jobs");
         drive_until_settled(&mut context, &handle, &executor);
@@ -2196,6 +2264,9 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Drop vs cancel (both orders): exactly one release, done settlement.
+    // cancel_first keeps endpoints alive in globals until cancel wins,
+    // then drops them via scope exit; drop_first collects first and can
+    // only cancel through a surviving global reader.
     for cancel_first in [true, false] {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         publish_blob(
@@ -2212,28 +2283,37 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         if cancel_first {
             context
                 .eval(Source::from_bytes(
-                    "globalThis.stream = srcBlob.stream(); \
-                     globalThis.reader = globalThis.stream.getReader(); \
-                     globalThis.reader.read().then(() => {}, () => {}); \
-                     globalThis.reader.cancel(); \
-                     delete globalThis.stream; delete globalThis.reader; true",
+                    "{ let stream = srcBlob.stream(); \
+                       let reader = stream.getReader(); \
+                       reader.read().then(() => {}, () => {}); \
+                       reader.cancel(); \
+                     } true",
                 ))
                 .expect("cancel first");
         } else {
             context
                 .eval(Source::from_bytes(
-                    "globalThis.stream = srcBlob.stream(); \
-                     globalThis.reader = globalThis.stream.getReader(); \
-                     globalThis.reader.read().then(() => {}, () => {}); \
-                     delete globalThis.stream; delete globalThis.reader; true",
+                    "globalThis.reader = (() => { \
+                         let stream = srcBlob.stream(); \
+                         let reader = stream.getReader(); \
+                         reader.read().then(() => {}, () => {}); \
+                         return reader; \
+                     })(); \
+                     true",
                 ))
-                .expect("drop first");
+                .expect("drop first setup");
             boa_gc::force_collect();
+            // Only the reader survived (returned from the IIFE); the
+            // stream side is already gone. Cancel through it, then drop
+            // it the real way too.
             context
-                .eval(Source::from_bytes("true"))
-                .expect("collect barrier");
+                .eval(Source::from_bytes(
+                    "globalThis.reader.cancel(); \
+                     { let r = globalThis.reader; globalThis.reader = undefined; } true",
+                ))
+                .expect("cancel after drop");
         }
-        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(
             stream_counts(&mut context, &handle),
             (0, 0, 0),
@@ -2242,6 +2322,10 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
     }
     // Drop vs EOF (both orders): the terminal EOF wins or the abandonment
     // wins — either way exactly one release and no resurrection.
+    // eof_first settles everything while endpoints are still reachable in
+    // globals (EOF wins, then the real drop of the dead epoch is a
+    // no-op); drop_first collects the endpoints inside the block first
+    // and only then drives the worker (abandonment wins before any chunk).
     for eof_first in [true, false] {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         publish_blob(
@@ -2255,25 +2339,38 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
                 1,
             ),
         );
-        context
-            .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.reader.read().then(() => {}); \
-                 globalThis.reader.read().then(() => {}); \
-                 true",
-            ))
-            .expect("setup");
         if eof_first {
+            context
+                .eval(Source::from_bytes(
+                    "globalThis.stream = srcBlob.stream(); \
+                     globalThis.reader = globalThis.stream.getReader(); \
+                     globalThis.reader.read().then(() => {}); \
+                     globalThis.reader.read().then(() => {}); \
+                     true",
+                ))
+                .expect("setup");
             drive_until_settled(&mut context, &handle, &executor);
+            context
+                .eval(Source::from_bytes(
+                    "{ let s = globalThis.stream; let r = globalThis.reader; \
+                       globalThis.stream = undefined; globalThis.reader = undefined; } true",
+                ))
+                .expect("drop after eof");
+            gc_drop_cleanup(&mut context, &handle, &executor);
         } else {
-            // One demand settles (chunk), the EOF probe is still owed when
-            // the endpoints go away: abandonment must not resurrect reads.
-            executor.run_streams();
-            let _ = handle.poll_io(&mut context);
-            context.run_jobs().expect("run_jobs");
+            context
+                .eval(Source::from_bytes(
+                    "{ let stream = srcBlob.stream(); \
+                       let reader = stream.getReader(); \
+                       reader.read().then(() => {}); \
+                       reader.read().then(() => {}); \
+                     } true",
+                ))
+                .expect("setup");
+            boa_gc::force_collect();
+            drive_until_settled(&mut context, &handle, &executor);
+            gc_drop_cleanup(&mut context, &handle, &executor);
         }
-        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader"]);
         assert_eq!(
             stream_counts(&mut context, &handle),
             (0, 0, 0),
@@ -2286,7 +2383,11 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Drop vs error (both orders): the mapped error still rejects live
-    // demand exactly once; the slot frees exactly once.
+    // demand exactly once; the slot frees exactly once. error_first keeps
+    // the promise reaction global and settles before dropping; drop_first
+    // collects the endpoints inside the block while the promise reaction
+    // (global) still owns the demand, so the error settles through the
+    // real drain afterwards.
     for error_first in [true, false] {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         publish_blob(
@@ -2297,42 +2398,63 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         );
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.verdict = 'pending'; \
-                 globalThis.settlements = 0; \
-                 globalThis.reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, e => { \
-                     globalThis.settlements += 1; \
-                     globalThis.verdict = e.name; \
-                 }); \
-                 true",
+                "globalThis.verdict = 'pending'; \
+                 globalThis.settlements = 0; true",
             ))
-            .expect("setup");
+            .expect("verdict root");
         if error_first {
+            context
+                .eval(Source::from_bytes(
+                    "globalThis.stream = srcBlob.stream(); \
+                     globalThis.reader = globalThis.stream.getReader(); \
+                     globalThis.reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, e => { \
+                         globalThis.settlements += 1; \
+                         globalThis.verdict = e.name; \
+                     }); \
+                     true",
+                ))
+                .expect("setup");
             drive_until_settled(&mut context, &handle, &executor);
             assert_eq!(
                 eval_str(&mut context, "globalThis.verdict"),
                 "NotReadableError"
             );
+            context
+                .eval(Source::from_bytes(
+                    "{ let s = globalThis.stream; let r = globalThis.reader; \
+                       globalThis.stream = undefined; globalThis.reader = undefined; } true",
+                ))
+                .expect("drop after error");
+            gc_drop_cleanup(&mut context, &handle, &executor);
+        } else {
+            context
+                .eval(Source::from_bytes(
+                    "{ let stream = srcBlob.stream(); \
+                       let reader = stream.getReader(); \
+                       reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, e => { \
+                           globalThis.settlements += 1; \
+                           globalThis.verdict = e.name; \
+                       }); \
+                     } true",
+                ))
+                .expect("setup");
+            boa_gc::force_collect();
+            // The owed promise still rejects exactly once through the real
+            // drain after the endpoints are gone.
+            drive_until_settled(&mut context, &handle, &executor);
+            let verdict = eval_str(&mut context, "globalThis.verdict");
+            assert!(
+                verdict == "NotReadableError",
+                "error race must reject once, got {verdict}"
+            );
+            assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
+            gc_drop_cleanup(&mut context, &handle, &executor);
         }
-        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader"]);
-        // When the error had not settled yet, the owed promise still
-        // rejects exactly once through the drain inside the cleanup.
-        drive_until_settled(&mut context, &handle, &executor);
-        let verdict = eval_str(&mut context, "globalThis.verdict");
-        assert!(
-            verdict == "NotReadableError",
-            "error race (error_first={error_first}) must reject once, got {verdict}"
-        );
-        assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
-        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Drop vs shutdown: shutdown wins, settles nothing late, frees once.
-    // Note: shutdown clears the bridge quota but leaves the context-table
-    // op root/payload cleanup to the shutdown drain path. The triple
-    // therefore reads (0 active, 0 payload, 0 ops) only after the drain
-    // below runs; assert the full triple there.
+    // Endpoints go out of scope inside the block before the collection;
+    // shutdown then runs on the endpoint-less (or abandoned) epoch.
     {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         publish_blob(
@@ -2348,11 +2470,11 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         );
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.verdict = 'pending'; \
-                 globalThis.reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, () => { globalThis.verdict = 'rejected'; }); \
-                 delete globalThis.stream; delete globalThis.reader; true",
+                "globalThis.verdict = 'pending'; \
+                 { let stream = srcBlob.stream(); \
+                   let reader = stream.getReader(); \
+                   reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, () => { globalThis.verdict = 'rejected'; }); \
+                 } true",
             ))
             .expect("setup");
         boa_gc::force_collect();
@@ -2360,12 +2482,16 @@ fn gc_drop_races_against_terminal_transitions_release_once() {
         executor.run_streams();
         drive_until_settled(&mut context, &handle, &executor);
         assert_eq!(eval_str(&mut context, "globalThis.verdict"), "pending");
-        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
 }
 
 /// M9D-GC-05: exhaustion/recovery and context isolation.
+///
+/// Unreachable streams are created inside block evals (out of scope with
+/// the eval); only the quota-probe verdict survives as a global. Recovery
+/// collects with the real `force_collect()` and drains the real `poll_io`.
 #[test]
 fn gc_exhaustion_recovery_and_context_isolation() {
     // Fill every slot (limit = 3) with unreachable streams: the next
@@ -2377,11 +2503,11 @@ fn gc_exhaustion_recovery_and_context_isolation() {
     let (mut context, handle, executor, _) = setup_manual_with_limits(limits);
     context
         .eval(Source::from_bytes(
-            "globalThis.s0 = new Blob(['a']).stream(); \
-             globalThis.s1 = new Blob(['b']).stream(); \
-             globalThis.s2 = new Blob(['c']).stream(); \
-             globalThis.probe = (() => { try { new Blob(['d']).stream(); return 'created'; } catch (e) { return e.constructor.name + ':' + e.name; } })(); \
-             true",
+            "{ let s0 = new Blob(['a']).stream(); \
+               let s1 = new Blob(['b']).stream(); \
+               let s2 = new Blob(['c']).stream(); \
+               globalThis.probe = (() => { try { new Blob(['d']).stream(); return 'created'; } catch (e) { return e.constructor.name + ':' + e.name; } })(); \
+             } true",
         ))
         .expect("exhaust");
     assert_eq!(stream_counts(&mut context, &handle), (3, 3, 3));
@@ -2391,47 +2517,58 @@ fn gc_exhaustion_recovery_and_context_isolation() {
         "quota boundary must reject, got {probe}"
     );
     // Real GC + cleanup recovers every slot without shutdown.
-    gc_drop_cleanup(
-        &mut context,
-        &handle,
-        &executor,
-        &["s0", "s1", "s2", "probe"],
-    );
+    context
+        .eval(Source::from_bytes("globalThis.probe = undefined; true"))
+        .expect("drop probe");
+    gc_drop_cleanup(&mut context, &handle, &executor);
     assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     context
         .eval(Source::from_bytes(
-            "globalThis.reader = new Blob(['ok']).stream().getReader(); \
-             globalThis.verdict = 'pending'; \
-             globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
-             true",
+            "globalThis.verdict = 'pending'; \
+             { let reader = new Blob(['ok']).stream().getReader(); \
+               reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+             } true",
         ))
         .expect("recovery stream");
     drive_until_settled(&mut context, &handle, &executor);
     assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:2");
-    gc_drop_cleanup(&mut context, &handle, &executor, &["reader"]);
+    gc_drop_cleanup(&mut context, &handle, &executor);
     assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     // Isolation: cleanup of one context never frees another context.
+    // Each stream goes out of scope inside its block eval; the survivor
+    // check observes the other context's real triple.
     {
         let (mut context_a, handle_a, executor_a, _) = setup_manual();
         let (mut context_b, handle_b, executor_b, _) = setup_manual();
         context_a
             .eval(Source::from_bytes(
-                "globalThis.a = new Blob(['a']).stream(); true",
+                "globalThis.keep_a = 1; \
+                 { let a = new Blob(['a']).stream(); globalThis.keep_a = 1; } true",
             ))
             .expect("context a stream");
         context_b
             .eval(Source::from_bytes(
-                "globalThis.b = new Blob(['b']).stream(); true",
+                "{ let b = new Blob(['b']).stream(); } true",
             ))
             .expect("context b stream");
-        assert_eq!(stream_counts(&mut context_a, &handle_a), (1, 1, 1));
+        // Context A keeps its stream alive via a different mechanism:
+        // re-create it as a real global root for the isolation check.
+        context_a
+            .eval(Source::from_bytes(
+                "globalThis.a = new Blob(['a2']).stream(); true",
+            ))
+            .expect("context a root");
         assert_eq!(stream_counts(&mut context_b, &handle_b), (1, 1, 1));
-        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a, &["a"]);
-        assert_eq!(stream_counts(&mut context_a, &handle_a), (0, 0, 0));
+        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a);
         // Context B is untouched by A's cleanup (no cross-context free).
         assert_eq!(stream_counts(&mut context_b, &handle_b), (1, 1, 1));
-        gc_drop_cleanup(&mut context_b, &handle_b, &executor_b, &["b"]);
+        gc_drop_cleanup(&mut context_b, &handle_b, &executor_b);
         assert_eq!(stream_counts(&mut context_b, &handle_b), (0, 0, 0));
+        context_a
+            .eval(Source::from_bytes("globalThis.a = undefined; true"))
+            .expect("drop a");
+        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a);
+        assert_eq!(stream_counts(&mut context_a, &handle_a), (0, 0, 0));
     }
     // Foreign poll_io is still rejected without mutation.
     {
@@ -2448,38 +2585,42 @@ fn gc_exhaustion_recovery_and_context_isolation() {
             Err(boa_fapi::PollIoError::ForeignContext)
         ));
         assert_eq!(stream_counts(&mut context_a, &handle_a), (1, 1, 1));
-        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a, &["a"]);
+        context_a
+            .eval(Source::from_bytes("globalThis.a = undefined; true"))
+            .expect("drop a");
+        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a);
         assert_eq!(stream_counts(&mut context_a, &handle_a), (0, 0, 0));
-        gc_drop_cleanup(&mut context_b, &handle_b, &executor_a, &[]);
+        gc_drop_cleanup(&mut context_b, &handle_b, &executor_a);
     }
 }
 
 /// M9D-GC-06: failure atomicity — every reachable failure after `reserve()`
 /// leaves quota/payload/operation counts unchanged.
+///
+/// Honest scope (acceptance finding): with the `streams-shim` feature
+/// enabled — the only configuration this suite builds — there is NO
+/// reachable post-`reserve()` failure inside `create_stream` itself: the
+/// prototype lookup cannot fail (registration installs it atomically, and
+/// `register` fails before any `globalThis` mutation otherwise), and the
+/// op-root insert / payload store are infallible. The previous revision
+/// of this test claimed a "missing prototype" injection here but executed
+/// an ordinary successful creation — that block is removed instead of
+/// re-labeled. What IS reachable after `reserve()` is covered below:
+/// quota-full creation, locked-`getReader`, queued-demand `releaseLock`,
+/// and submit failure each leave the triple unchanged. The synchronous
+/// rollback helpers (`rollback_stream_reservation`,
+/// `rollback_reader_endpoint`) exist for the disabled-shim builds and are
+/// covered by the `no-default-features` build (which asserts the same
+/// `TypeError` without consuming quota).
 #[test]
 fn gc_failure_atomicity_after_reserve_leaves_no_hidden_slot() {
-    // Missing prototype (feature-disabled surface): create_stream reserves,
-    // then rolls back synchronously — counts unchanged, error propagates.
-    {
-        let (mut context, handle, executor, _) = setup_manual();
-        let baseline = stream_counts(&mut context, &handle);
-        let result = context.eval(Source::from_bytes(
-            "globalThis.ok = (() => { try { new Blob(['x']).stream(); return 'created'; } catch (e) { return 'threw'; } })(); true",
-        ));
-        assert!(result.is_ok());
-        // Control: the success path holds exactly one slot (sanity that the
-        // baseline comparison below is meaningful).
-        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
-        gc_drop_cleanup(&mut context, &handle, &executor, &["ok"]);
-        assert_eq!(stream_counts(&mut context, &handle), baseline);
-    }
     // Quota-full is itself atomic: the rejected creation consumes nothing.
     {
         let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
         let baseline = stream_counts(&mut context, &handle);
         context
             .eval(Source::from_bytes(
-                "globalThis.holder = new Blob(['h']).stream(); true",
+                "{ let holder = new Blob(['h']).stream(); globalThis.holder = holder; } true",
             ))
             .expect("holder");
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
@@ -2490,11 +2631,17 @@ fn gc_failure_atomicity_after_reserve_leaves_no_hidden_slot() {
         assert_eq!(eval_str(&mut context, "globalThis.rejected"), "rejected");
         // Still exactly the holder's slot: no hidden second slot.
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
-        gc_drop_cleanup(&mut context, &handle, &executor, &["holder", "rejected"]);
+        context
+            .eval(Source::from_bytes(
+                "{ let h = globalThis.holder; let r = globalThis.rejected; \
+                   globalThis.holder = undefined; globalThis.rejected = undefined; } true",
+            ))
+            .expect("drop holder");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), baseline);
     }
     // getReader failure atomicity: locked-stream getReader throws without
-    // phantom endpoints (counts unchanged, original still reads).
+    // phantom sides (counts unchanged, original still reads).
     {
         let (mut context, handle, executor, _) = setup_manual();
         publish_blob(
@@ -2517,23 +2664,25 @@ fn gc_failure_atomicity_after_reserve_leaves_no_hidden_slot() {
             ))
             .expect("setup");
         assert_eq!(eval_str(&mut context, "globalThis.second"), "threw");
-        // Exactly one operation: the failed getReader left no phantom owner.
+        // Exactly one operation: the failed getReader left no phantom side.
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
         context
             .eval(Source::from_bytes(
                 "globalThis.verdict = 'pending'; \
-                 globalThis.r1.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
-                 true",
+                 { let r1 = globalThis.r1; \
+                   r1.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 } true",
             ))
             .expect("read");
         drive_until_settled(&mut context, &handle, &executor);
         assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:6");
-        gc_drop_cleanup(
-            &mut context,
-            &handle,
-            &executor,
-            &["stream", "r1", "second"],
-        );
+        context
+            .eval(Source::from_bytes(
+                "{ let s = globalThis.stream; let r = globalThis.r1; let x = globalThis.second; \
+                   globalThis.stream = undefined; globalThis.r1 = undefined; globalThis.second = undefined; } true",
+            ))
+            .expect("drop all");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // releaseLock failure atomicity: releasing with queued demand throws
@@ -2564,12 +2713,13 @@ fn gc_failure_atomicity_after_reserve_leaves_no_hidden_slot() {
         assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
         assert_eq!(executor.pending_streams(), 1);
         drive_until_settled(&mut context, &handle, &executor);
-        gc_drop_cleanup(
-            &mut context,
-            &handle,
-            &executor,
-            &["stream", "reader", "released"],
-        );
+        context
+            .eval(Source::from_bytes(
+                "{ let s = globalThis.stream; let r = globalThis.reader; let x = globalThis.released; \
+                   globalThis.stream = undefined; globalThis.reader = undefined; globalThis.released = undefined; } true",
+            ))
+            .expect("drop all");
+        gc_drop_cleanup(&mut context, &handle, &executor);
         assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
     }
     // Submit-failure atomicity (QueueFull executor): the failed read takes
@@ -2611,11 +2761,11 @@ fn gc_failure_atomicity_after_reserve_leaves_no_hidden_slot() {
         );
         context
             .eval(Source::from_bytes(
-                "globalThis.stream = srcBlob.stream(); \
-                 globalThis.reader = globalThis.stream.getReader(); \
-                 globalThis.v = 'pending'; \
-                 globalThis.reader.read().then(() => { globalThis.v = 'fulfilled'; }, e => { globalThis.v = e.name; }); \
-                 true",
+                "{ let stream = srcBlob.stream(); \
+                   let reader = stream.getReader(); \
+                   globalThis.v = 'pending'; \
+                   reader.read().then(() => { globalThis.v = 'fulfilled'; }, e => { globalThis.v = e.name; }); \
+                 } true",
             ))
             .expect("setup");
         drive(&mut context, &handle);
