@@ -126,6 +126,11 @@ impl WptWake {
         if *generation != observed || timeout.is_zero() {
             return;
         }
+        // Cap every single sleep at 50ms: a lost wake (worker completed
+        // between `poll_io` and `observe`) must delay the verdict by
+        // milliseconds, never by the remainder of the file timeout. The
+        // pump loop re-checks `has_pending_io` after every wake.
+        let timeout = timeout.min(Duration::from_millis(50));
         let _ = self
             .changed
             .wait_timeout_while(generation, timeout, |value| *value == observed);
@@ -307,14 +312,180 @@ fn split_trailing_punctuation(value: &str) -> (&str, &str) {
     (&value[..end], &value[end..])
 }
 
+/// Pre-fills the untitled-test title FIFO for one file.
+///
+/// Pinned files compute some titles at runtime from loop variables
+/// (Blob-newobject template literals, filereader_result event x method
+/// matrix) or omit the title entirely (four filereader files use bare
+/// `async_test(fn)`). The manifest lists the exact ids in execution order;
+/// the runner injects them as `globalThis.__wpt_next_title` (a plain Array)
+/// before the file runs, and each untitled `test`/`async_test`/`promise_test`
+/// call shifts one. Files without untitled calls get an empty FIFO (any
+/// untitled call there is FAIL).
+///
+/// The FIFO is filled from manifest rows in manifest order: the newobject
+/// `[NewObject]` family, the result matrix prefix
+/// (`result is null during "`), plus the bare-`async_test` ids
+/// (`async_test #N`). Static rows execute under their literal titles.
+/// Manifest order is the execution contract — the generator sorts rows by
+/// subtest, and all three families sort in execution order by construction.
+fn install_title_fifo(file: &ManifestFile, context: &mut Context) -> Result<(), RunError> {
+    use boa_engine::object::builtins::JsArray;
+    use boa_engine::{JsValue, js_string};
+    let titles: Vec<String> = file
+        .subtests
+        .iter()
+        .filter(|s| s.expected != ExpectedStatus::NotRun)
+        .map(|s| s.subtest.clone())
+        .filter(|name| {
+            name.ends_with("returns [NewObject]")
+                || name.starts_with("result is null during \"")
+                || name.starts_with("async_test #")
+        })
+        .collect();
+    // FIFO families with a fixed FILE order (not manifest sort order) are
+    // re-sorted into raw execution order here. Blob-newobject iterates
+    // `['stream', 'text', 'arrayBuffer', 'bytes']`; the result matrix and
+    // `async_test #N` ids already sort in execution order. Non-NewObject
+    // rows keep manifest order FIRST (family 0, stable by index);
+    // NewObject rows follow in file order (family 1) — one FIFO per file
+    // so cross-family mixing never happens in practice.
+    let titles: Vec<String> = titles;
+    let order = ["stream", "text", "arrayBuffer", "bytes"];
+    let mut keyed: Vec<(usize, usize, usize, String)> = titles
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let family = usize::from(name.ends_with("returns [NewObject]"));
+            let rank = if family == 1 {
+                let method = name
+                    .rsplit_once('.')
+                    .map(|(_, rest)| rest.split('(').next().unwrap_or(rest))
+                    .unwrap_or("");
+                order
+                    .iter()
+                    .position(|m| *m == method)
+                    .unwrap_or(usize::MAX)
+            } else {
+                index
+            };
+            (family, rank, index, name)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let titles: Vec<String> = keyed.into_iter().map(|(_, _, _, name)| name).collect();
+    let array = JsArray::new(context).map_err(|_| RunError::Prelude)?;
+    for (index, title) in titles.iter().enumerate() {
+        array
+            .set(
+                index,
+                JsValue::from(js_string!(title.as_str())),
+                false,
+                context,
+            )
+            .map_err(|_| RunError::Prelude)?;
+    }
+    context
+        .global_object()
+        .create_data_property_or_throw(
+            js_string!("__wpt_next_title"),
+            JsValue::from(array),
+            context,
+        )
+        .map_err(|_| RunError::Prelude)?;
+    Ok(())
+}
+
+/// Installs the M9-E §6 FileList fixture for the one manifest file that
+/// declares `fixture: "filelist"`.
+///
+/// On the Boa thread, before any test JS runs: creates two distinct `File`
+/// objects through the public host API (`FileApiHandle::file_from_bytes`),
+/// builds a real `FileList` via `FileApiHandle::file_list`, and injects
+/// only that object under the reserved `globalThis.__wpt_file_list`
+/// binding (plain data property on `globalThis`). Any other fixture name
+/// is a [`RunError::Prelude`] launch failure; the reserved binding is
+/// never created for files without the fixture declaration.
+///
+/// A plain Array or a pair of Files is NOT a fixture: `Object.prototype`
+/// `toString` must read `[object FileList]` or the install fails.
+fn install_file_list_fixture(
+    file: &ManifestFile,
+    handle: &mut FileApiHandle,
+    context: &mut Context,
+) -> Result<(), RunError> {
+    use boa_engine::{JsValue, js_string};
+    let fixture = file_fixture_name(file);
+    if fixture.is_none() {
+        return Ok(());
+    }
+    let Some(fixture) = fixture else {
+        return Ok(());
+    };
+    if fixture != "filelist" {
+        return Err(RunError::Prelude);
+    }
+    let first = handle
+        .file_from_bytes(
+            bytes::Bytes::from_static(b"a"),
+            "a.txt",
+            boa_fapi::HostFileOptions::default(),
+            context,
+        )
+        .map_err(|_| RunError::Prelude)?;
+    let second = handle
+        .file_from_bytes(
+            bytes::Bytes::from_static(b"bb"),
+            "b.txt",
+            boa_fapi::HostFileOptions::default(),
+            context,
+        )
+        .map_err(|_| RunError::Prelude)?;
+    let list = handle
+        .file_list([first, second], context)
+        .map_err(|_| RunError::Prelude)?;
+    context
+        .global_object()
+        .create_data_property_or_throw(js_string!("__wpt_file_list"), JsValue::from(list), context)
+        .map_err(|_| RunError::Prelude)?;
+    // Brand proof: the injected object must be a genuine FileList.
+    let tag = eval_string(
+        context,
+        "Object.prototype.toString.call(globalThis.__wpt_file_list)",
+    )?;
+    if tag != "[object FileList]" {
+        return Err(RunError::Prelude);
+    }
+    Ok(())
+}
+
+/// Reads the optional `fixture` declaration of a manifest file.
+fn file_fixture_name(file: &ManifestFile) -> Option<&str> {
+    file.fixture()
+}
+
 /// Registers the File API extension into a fresh context.
+///
+/// The WPT runner raises the per-global concurrent-read ceiling: one
+/// upstream file fans out dozens of simultaneous `test_blob` promise
+/// reads (Blob-slice issues ~140 at once across its matrix cells), and
+/// the default 64-slot bridge would reject the tail with a quota error.
+/// The WPT ceiling (1024) keeps every hail-mary in one file inside one
+/// worker while remaining bounded; quota-exhaustion behavior itself stays
+/// covered by the dedicated `m9_promise_io` integration tests.
 fn fresh_context() -> Result<(Context, FileApiHandle, Arc<WptWake>), RunError> {
+    use boa_fapi_core::limits::FileApiLimits;
     let mut context = Context::default();
     let wake = Arc::new(WptWake::default());
+    let limits = FileApiLimits {
+        max_concurrent_reads_per_global: 1024,
+        ..FileApiLimits::default()
+    };
     let handle = FileApiExtension::builder()
         .clock(Arc::new(WptClock {
             millis: 1_700_000_000_000,
         }))
+        .limits(limits)
         .io_wake(Arc::clone(&wake) as Arc<dyn FileIoWake>)
         .build()
         .register(&mut context)
@@ -353,7 +524,10 @@ fn eval_u64(context: &mut Context, source: &str) -> Result<u64, RunError> {
 /// Executes one manifest file and maps recorded entries to subtest rows.
 ///
 /// The file runs in a fresh `Context`; the prelude installs first, then
-/// the adapted source. Each pump pass drives the documented M9-B host loop
+/// an optional per-file host fixture (M9-E §6: only the `filelist` file
+/// receives a real host-created `FileList` under
+/// `globalThis.__wpt_file_list`), then the adapted source. Each pump
+/// pass drives the documented M9-B host loop
 /// (`FileApiHandle::poll_io` then `Context::run_jobs()`, up to
 /// `max_pump_passes` passes or `file_timeout` wall guard): entries recorded
 /// by then decide `PASS`/`FAIL`; still-expected-but-unrecorded async
@@ -371,17 +545,63 @@ pub fn run_file(
     context
         .eval(Source::from_bytes(&harness::prelude_source(&file.path)))
         .map_err(|_| RunError::Prelude)?;
-    let file_result = context.eval(Source::from_bytes(source_text));
-    let file_error = file_result.err().map(|e| format!("{e:?}"));
+    install_file_list_fixture(file, handle, context)?;
+    install_title_fifo(file, context)?;
+    // The whole corpus file evaluates FIRST (registers every test), then
+    // the pump drives settlement — exactly the browser shape (script runs
+    // to completion, then the task queue drains). Splitting eval and pump
+    // into separate host-loop turns would let continuations armed during
+    // eval (e.g. `wait_for('loadstart')` in `filereader_abort`) observe
+    // state from a partially-pumped world and time out.
+    let file_result = if file
+        .subtests
+        .iter()
+        .all(|s| s.expected == ExpectedStatus::NotRun)
+    {
+        // All-NOTRUN files (pure exclusions: idlharness,
+        // send-file-formdata, url-with-fetch/xhr matrices) never execute
+        // upstream JS: evaluating them would throw (missing host globals)
+        // and turn exact exclusions into FAIL. The manifest reason is the
+        // verdict; evaluation is skipped only when every row expects
+        // NOTRUN.
+        None
+    } else {
+        Some(context.eval(Source::from_bytes(source_text)))
+    };
+    // No DRAIN 0: the pump below starts with `poll_io` + `run_jobs`
+    // immediately after eval — the browser shape (script runs to
+    // completion, then the queue drains). A pre-poll `run_jobs()` pass
+    // regresses waiter arming (`filereader_abort` reused-reader TIMEOUT,
+    // `filereader_events` non-empty TIMEOUT): verified by trial, removed.
+    let file_error = file_result.and_then(|result| result.err().map(|e| format!("{e:?}")));
     // Bounded pump: the actual host loop is wake -> poll_io -> run_jobs.
     // `poll_io` is deliberately non-blocking, so an outstanding read waits
     // on the worker's wake signal rather than consuming a fixed number of
     // CPU spins before the worker receives a time slice. The wall guard
     // bounds a lost worker or a source that never returns. A job error is
     // FAIL for every unsettled row (never a silent TIMEOUT substitution).
+    //
+    // Hang triage aid (M9-E): when the wall guard fires with zero recorded
+    // entries, the detail names the phase (`no harness entry after pump
+    // budget`) — the per-file worker timing (`elapsed_ms`) shows whether
+    // evaluation itself stalled (large) or the pump spun idle (small).
+    //
+    // Wait strategy: `wait_for_change(remaining)` sleeps until the FULL
+    // file timeout when no wake arrives. Sync-only files (no bridge I/O
+    // ever pending) must NOT sleep: with nothing outstanding the loop just
+    // pumps jobs and re-checks, sleeping at most 50ms per pass so settled
+    // files return in milliseconds, not at the wall deadline. Early exit:
+    // once every manifest subtest has exactly one harness entry (pass or
+    // fail — duplicates excluded) and no bridge I/O is outstanding,
+    // further passes cannot birth new verdicts: pending async rows with no
+    // I/O and no jobs left would TIMEOUT identically now or at the wall.
+    // Harness-internal markers (`missing ... title`) also count as
+    // settled: they are terminal FAIL rows, never pending async work.
     let mut job_failed = false;
     let mut passes = 0;
-    while passes < options.max_pump_passes {
+    let mut quiet: u32 = 0;
+    let mut last_settled: u64 = u64::MAX;
+    'pump: while passes < options.max_pump_passes {
         if started.elapsed() > options.file_timeout {
             break;
         }
@@ -393,26 +613,60 @@ pub fn run_file(
         }
         passes += 1;
         if handle.has_pending_io() {
+            quiet = 0;
+            last_settled = u64::MAX;
             let remaining = options.file_timeout.saturating_sub(started.elapsed());
             wake.wait_for_change(observed_wake, remaining);
+        } else {
+            // Fast path: TWO consecutive quiet passes (no pending I/O,
+            // unchanged settled count) prove quiescence; a single quiet
+            // pass may still hold unflushed microtasks. Verdicts are final
+            // only when every expected row settled (all-PASS/FAIL/NOTRUN
+            // entries recorded, no pending async work left).
+            let settled = eval_u64(context, harness::settled_probe_source())
+                .unwrap_or(0)
+                .min(10_000);
+            if settled == last_settled
+                && settled as usize >= file.subtests.len()
+                && wake.observe() == observed_wake
+            {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            last_settled = settled;
+            if quiet >= 2 {
+                break 'pump;
+            }
+            wake.wait_for_change(observed_wake, Duration::from_millis(50));
         }
     }
     // Read back recorded entries: `pass|name|message` per index.
     // The count is clamped (10 000) and every per-index read is fallible.
     // A readback failure is a typed worker error, never an empty result or a
-    // fabricated TIMEOUT row.
-    let count = eval_u64(context, harness::results_probe_source())?.min(10_000);
-    let mut recorded: Vec<(bool, String, String)> = Vec::new();
-    for index in 0..count {
-        // `entry` sources are built from an integer index only — no file
-        // or manifest text is interpolated into evaluated JS.
-        let entry = eval_string(context, &harness::result_entry_source(index as usize))?;
-        let mut parts = entry.splitn(3, '|');
-        let pass = parts.next() == Some("1");
-        let name = parts.next().unwrap_or("").to_owned();
-        let message = parts.next().unwrap_or("").to_owned();
-        recorded.push((pass, name, message));
-    }
+    // fabricated TIMEOUT row. Skipped-evaluation files record nothing: the
+    // expected-NOTRUN mapping below reports them without readback.
+    let recorded: Vec<(bool, String, String)> = if file
+        .subtests
+        .iter()
+        .all(|s| s.expected == ExpectedStatus::NotRun)
+    {
+        Vec::new()
+    } else {
+        let count = eval_u64(context, harness::results_probe_source())?.min(10_000);
+        let mut recorded = Vec::new();
+        for index in 0..count {
+            // `entry` sources are built from an integer index only — no file
+            // or manifest text is interpolated into evaluated JS.
+            let entry = eval_string(context, &harness::result_entry_source(index as usize))?;
+            let mut parts = entry.splitn(3, '|');
+            let pass = parts.next() == Some("1");
+            let name = parts.next().unwrap_or("").to_owned();
+            let message = parts.next().unwrap_or("").to_owned();
+            recorded.push((pass, name, message));
+        }
+        recorded
+    };
     // Index recorded entries by name (first entry wins; duplicates fail
     // the subtest explicitly instead of silently passing).
     let mut by_name: BTreeMap<String, Vec<(bool, String)>> = BTreeMap::new();
@@ -567,9 +821,65 @@ mod tests {
     use crate::manifest::{ManifestSubtest, load_manifest};
 
     fn manifest_file(status: &str) -> ManifestFile {
+        // Schema-2 fixture (strict): full §4 record on the exercised row.
+        // Six one-row files cover every mandatory group so the loader's
+        // completeness check passes.
         let sha = "e".repeat(64);
+        let upstream_sha = "f".repeat(64);
+        let row = if status == "NOTRUN" {
+            "\"status\": \"NOTRUN\", \"reason\": \"needs X\", \"capability\": \"worker-runtime\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M9E-WPT-03\", \"classification\": \"unsupported-host-capability\", \"spec_section\": \"FileAPI WD Blob\", \"issue\": \"QUESTIONS.md Q1-Q3\""
+        } else {
+            "\"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"classification\": \"supported\", \"spec_section\": \"\", \"issue\": \"\""
+        };
+        let file = |path: &str, upstream: &str, group: &str, test: &str, subtest: &str| {
+            format!(
+                "{{\"path\": \"{path}\", \"upstream_path\": \"{upstream}\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"upstream_sha256\": \"{upstream_sha}\", \"sha256\": \"{sha}\", \"group\": \"{group}\", \"capability\": \"blob-constructor\", \"provenance\": \"direct\", \"subtests\": [{{\"test\": \"{test}\", \"subtest\": \"{subtest}\", {row}}}]}}"
+            )
+        };
         let text = format!(
-            "{{\"schema_version\": 1, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{{\"path\": \"corpus/a.js\", \"upstream_path\": \"FileAPI/blob/a.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/blob\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"t\", \"subtest\": \"s\", \"status\": \"{status}\", \"reason\": \"needs X\", \"capability\": \"c\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M7-WPT-05\"}}]}}, {{\"path\": \"corpus/b.js\", \"upstream_path\": \"FileAPI/file/b.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/file\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"t2\", \"subtest\": \"s2\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}}]}}, {{\"path\": \"corpus/c.js\", \"upstream_path\": \"FileAPI/filelist-section/c.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/filelist-section\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"t3\", \"subtest\": \"s3\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}}]}}, {{\"path\": \"corpus/d.js\", \"upstream_path\": \"FileAPI/reading-data-section/d.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/reading-data-section\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"t4\", \"subtest\": \"s4\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}}]}}, {{\"path\": \"corpus/e.js\", \"upstream_path\": \"FileAPI/FileReader/e.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/FileReader\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"t5\", \"subtest\": \"s5\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}}]}}, {{\"path\": \"corpus/f.js\", \"upstream_path\": \"FileAPI/BlobURL/f.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/BlobURL\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"t6\", \"subtest\": \"s6\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}}]}}]}}"
+            "{{\"schema_version\": 2, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{}, {}, {}, {}, {}, {}]}}",
+            file(
+                "corpus/a.js",
+                "FileAPI/blob/a.any.js",
+                "FileAPI/blob",
+                "t",
+                "s"
+            ),
+            file(
+                "corpus/b.js",
+                "FileAPI/file/b.any.js",
+                "FileAPI/file",
+                "t2",
+                "s2"
+            ),
+            file(
+                "corpus/c.js",
+                "FileAPI/filelist-section/c.any.js",
+                "FileAPI/filelist-section",
+                "t3",
+                "s3"
+            ),
+            file(
+                "corpus/d.js",
+                "FileAPI/reading-data-section/d.any.js",
+                "FileAPI/reading-data-section",
+                "t4",
+                "s4"
+            ),
+            file(
+                "corpus/e.js",
+                "FileAPI/root/e.any.js",
+                "FileAPI/root",
+                "t5",
+                "s5"
+            ),
+            file(
+                "corpus/f.js",
+                "FileAPI/url/f.any.js",
+                "FileAPI/url",
+                "t6",
+                "s6"
+            ),
         );
         load_manifest(&text, "2026-09-08")
             .expect("load")
@@ -609,6 +919,109 @@ mod tests {
             .find(|s| s.subtest == "s")
             .expect("row s");
         assert_eq!(row.actual, ActualStatus::Fail);
+    }
+
+    #[test]
+    fn filelist_fixture_injects_a_real_host_file_list() {
+        use crate::manifest::load_manifest;
+        // Schema-2 file WITH the `filelist` fixture: the runner must
+        // create two host Files, build a real FileList, and inject only
+        // that object — the JS below observes the host object, never a
+        // plain Array.
+        let sha = "e".repeat(64);
+        let upstream_sha = "f".repeat(64);
+        let fixture_file = format!(
+            "{{\"path\": \"corpus/filelist-host.js\", \"upstream_path\": \"FileAPI/filelist-section/filelist.html\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"upstream_sha256\": \"{upstream_sha}\", \"sha256\": \"{sha}\", \"group\": \"FileAPI/filelist-section\", \"capability\": \"filelist\", \"provenance\": \"adapted\", \"adapter\": \"m9e-filelist-fixture-01\", \"fixture\": \"filelist\", \"subtests\": [{{\"test\": \"filelist-host\", \"subtest\": \"s\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"filelist\", \"owner\": \"o\", \"review_by\": \"\", \"trace\": \"M9E-WPT-04\", \"classification\": \"project-acceptance\", \"spec_section\": \"FileAPI WD FileList\", \"issue\": \"\"}}]}}"
+        );
+        // The loader requires all six groups: add five direct siblings.
+        let sibling = |path: &str, upstream: &str, group: &str, test: &str, subtest: &str| {
+            format!(
+                "{{\"path\": \"{path}\", \"upstream_path\": \"{upstream}\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"upstream_sha256\": \"{upstream_sha}\", \"sha256\": \"{sha}\", \"group\": \"{group}\", \"capability\": \"blob-constructor\", \"provenance\": \"direct\", \"subtests\": [{{\"test\": \"{test}\", \"subtest\": \"{subtest}\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"classification\": \"supported\", \"spec_section\": \"\", \"issue\": \"\"}}]}}"
+            )
+        };
+        let text = format!(
+            "{{\"schema_version\": 2, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{fixture_file}, {}, {}, {}, {}, {}]}}",
+            sibling(
+                "corpus/b.js",
+                "FileAPI/file/b.any.js",
+                "FileAPI/file",
+                "t2",
+                "s2"
+            ),
+            sibling(
+                "corpus/c.js",
+                "FileAPI/blob/c.any.js",
+                "FileAPI/blob",
+                "t3",
+                "s3"
+            ),
+            sibling(
+                "corpus/d.js",
+                "FileAPI/reading-data-section/d.any.js",
+                "FileAPI/reading-data-section",
+                "t4",
+                "s4"
+            ),
+            sibling(
+                "corpus/e.js",
+                "FileAPI/root/e.any.js",
+                "FileAPI/root",
+                "t5",
+                "s5"
+            ),
+            sibling(
+                "corpus/f.js",
+                "FileAPI/url/f.any.js",
+                "FileAPI/url",
+                "t6",
+                "s6"
+            ),
+        );
+        let manifest = load_manifest(&text, "2026-09-08").expect("load");
+        let file = manifest
+            .files
+            .iter()
+            .find(|f| f.path == "corpus/filelist-host.js")
+            .expect("fixture file")
+            .clone();
+        let result = run_file(
+            &file,
+            "test(function() { \
+               var list = globalThis.__wpt_file_list; \
+               assert_equals(Object.prototype.toString.call(list), '[object FileList]'); \
+               assert_equals(list.length, 2); \
+               assert_equals(list.item(0).name, 'a.txt'); \
+             }, 's');",
+            &RunOptions::default(),
+        )
+        .expect("run");
+        let row = result
+            .subtests
+            .iter()
+            .find(|s| s.subtest == "s")
+            .expect("row s");
+        assert_eq!(row.actual, ActualStatus::Pass);
+    }
+
+    #[test]
+    fn filelist_fixture_rejects_a_plain_array() {
+        // Negative control for §6: without the fixture declaration the
+        // reserved binding must not exist — a plain Array never counts.
+        let file = manifest_file("PASS");
+        let result = run_file(
+            &file,
+            "test(function() { \
+               assert_equals(typeof globalThis.__wpt_file_list, 'undefined'); \
+             }, 's');",
+            &RunOptions::default(),
+        )
+        .expect("run");
+        let row = result
+            .subtests
+            .iter()
+            .find(|s| s.subtest == "s")
+            .expect("row s");
+        assert_eq!(row.actual, ActualStatus::Pass);
     }
 
     #[test]
@@ -702,6 +1115,9 @@ mod tests {
             owner: String::new(),
             review_by: String::new(),
             trace: String::new(),
+            classification: crate::manifest::Classification::Supported,
+            spec_section: String::new(),
+            issue: String::new(),
         };
         assert_eq!(sub.timeout_ms, 1);
     }

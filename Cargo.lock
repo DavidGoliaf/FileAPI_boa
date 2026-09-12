@@ -183,6 +183,8 @@ version = "0.1.0"
 dependencies = [
  "boa_engine",
  "boa_fapi",
+ "boa_fapi_core",
+ "bytes",
  "thiserror",
 ]
 

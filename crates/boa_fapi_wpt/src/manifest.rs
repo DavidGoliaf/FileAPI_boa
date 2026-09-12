@@ -12,22 +12,31 @@ use std::fmt;
 use thiserror::Error;
 
 /// Manifest schema version accepted by this harness.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Minimal schema version accepted by the offline `--smoke` developer
+/// path (legacy M7 manifests). Strict mode always requires
+/// [`SCHEMA_VERSION`].
+pub const MIN_SMOKE_SCHEMA_VERSION: u32 = 1;
 
 /// Terminal per-subtest statuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExpectedStatus {
     /// The subtest must pass.
     Pass,
+    /// A recorded open defect: actual FAIL satisfies the strict
+    /// comparison (keeps the release gate red, see `report::release_green`).
+    Fail,
     /// The subtest cannot run: exact capability gap recorded.
     NotRun,
 }
 
 impl ExpectedStatus {
-    /// Parses the exact status token (`PASS` / `NOTRUN` only).
+    /// Parses the exact status token (`PASS` / `FAIL` / `NOTRUN`).
     pub fn parse(token: &str) -> Result<Self, ManifestError> {
         match token {
             "PASS" => Ok(Self::Pass),
+            "FAIL" => Ok(Self::Fail),
             "NOTRUN" => Ok(Self::NotRun),
             _ => Err(ManifestError::UnknownStatus(token.to_owned())),
         }
@@ -38,10 +47,116 @@ impl ExpectedStatus {
     pub fn token(self) -> &'static str {
         match self {
             Self::Pass => "PASS",
+            Self::Fail => "FAIL",
             Self::NotRun => "NOTRUN",
         }
     }
 }
+
+/// Provenance of one manifest file: how the executed bytes relate to the
+/// pinned upstream file (M9-E §5 fidelity gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Executed bytes are the raw pinned upstream bytes, byte-identical
+    /// (`sha256 == upstream_sha256`, no `adapter`).
+    Direct,
+    /// Project-owned file executed through a deterministic adapter/patch
+    /// (`adapter` id required, e.g. the FileList host fixture).
+    Adapted,
+}
+
+impl Provenance {
+    /// Parses the exact provenance token (`direct` / `adapted`).
+    pub fn parse(token: &str) -> Result<Self, ManifestError> {
+        match token {
+            "direct" => Ok(Self::Direct),
+            "adapted" => Ok(Self::Adapted),
+            _ => Err(ManifestError::BadType("files[].provenance".to_owned())),
+        }
+    }
+
+    /// Renders the canonical provenance token.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Adapted => "adapted",
+        }
+    }
+}
+
+/// Classification of one subtest row (M9-E §4 accounting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Classification {
+    /// Implemented behavior: PASS, or a recorded open defect (FAIL with
+    /// an `issue` link — satisfies strict, keeps release red).
+    Supported,
+    /// Missing host capability from the closed allow-list
+    /// ([`CAPABILITY_ALLOW_LIST`]): exact NOTRUN exclusion.
+    UnsupportedHostCapability,
+    /// Harness gap: never a valid long-term exclusion — breaks the
+    /// release gate (load error in strict manifests).
+    HarnessGap,
+    /// Project-owned acceptance row (never presented as WPT).
+    ProjectAcceptance,
+}
+
+impl Classification {
+    /// Parses the exact classification token.
+    pub fn parse(token: &str) -> Result<Self, ManifestError> {
+        match token {
+            "supported" => Ok(Self::Supported),
+            "unsupported-host-capability" => Ok(Self::UnsupportedHostCapability),
+            "harness-gap" => Ok(Self::HarnessGap),
+            "project-acceptance" => Ok(Self::ProjectAcceptance),
+            _ => Err(ManifestError::BadType(
+                "subtests[].classification".to_owned(),
+            )),
+        }
+    }
+
+    /// Renders the canonical classification token.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::UnsupportedHostCapability => "unsupported-host-capability",
+            Self::HarnessGap => "harness-gap",
+            Self::ProjectAcceptance => "project-acceptance",
+        }
+    }
+}
+
+/// Closed capability allow-list (M9-E §4): `browser-only` is never valid;
+/// browser-only tests are recorded under their concrete missing
+/// capability instead.
+pub const CAPABILITY_ALLOW_LIST: [&str; 13] = [
+    "html-file-input",
+    "navigation",
+    "fetch",
+    "mediasource",
+    "worker-runtime",
+    "network-wpt-server",
+    "blob-constructor",
+    "blob-slice",
+    "promise-reads",
+    "file-constructor",
+    "filereader",
+    "filelist",
+    "blob-url",
+];
+
+/// Mandatory WPT groups: every strict manifest covers all six roots plus
+/// the pinned `FileAPI/root` and `FileAPI/url` groups produced by the
+/// deterministic generator.
+pub const REQUIRED_GROUPS: [&str; 6] = [
+    "FileAPI/blob",
+    "FileAPI/file",
+    "FileAPI/filelist-section",
+    "FileAPI/reading-data-section",
+    "FileAPI/root",
+    "FileAPI/url",
+];
 
 /// One adapted corpus file entry.
 #[derive(Debug, Clone)]
@@ -50,16 +165,35 @@ pub struct ManifestFile {
     pub path: String,
     /// Upstream `FileAPI/**` path this file adapts.
     pub upstream_path: String,
-    /// Upstream git blob SHA (hex, provenance only).
+    /// Upstream git blob SHA (hex, provenance only — never evidence).
     pub upstream_blob_sha: String,
-    /// SHA-256 (hex, lowercase) of the stored adapted file bytes.
+    /// Raw-content SHA-256 (hex, lowercase) of the pinned upstream bytes
+    /// (M9-E §3 evidence, verified against `--upstream-root`).
+    pub upstream_sha256: String,
+    /// SHA-256 (hex, lowercase) of the stored corpus file bytes.
     pub sha256: String,
     /// WPT group, e.g. `FileAPI/blob`.
     pub group: String,
     /// Capability the file needs, e.g. `blob-constructor`.
     pub capability: String,
+    /// Fidelity provenance: `direct` (byte-identical upstream) or
+    /// `adapted` (deterministic adapter/patch + `adapter` id).
+    pub provenance: Provenance,
+    /// Adapter id for `adapted` files (e.g. `m9e-filelist-fixture-01`);
+    /// always empty for `direct` files.
+    pub adapter: String,
+    /// Optional per-file host fixture hook name (only `filelist`).
+    pub fixture: Option<String>,
     /// Subtests in file order (stable report order).
     pub subtests: Vec<ManifestSubtest>,
+}
+
+impl ManifestFile {
+    /// Returns the fixture hook name, if declared.
+    #[must_use]
+    pub fn fixture(&self) -> Option<&str> {
+        self.fixture.as_deref()
+    }
 }
 
 /// One subtest expectation: exact IDs, no wildcards.
@@ -73,7 +207,7 @@ pub struct ManifestSubtest {
     pub timeout_ms: u64,
     /// Expected terminal status.
     pub expected: ExpectedStatus,
-    /// Machine-readable gap reason (required for `NOTRUN`).
+    /// Machine-readable gap reason (required unless PASS).
     pub reason: String,
     /// Capability the subtest needs.
     pub capability: String,
@@ -81,8 +215,15 @@ pub struct ManifestSubtest {
     pub owner: String,
     /// Review date `YYYY-MM-DD`; expired entries fail strict loads.
     pub review_by: String,
-    /// Trace row in `docs/spec-matrix.md`, e.g. `M7-WPT-01`.
+    /// Trace row in `docs/spec-matrix.md`, e.g. `M9E-WPT-02`.
     pub trace: String,
+    /// Accounting classification (M9-E §4).
+    pub classification: Classification,
+    /// Normative spec section, e.g. `FileAPI WD Blob`.
+    pub spec_section: String,
+    /// Open-defect link (required for expected FAIL) or
+    /// capability-gap reference (required for NOTRUN).
+    pub issue: String,
 }
 
 /// Pinned upstream source block.
@@ -99,6 +240,7 @@ pub struct ManifestSource {
 /// Loaded manifest: source, files keyed by path (sorted), default timeout.
 #[derive(Debug, Clone)]
 pub struct Manifest {
+    schema_version: u32,
     /// Pinned upstream source.
     pub source: ManifestSource,
     /// Corpus root relative to the manifest directory.
@@ -107,6 +249,35 @@ pub struct Manifest {
     pub default_timeout_ms: u64,
     /// Files in manifest order.
     pub files: Vec<ManifestFile>,
+}
+
+impl Manifest {
+    /// Returns the validated schema version (1 = legacy smoke-only,
+    /// 2 = strict M9-E gate).
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Rebuilds the manifest with cloned fields (worker fan-out across
+    /// OS threads: only validated records cross the boundary, never live
+    /// JS state).
+    #[must_use]
+    pub fn for_worker(
+        &self,
+        source: ManifestSource,
+        corpus_root: String,
+        default_timeout_ms: u64,
+        files: Vec<ManifestFile>,
+    ) -> Self {
+        Self {
+            schema_version: self.schema_version,
+            source,
+            corpus_root,
+            default_timeout_ms,
+            files,
+        }
+    }
 }
 
 /// Fallible manifest errors (library uses `thiserror`, never panics).
@@ -133,6 +304,21 @@ pub enum ManifestError {
     /// Non-`PASS` expectation without capability/owner/review/trace.
     #[error("subtest `{0} :: {1}` needs `{2}` for {3}")]
     MissingFieldFor(String, String, String, String),
+    /// Expected FAIL without an open-defect `issue` link.
+    #[error("subtest `{0} :: {1}` expects FAIL without an open defect record")]
+    MissingIssue(String, String),
+    /// `browser-only` is never a valid capability.
+    #[error("subtest `{0} :: {1}` uses forbidden capability `browser-only`")]
+    BrowserOnly(String, String),
+    /// Unknown capability (not in the closed allow-list).
+    #[error("subtest `{0} :: {1}` uses unknown capability `{2}`")]
+    BadCapability(String, String, String),
+    /// `supported` subtest wrongly marked NOTRUN.
+    #[error("subtest `{0} :: {1}` is supported and must not be NOTRUN")]
+    SupportedNotRun(String, String),
+    /// A `harness-gap` exclusion (breaks the release gate).
+    #[error("subtest `{0} :: {1}` records a harness gap (release gate is red)")]
+    HarnessGap(String, String),
     /// Malformed hex hash.
     #[error("manifest field `{0}` is not lowercase hex")]
     BadHex(String),
@@ -526,16 +712,6 @@ pub const MAX_NAME_LEN: usize = 256;
 /// Maximum accepted lengths for reason/owner/trace fields.
 pub const MAX_META_LEN: usize = 512;
 
-/// Mandatory WPT groups: every strict manifest covers all six.
-pub const REQUIRED_GROUPS: [&str; 6] = [
-    "FileAPI/blob",
-    "FileAPI/file",
-    "FileAPI/filelist-section",
-    "FileAPI/reading-data-section",
-    "FileAPI/FileReader",
-    "FileAPI/BlobURL",
-];
-
 /// Validates a logical adapted path: exactly `corpus/<name>.js` with no
 /// leading slash, drive prefix, `..` segment, NUL/control characters or
 /// non-`.js` suffix. This is a logical name, never an OS path: joining
@@ -778,7 +954,468 @@ fn is_date(text: &str) -> bool {
     day <= max_day
 }
 
-/// Loads and validates a manifest document.
+/// Resolves the effective capability: the subtest-level value wins; an
+/// empty subtest value inherits the file-level capability.
+fn effective_capability(file_capability: &str, sub_capability: &str) -> String {
+    if sub_capability.is_empty() {
+        file_capability.to_owned()
+    } else {
+        sub_capability.to_owned()
+    }
+}
+
+/// Validates one closed-list capability value (schema 2): non-empty,
+/// listed in [`CAPABILITY_ALLOW_LIST`], never `browser-only` (which is
+/// not in the list by design and gets its own error).
+fn check_capability(test: &str, subtest: &str, capability: &str) -> Result<(), ManifestError> {
+    if capability == "browser-only" {
+        return Err(ManifestError::BrowserOnly(
+            test.to_owned(),
+            subtest.to_owned(),
+        ));
+    }
+    if !CAPABILITY_ALLOW_LIST.contains(&capability) {
+        return Err(ManifestError::BadCapability(
+            test.to_owned(),
+            subtest.to_owned(),
+            capability.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Enforces the M9-E §4 accounting rules for one manifest row:
+///
+/// - `supported` is never `NOTRUN`;
+/// - expected `FAIL` needs a non-empty open-defect `issue` link;
+/// - `harness-gap` breaks the release gate (load error);
+/// - `unsupported-host-capability` needs a closed-list capability
+///   (never `browser-only`).
+fn check_expectation_rules(
+    test: &str,
+    subtest: &str,
+    expected: ExpectedStatus,
+    classification: Classification,
+    capability: &str,
+    reason: &str,
+    issue: &str,
+) -> Result<(), ManifestError> {
+    check_capability(test, subtest, capability)?;
+    match classification {
+        Classification::Supported => {
+            if expected == ExpectedStatus::NotRun {
+                return Err(ManifestError::SupportedNotRun(
+                    test.to_owned(),
+                    subtest.to_owned(),
+                ));
+            }
+            if expected == ExpectedStatus::Fail && issue.is_empty() {
+                return Err(ManifestError::MissingIssue(
+                    test.to_owned(),
+                    subtest.to_owned(),
+                ));
+            }
+        }
+        Classification::UnsupportedHostCapability => {
+            if reason.is_empty() {
+                return Err(ManifestError::MissingReason(
+                    test.to_owned(),
+                    subtest.to_owned(),
+                    expected.token().to_owned(),
+                ));
+            }
+        }
+        Classification::HarnessGap => {
+            return Err(ManifestError::HarnessGap(
+                test.to_owned(),
+                subtest.to_owned(),
+            ));
+        }
+        Classification::ProjectAcceptance => {}
+    }
+    Ok(())
+}
+
+/// One parsed `expectations.json` row (M9-E §4): the exact
+/// `(upstream_path, test, subtest)` id plus the full accounting record.
+#[derive(Debug, Clone)]
+pub struct ExpectationRow {
+    /// Pinned upstream `FileAPI/**` path.
+    pub upstream_path: String,
+    /// Test ID (file-level name).
+    pub test: String,
+    /// Subtest name.
+    pub subtest: String,
+    /// Expected terminal status.
+    pub expected: ExpectedStatus,
+    /// Accounting classification.
+    pub classification: Classification,
+    /// Closed-list capability.
+    pub capability: String,
+    /// Exact gap/defect reason.
+    pub reason: String,
+    /// Owner of the entry.
+    pub owner: String,
+    /// Review date `YYYY-MM-DD`.
+    pub review_by: String,
+    /// Trace row, e.g. `M9E-WPT-03`.
+    pub trace: String,
+    /// Normative spec section.
+    pub spec_section: String,
+    /// Open-defect link (FAIL) or gap reference (NOTRUN).
+    pub issue: String,
+    /// `direct`, the fixture adapter id, or empty (file-level exclusion).
+    pub adapter: String,
+}
+
+/// Loads and validates an `expectations.json` document (schema 1).
+///
+/// Rules: exact `(upstream_path, test, subtest)` rows, no wildcards or
+/// file-level catch-alls (every row names a subtest), closed-list
+/// capabilities (never `browser-only`), the §4 classification matrix
+/// (same rules as manifest rows), and the
+/// pinned repository/commit literals matching the manifest source.
+/// Expired `review_by` fails the load.
+pub fn load_expectations(
+    text: &str,
+    today: &str,
+    source: &ManifestSource,
+) -> Result<Vec<ExpectationRow>, ManifestError> {
+    let root = parse_json(text)?;
+    if !matches!(root, Json::Obj(_)) {
+        return Err(ManifestError::RootNotObject);
+    }
+    let schema = root
+        .need("schema_version")?
+        .as_u32()
+        .ok_or_else(|| ManifestError::BadType("schema_version".to_owned()))?;
+    if schema != 1 {
+        return Err(ManifestError::BadSchema(schema));
+    }
+    let repository = root
+        .need("repository")?
+        .as_str()
+        .ok_or_else(|| ManifestError::BadType("repository".to_owned()))?;
+    let commit = root
+        .need("commit")?
+        .as_str()
+        .ok_or_else(|| ManifestError::BadType("commit".to_owned()))?;
+    if repository != source.repository || commit != source.commit {
+        return Err(ManifestError::BadType("expectations source".to_owned()));
+    }
+    if !is_hex(commit, 20) {
+        return Err(ManifestError::BadHex("commit".to_owned()));
+    }
+    let rows = root
+        .need("expectations")?
+        .as_arr()
+        .ok_or_else(|| ManifestError::BadType("expectations".to_owned()))?;
+    if rows.is_empty() || rows.len() > 100_000 {
+        return Err(ManifestError::BadType("expectations".to_owned()));
+    }
+    let mut out = Vec::new();
+    let mut seen: BTreeMap<(String, String, String), ()> = BTreeMap::new();
+    for row in rows {
+        let upstream_path = row
+            .need("upstream_path")?
+            .as_str()
+            .ok_or_else(|| ManifestError::BadType("upstream_path".to_owned()))?
+            .to_owned();
+        let test = row
+            .need("test")?
+            .as_str()
+            .ok_or_else(|| ManifestError::BadType("test".to_owned()))?
+            .to_owned();
+        let subtest = row
+            .need("subtest")?
+            .as_str()
+            .ok_or_else(|| ManifestError::BadType("subtest".to_owned()))?
+            .to_owned();
+        let status = row
+            .need("status")?
+            .as_str()
+            .ok_or_else(|| ManifestError::BadType("status".to_owned()))?;
+        let expected = ExpectedStatus::parse(status)?;
+        let classification = Classification::parse(
+            row.need("classification")?
+                .as_str()
+                .ok_or_else(|| ManifestError::BadType("classification".to_owned()))?,
+        )?;
+        let capability = row
+            .need("capability")?
+            .as_str()
+            .ok_or_else(|| ManifestError::BadType("capability".to_owned()))?
+            .to_owned();
+        let reason = row
+            .field("reason")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let owner = row
+            .field("owner")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let review_by = row
+            .field("review_by")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let trace = row
+            .field("trace")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let spec_section = row
+            .field("spec_section")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let issue = row
+            .field("issue")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let adapter = row
+            .field("adapter")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if upstream_path.is_empty()
+            || test.is_empty()
+            || subtest.is_empty()
+            || upstream_path.len() > MAX_PATH_LEN
+            || test.len() > MAX_NAME_LEN
+            || subtest.len() > MAX_NAME_LEN
+        {
+            return Err(ManifestError::BadType("expectation id".to_owned()));
+        }
+        if !upstream_path.starts_with("FileAPI/") {
+            return Err(ManifestError::BadType("upstream_path".to_owned()));
+        }
+        if test.contains('*') || subtest.contains('*') || upstream_path.contains('*') {
+            return Err(ManifestError::Wildcard(test.clone(), subtest.clone()));
+        }
+        for value in [
+            &reason,
+            &owner,
+            &review_by,
+            &trace,
+            &spec_section,
+            &issue,
+            &adapter,
+        ] {
+            if value.len() > MAX_META_LEN {
+                return Err(ManifestError::BadType(
+                    "expectation meta too long".to_owned(),
+                ));
+            }
+        }
+        if adapter.contains('*') {
+            return Err(ManifestError::Wildcard(test.clone(), subtest.clone()));
+        }
+        if owner.is_empty() || review_by.is_empty() || trace.is_empty() {
+            return Err(ManifestError::MissingFieldFor(
+                test.clone(),
+                subtest.clone(),
+                "owner/review_by/trace".to_owned(),
+                expected.token().to_owned(),
+            ));
+        }
+        if !is_date(&review_by) {
+            return Err(ManifestError::BadDate(test.clone(), subtest.clone()));
+        }
+        if review_by.as_str() < today {
+            return Err(ManifestError::Expired(
+                test.clone(),
+                subtest.clone(),
+                review_by.clone(),
+            ));
+        }
+        if expected == ExpectedStatus::NotRun && reason.is_empty() {
+            return Err(ManifestError::MissingReason(
+                test.clone(),
+                subtest.clone(),
+                expected.token().to_owned(),
+            ));
+        }
+        check_expectation_rules(
+            &test,
+            &subtest,
+            expected,
+            classification,
+            &capability,
+            &reason,
+            &issue,
+        )?;
+        // `DYNAMIC:` tracker rows cover dynamic-title matrices that never
+        // execute (the harness cannot name them byte-exactly yet): they
+        // must be NOTRUN exclusions, never PASS/FAIL.
+        if subtest.starts_with("DYNAMIC:") && expected != ExpectedStatus::NotRun {
+            return Err(ManifestError::BadType(
+                "DYNAMIC tracker must be NOTRUN".to_owned(),
+            ));
+        }
+        if seen
+            .insert((upstream_path.clone(), test.clone(), subtest.clone()), ())
+            .is_some()
+        {
+            return Err(ManifestError::Duplicate(test, subtest));
+        }
+        out.push(ExpectationRow {
+            upstream_path,
+            test,
+            subtest,
+            expected,
+            classification,
+            capability,
+            reason,
+            owner,
+            review_by,
+            trace,
+            spec_section,
+            issue,
+            adapter,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolves manifest rows against expectation rows by exact
+/// `(upstream_path, test, subtest)` id (M9-E §4 drift gate).
+///
+/// Every manifest subtest needs exactly one expectations row with the
+/// same id, status, classification, capability, reason, owner,
+/// `review_by`, trace, section, and issue; any drift (status, reason,
+/// capability, owner, review, trace, classification, section, issue) is
+/// a load error. Expectations rows without a manifest file are either
+/// `DYNAMIC:` trackers or file-level exclusions (subtest exactly
+/// `file-level exclusion`) — anything else is a load error. Adapter
+/// agreement: manifest `direct` files require expectations `adapter ==
+/// "direct"`; the `adapted` FileList fixture requires the fixture
+/// adapter id on both sides.
+pub fn resolve_expectations(
+    manifest: &Manifest,
+    rows: &[ExpectationRow],
+) -> Result<(), ManifestError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_id: BTreeMap<(String, String, String), &ExpectationRow> = BTreeMap::new();
+    for row in rows {
+        if by_id
+            .insert(
+                (
+                    row.upstream_path.clone(),
+                    row.test.clone(),
+                    row.subtest.clone(),
+                ),
+                row,
+            )
+            .is_some()
+        {
+            return Err(ManifestError::Duplicate(
+                row.test.clone(),
+                row.subtest.clone(),
+            ));
+        }
+    }
+    let mut covered: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for file in &manifest.files {
+        for sub in &file.subtests {
+            let key = (
+                file.upstream_path.clone(),
+                sub.test.clone(),
+                sub.subtest.clone(),
+            );
+            let Some(row) = by_id.get(&key) else {
+                return Err(ManifestError::MissingField(format!(
+                    "no expectation for `{}`",
+                    sub.subtest
+                )));
+            };
+            if row.expected != sub.expected
+                || row.classification != sub.classification
+                || row.capability != sub.capability
+                || row.reason != sub.reason
+                || row.owner != sub.owner
+                || row.review_by != sub.review_by
+                || row.trace != sub.trace
+                || row.spec_section != sub.spec_section
+                || row.issue != sub.issue
+            {
+                return Err(ManifestError::BadType(format!(
+                    "expectation drift for `{}`",
+                    sub.subtest
+                )));
+            }
+            let expected_adapter = match file.provenance {
+                Provenance::Direct => "direct",
+                Provenance::Adapted => file.adapter.as_str(),
+            };
+            if row.adapter != expected_adapter {
+                return Err(ManifestError::BadType(format!(
+                    "adapter drift for `{}`",
+                    sub.subtest
+                )));
+            }
+            covered.insert(key);
+        }
+    }
+    for row in rows {
+        let key = (
+            row.upstream_path.clone(),
+            row.test.clone(),
+            row.subtest.clone(),
+        );
+        if covered.contains(&key) {
+            continue;
+        }
+        // Rows without a manifest file: only `DYNAMIC:` trackers and
+        // file-level exclusions exist by design.
+        let tracker = row.subtest.starts_with("DYNAMIC:");
+        let file_level = row.subtest == "file-level exclusion";
+        if !tracker && !file_level {
+            return Err(ManifestError::MissingField(format!(
+                "expectation without manifest file for `{}`",
+                row.subtest
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Collects the `DYNAMIC:` tracker rows attached to one manifest file.
+///
+/// Trackers never execute (the worker never sees them): they attach to
+/// the parent report here so totals cover every gate id. Only rows whose
+/// `upstream_path` matches the file and whose subtest starts with
+/// `DYNAMIC:` attach; file-level exclusions attach to no file.
+#[must_use]
+pub fn tracker_subtests(
+    file: &ManifestFile,
+    rows: &[ExpectationRow],
+) -> Vec<crate::runner::SubtestResult> {
+    let mut out = Vec::new();
+    for row in rows {
+        if row.upstream_path != file.upstream_path {
+            continue;
+        }
+        if !row.subtest.starts_with("DYNAMIC:") {
+            continue;
+        }
+        out.push(crate::runner::SubtestResult {
+            test: row.test.clone(),
+            subtest: row.subtest.clone(),
+            actual: crate::runner::ActualStatus::NotRun,
+            expected: crate::manifest::ExpectedStatus::NotRun,
+            detail: crate::runner::scrub_detail(&format!("notrun: {}", row.reason)),
+            trace: row.trace.clone(),
+            elapsed_ms: 0,
+        });
+    }
+    out.sort_by(|a, b| a.test.cmp(&b.test).then(a.subtest.cmp(&b.subtest)));
+    out
+}
+/// Loads and validates a manifest document (strict: schema 2 only).
 ///
 /// `today` is the `YYYY-MM-DD` review clock (UTC date at load time);
 /// expectations with `review_by` before `today` fail the load so stale
@@ -794,9 +1431,63 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
         .need("schema_version")?
         .as_u32()
         .ok_or_else(|| ManifestError::BadType("schema_version".to_owned()))?;
+    // Strict mode requires schema 2; the offline smoke path additionally
+    // accepts the legacy schema 1 (see `load_manifest_for_mode`).
     if schema != SCHEMA_VERSION {
         return Err(ManifestError::BadSchema(schema));
     }
+    load_manifest_schema2(&root, today, SCHEMA_VERSION)
+}
+
+/// Loads a manifest for one CLI mode: `--smoke` accepts schema 1 (legacy
+/// adapted manifest) or schema 2; `--strict` requires schema 2.
+pub fn load_manifest_for_mode(
+    text: &str,
+    today: &str,
+    strict: bool,
+) -> Result<Manifest, ManifestError> {
+    let root = parse_json(text)?;
+    if !matches!(root, Json::Obj(_)) {
+        return Err(ManifestError::RootNotObject);
+    }
+    let schema = root
+        .need("schema_version")?
+        .as_u32()
+        .ok_or_else(|| ManifestError::BadType("schema_version".to_owned()))?;
+    if strict {
+        if schema != SCHEMA_VERSION {
+            return Err(ManifestError::BadSchema(schema));
+        }
+        return load_manifest_schema2(&root, today, schema);
+    }
+    if schema != SCHEMA_VERSION && schema != MIN_SMOKE_SCHEMA_VERSION {
+        return Err(ManifestError::BadSchema(schema));
+    }
+    if schema == MIN_SMOKE_SCHEMA_VERSION {
+        return load_manifest_schema1(&root, today);
+    }
+    load_manifest_schema2(&root, today, schema)
+}
+
+/// Shared schema-1 body (legacy M7 adapted manifests, smoke-only).
+fn load_manifest_schema1(root: &Json, today: &str) -> Result<Manifest, ManifestError> {
+    load_manifest_inner(root, today, MIN_SMOKE_SCHEMA_VERSION, false)
+}
+
+/// Shared schema-2 body (M9-E strict manifests).
+fn load_manifest_schema2(root: &Json, today: &str, schema: u32) -> Result<Manifest, ManifestError> {
+    load_manifest_inner(root, today, schema, true)
+}
+
+/// Shared manifest body: `strict_fields` selects schema-2 validation
+/// (`upstream_sha256`, provenance/adapter/fixture, classification,
+/// spec section, issue, capability allow-list, harness-gap release rule).
+fn load_manifest_inner(
+    root: &Json,
+    today: &str,
+    _schema: u32,
+    strict_fields: bool,
+) -> Result<Manifest, ManifestError> {
     let source_json = root.need("source")?;
     let source = ManifestSource {
         repository: source_json
@@ -865,6 +1556,19 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             .as_str()
             .ok_or_else(|| ManifestError::BadType("files[].upstream_blob_sha".to_owned()))?
             .to_owned();
+        let upstream_sha256 = if strict_fields {
+            file_json
+                .need("upstream_sha256")?
+                .as_str()
+                .ok_or_else(|| ManifestError::BadType("files[].upstream_sha256".to_owned()))?
+                .to_owned()
+        } else {
+            file_json
+                .field("upstream_sha256")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
         let sha256 = file_json
             .need("sha256")?
             .as_str()
@@ -880,6 +1584,55 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             .as_str()
             .ok_or_else(|| ManifestError::BadType("files[].capability".to_owned()))?
             .to_owned();
+        // Provenance + adapter + fixture (schema 2 only): `direct` files
+        // carry no adapter and no fixture; `adapted` files require a
+        // non-empty adapter id; only the `filelist` fixture exists.
+        let (provenance, adapter, fixture) = if strict_fields {
+            let provenance = Provenance::parse(
+                file_json
+                    .need("provenance")?
+                    .as_str()
+                    .ok_or_else(|| ManifestError::BadType("files[].provenance".to_owned()))?,
+            )?;
+            let adapter = file_json
+                .field("adapter")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if adapter.contains('*') || adapter.len() > MAX_META_LEN {
+                return Err(ManifestError::Wildcard(path.clone(), String::new()));
+            }
+            match provenance {
+                Provenance::Direct if !adapter.is_empty() => {
+                    return Err(ManifestError::BadType(
+                        "files[].adapter must be empty for direct".to_owned(),
+                    ));
+                }
+                Provenance::Adapted if adapter.is_empty() => {
+                    return Err(ManifestError::BadType(
+                        "files[].adapter required for adapted".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            let fixture = file_json
+                .field("fixture")
+                .and_then(Json::as_str)
+                .map(str::to_owned);
+            if let Some(fixture) = fixture.as_deref() {
+                if fixture != "filelist" {
+                    return Err(ManifestError::BadType("files[].fixture".to_owned()));
+                }
+                if provenance != Provenance::Adapted {
+                    return Err(ManifestError::BadType(
+                        "files[].fixture needs adapted provenance".to_owned(),
+                    ));
+                }
+            }
+            (provenance, adapter, fixture)
+        } else {
+            (Provenance::Adapted, String::new(), None)
+        };
         if path.is_empty() || upstream_path.is_empty() || group.is_empty() || capability.is_empty()
         {
             return Err(ManifestError::BadType("files[] empty field".to_owned()));
@@ -903,6 +1656,11 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
         if group.len() > MAX_PATH_LEN || !REQUIRED_GROUPS.contains(&group.as_str()) {
             return Err(ManifestError::BadType("files[].group".to_owned()));
         }
+        // File-level capabilities obey the same closed allow-list as
+        // subtest rows (schema 2): `browser-only` never validates.
+        if strict_fields {
+            check_capability(&path, &path, &capability)?;
+        }
         if seen_paths.insert(path.clone(), ()).is_some() {
             return Err(ManifestError::Duplicate(path.clone(), String::new()));
         }
@@ -910,6 +1668,11 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
             return Err(ManifestError::BadHex(
                 "files[].upstream_blob_sha".to_owned(),
             ));
+        }
+        // `upstream_blob_sha` is provenance only (M9-E §3): the strict gate
+        // never treats it as content evidence — `upstream_sha256` below is.
+        if strict_fields && !is_hex(&upstream_sha256, 32) {
+            return Err(ManifestError::BadHex("files[].upstream_sha256".to_owned()));
         }
         if !is_hex(&sha256, 32) {
             return Err(ManifestError::BadHex("files[].sha256".to_owned()));
@@ -994,17 +1757,61 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_owned();
+            let classification = if strict_fields {
+                Classification::parse(sub_json.need("classification")?.as_str().ok_or_else(
+                    || ManifestError::BadType("subtests[].classification".to_owned()),
+                )?)?
+            } else {
+                Classification::Supported
+            };
+            let spec_section = if strict_fields {
+                sub_json
+                    .field("spec_section")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                String::new()
+            };
+            let issue = if strict_fields {
+                sub_json
+                    .field("issue")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                String::new()
+            };
             // Every subtest carries the full expectation record: lengths
             // are bounded; `reason` non-empty only has meaning for
             // non-PASS (PASS rows keep it empty by convention, but the
             // loader does not reject a stale reason on PASS — strict
             // compares enum statuses, never the reason text).
-            for value in [&reason, &sub_capability, &owner, &review_by, &trace] {
+            for value in [
+                &reason,
+                &sub_capability,
+                &owner,
+                &review_by,
+                &trace,
+                &spec_section,
+                &issue,
+            ] {
                 if value.len() > MAX_META_LEN {
                     return Err(ManifestError::BadType(
                         "subtests[] meta too long".to_owned(),
                     ));
                 }
+            }
+            if strict_fields {
+                check_expectation_rules(
+                    &test,
+                    &subtest,
+                    expected,
+                    classification,
+                    &effective_capability(&capability, &sub_capability),
+                    &reason,
+                    &issue,
+                )?;
             }
             if expected != ExpectedStatus::Pass {
                 if reason.is_empty() {
@@ -1013,6 +1820,14 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
                         subtest,
                         expected.token().to_owned(),
                     ));
+                }
+                // Schema-1 legacy path (smoke-only): NOTRUN rows still need
+                // the full record, but skip the schema-2 classification
+                // matrix (already enforced above when `strict_fields`).
+                // `supported` + NOTRUN stays rejected even in schema 1:
+                // a supported capability is never a gap.
+                if !strict_fields && sub_capability == "supported" {
+                    return Err(ManifestError::SupportedNotRun(test, subtest));
                 }
                 for (field, value) in [
                     ("capability", &sub_capability),
@@ -1042,23 +1857,26 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
                 timeout_ms,
                 expected,
                 reason,
-                capability: if sub_capability.is_empty() {
-                    capability.clone()
-                } else {
-                    sub_capability
-                },
+                capability: effective_capability(&capability, &sub_capability),
                 owner,
                 review_by,
                 trace,
+                classification,
+                spec_section,
+                issue,
             });
         }
         files.push(ManifestFile {
             path,
             upstream_path,
             upstream_blob_sha,
+            upstream_sha256,
             sha256,
             group,
             capability,
+            provenance,
+            adapter,
+            fixture,
             subtests,
         });
     }
@@ -1078,6 +1896,7 @@ pub fn load_manifest(text: &str, today: &str) -> Result<Manifest, ManifestError>
         }
     }
     Ok(Manifest {
+        schema_version: _schema,
         source,
         corpus_root,
         default_timeout_ms,
@@ -1095,19 +1914,37 @@ mod tests {
     }
 
     fn minimal_manifest(status: &str) -> String {
+        minimal_manifest_schema(status, 2)
+    }
+
+    /// Schema-2 fixture with a NOTRUN gap row carrying the full §4 record
+    /// (used by the reason/expiry tests). `status` applies to the first
+    /// subtest only; the remaining rows stay PASS.
+    fn minimal_manifest_schema(status: &str, schema: u32) -> String {
         let sha = "e".repeat(64);
+        let upstream_sha = "f".repeat(64);
+        let gap = |st: &str| {
+            if st == "NOTRUN" {
+                "\"status\": \"NOTRUN\", \"reason\": \"needs worker\", \"capability\": \"worker-runtime\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M9E-WPT-03\", \"classification\": \"unsupported-host-capability\", \"spec_section\": \"FileAPI WD Blob\", \"issue\": \"QUESTIONS.md Q1-Q3\""
+            } else if st == "FAIL" {
+                "\"status\": \"FAIL\", \"reason\": \"open defect\", \"capability\": \"blob-constructor\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M9E-WPT-02\", \"classification\": \"supported\", \"spec_section\": \"FileAPI WD Blob\", \"issue\": \"docs/reviews/M9E-handoff.md\""
+            } else {
+                "\"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"classification\": \"supported\", \"spec_section\": \"\", \"issue\": \"\""
+            }
+        };
         let file = |path: &str,
                     upstream: &str,
                     group: &str,
                     test: &str,
                     subtest: &str,
                     st: &str| {
+            let row = gap(st);
             format!(
-                "{{\"path\": \"{path}\", \"upstream_path\": \"{upstream}\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"{group}\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"{test}\", \"subtest\": \"{subtest}\", \"status\": \"{st}\", \"reason\": \"needs Dom\", \"capability\": \"c\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M7-WPT-05\"}}]}}"
+                "{{\"path\": \"{path}\", \"upstream_path\": \"{upstream}\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"upstream_sha256\": \"{upstream_sha}\", \"sha256\": \"{sha}\", \"group\": \"{group}\", \"capability\": \"blob-constructor\", \"provenance\": \"direct\", \"subtests\": [{{\"test\": \"{test}\", \"subtest\": \"{subtest}\", {row}}}]}}"
             )
         };
         format!(
-            "{{\"schema_version\": 1, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{}, {}, {}, {}, {}, {}]}}",
+            "{{\"schema_version\": {schema}, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{}, {}, {}, {}, {}, {}]}}",
             file(
                 "corpus/a.js",
                 "FileAPI/blob/a.any.js",
@@ -1142,16 +1979,82 @@ mod tests {
             ),
             file(
                 "corpus/e.js",
-                "FileAPI/FileReader/e.any.js",
-                "FileAPI/FileReader",
+                "FileAPI/root/e.any.js",
+                "FileAPI/root",
                 "t5",
                 "s5",
                 "PASS"
             ),
             file(
                 "corpus/f.js",
-                "FileAPI/BlobURL/f.any.js",
-                "FileAPI/BlobURL",
+                "FileAPI/url/f.any.js",
+                "FileAPI/url",
+                "t6",
+                "s6",
+                "PASS"
+            ),
+        )
+    }
+
+    fn minimal_manifest_smoke1() -> String {
+        // Legacy schema-1 shape (smoke-only): no schema-2 fields.
+        let sha = "e".repeat(64);
+        let file = |path: &str,
+                    upstream: &str,
+                    group: &str,
+                    test: &str,
+                    subtest: &str,
+                    st: &str| {
+            format!(
+                "{{\"path\": \"{path}\", \"upstream_path\": \"{upstream}\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"{sha}\", \"group\": \"{group}\", \"capability\": \"blob\", \"subtests\": [{{\"test\": \"{test}\", \"subtest\": \"{subtest}\", \"status\": \"{st}\", \"reason\": \"needs Dom\", \"capability\": \"c\", \"owner\": \"o\", \"review_by\": \"2099-01-01\", \"trace\": \"M7-WPT-05\"}}]}}"
+            )
+        };
+        format!(
+            "{{\"schema_version\": 1, \"source\": {{\"repository\": \"https://github.com/web-platform-tests/wpt\", \"commit\": \"0968c868d8095217d18d86b34c7f21dccae58768\", \"license\": \"BSD-3-Clause\"}}, \"corpus_root\": \"crates/boa_fapi_wpt/corpus\", \"default_timeout_ms\": 5000, \"files\": [{}, {}, {}, {}, {}, {}]}}",
+            file(
+                "corpus/a.js",
+                "FileAPI/blob/a.any.js",
+                "FileAPI/blob",
+                "t",
+                "s",
+                "PASS"
+            ),
+            file(
+                "corpus/b.js",
+                "FileAPI/file/b.any.js",
+                "FileAPI/file",
+                "t2",
+                "s2",
+                "PASS"
+            ),
+            file(
+                "corpus/c.js",
+                "FileAPI/filelist-section/c.any.js",
+                "FileAPI/filelist-section",
+                "t3",
+                "s3",
+                "PASS"
+            ),
+            file(
+                "corpus/d.js",
+                "FileAPI/reading-data-section/d.any.js",
+                "FileAPI/reading-data-section",
+                "t4",
+                "s4",
+                "PASS"
+            ),
+            file(
+                "corpus/e.js",
+                "FileAPI/root/e.any.js",
+                "FileAPI/root",
+                "t5",
+                "s5",
+                "PASS"
+            ),
+            file(
+                "corpus/f.js",
+                "FileAPI/url/f.any.js",
+                "FileAPI/url",
                 "t6",
                 "s6",
                 "PASS"
@@ -1167,9 +2070,72 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_status_and_wildcards() {
+    fn smoke_accepts_legacy_schema1_but_strict_rejects_it() {
+        let legacy = minimal_manifest_smoke1();
+        assert!(load_manifest(&legacy, today()).is_err());
+        assert!(load_manifest_for_mode(&legacy, today(), false).is_ok());
+        assert!(load_manifest_for_mode(&legacy, today(), true).is_err());
+        let current = minimal_manifest("PASS");
+        assert!(load_manifest_for_mode(&current, today(), false).is_ok());
+        assert!(load_manifest_for_mode(&current, today(), true).is_ok());
+    }
+
+    #[test]
+    fn rejects_fail_without_issue_and_browser_only() {
+        // `supported` + FAIL without an issue link is not a recorded defect.
+        let no_issue = minimal_manifest("FAIL").replacen(
+            "\"issue\": \"docs/reviews/M9E-handoff.md\"",
+            "\"issue\": \"\"",
+            1,
+        );
         assert!(matches!(
-            load_manifest(&minimal_manifest("MAYBE"), today()),
+            load_manifest(&no_issue, today()),
+            Err(ManifestError::MissingIssue(_, _))
+        ));
+        // `browser-only` never validates as a capability.
+        let browser = minimal_manifest("PASS").replacen(
+            "\"capability\": \"blob-constructor\"",
+            "\"capability\": \"browser-only\"",
+            1,
+        );
+        assert!(matches!(
+            load_manifest(&browser, today()),
+            Err(ManifestError::BrowserOnly(_, _))
+        ));
+    }
+
+    #[test]
+    fn rejects_supported_notrun_and_harness_gap() {
+        // `supported` is never NOTRUN: flip the first row's status to
+        // NOTRUN while keeping the `supported` classification.
+        let notrun = minimal_manifest("NOTRUN").replacen(
+            "\"classification\": \"unsupported-host-capability\"",
+            "\"classification\": \"supported\"",
+            1,
+        );
+        assert!(matches!(
+            load_manifest(&notrun, today()),
+            Err(ManifestError::SupportedNotRun(_, _))
+        ));
+        // `harness-gap` breaks the release gate (load error).
+        let gap = minimal_manifest("PASS").replacen(
+            "\"classification\": \"supported\"",
+            "\"classification\": \"harness-gap\"",
+            1,
+        );
+        assert!(matches!(
+            load_manifest(&gap, today()),
+            Err(ManifestError::HarnessGap(_, _))
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_status_and_wildcards() {
+        // Unknown status token on the first row.
+        let mut unknown = minimal_manifest("PASS");
+        unknown = unknown.replacen("\"status\": \"PASS\"", "\"status\": \"MAYBE\"", 1);
+        assert!(matches!(
+            load_manifest(&unknown, today()),
             Err(ManifestError::UnknownStatus(_))
         ));
         let wild = minimal_manifest("PASS").replace("\"test\": \"t\"", "\"test\": \"t*\"");
@@ -1181,8 +2147,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_reason_and_expired_review() {
+        // NOTRUN gap without a reason fails the load.
         let mut no_reason = minimal_manifest("NOTRUN");
-        no_reason = no_reason.replace("\"reason\": \"needs Dom\"", "\"reason\": \"\"");
+        no_reason = no_reason.replacen("\"reason\": \"needs worker\"", "\"reason\": \"\"", 1);
         assert!(matches!(
             load_manifest(&no_reason, today()),
             Err(ManifestError::MissingReason(_, _, _))
@@ -1197,10 +2164,10 @@ mod tests {
     #[test]
     fn rejects_bad_schema_and_bad_hash() {
         let bad_schema =
-            minimal_manifest("PASS").replace("\"schema_version\": 1", "\"schema_version\": 2");
+            minimal_manifest("PASS").replace("\"schema_version\": 2", "\"schema_version\": 3");
         assert!(matches!(
             load_manifest(&bad_schema, today()),
-            Err(ManifestError::BadSchema(2))
+            Err(ManifestError::BadSchema(3))
         ));
         let bad_hash = minimal_manifest("PASS").replace(&"e".repeat(64), "zz");
         assert!(matches!(
@@ -1230,9 +2197,13 @@ mod tests {
             Err(ManifestError::DuplicateJsonKey(k)) if k == "license"
         ));
         // Same key twice inside a subtest, with different value types.
-        let dup_sub = minimal_manifest("PASS").replace(
-            "\"trace\": \"M7-WPT-05\"",
-            "\"trace\": \"M7-WPT-05\", \"trace\": 7",
+        // `replacen(..., 1)` hits the first `"trace"` occurrence — the
+        // file-level... no: subtest rows carry the trace, so anchor on
+        // the full subtest-trace pair to land inside a subtest object.
+        let dup_sub = minimal_manifest("PASS").replacen(
+            "\"subtest\": \"s\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"",
+            "\"subtest\": \"s\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"trace\": 7",
+            1,
         );
         assert!(matches!(
             load_manifest(&dup_sub, today()),
@@ -1282,23 +2253,33 @@ mod tests {
             "https://github.com/web-platform-tests/wpt"
         );
         // Same subtest name under two test IDs in one file → load error.
-        // The collision is built inside the FIRST file entry only: anchor
-        // on the unique first-file trace marker so the duplicate subtest
-        // lands in file #1, not in a later entry.
+        // Build the collision by direct JSON assembly: parse the base
+        // fixture is overkill — instead append a second subtest object
+        // into the first file's subtests array by anchoring on the
+        // first row's full text and duplicating it with a new test id.
         let base = minimal_manifest("PASS");
-        let anchor = "\"trace\": \"M7-WPT-05\"}]";
-        let insert_at = base.find(anchor).expect("fixture shape") + anchor.len() - 1;
-        let mut collision = base[..insert_at].to_owned();
-        collision.push_str(
-            ",{\"test\": \"t-other\", \"subtest\": \"same-but-once\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}",
-        );
-        collision.push_str(&base[insert_at..]);
-        // Rename the original subtest of the same (first) file.
-        collision = collision.replacen(
+        let first_row = "\"test\": \"t\", \"subtest\": \"s\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"classification\": \"supported\", \"spec_section\": \"\", \"issue\": \"\"";
+        let dup_row = "\"test\": \"t-other\", \"subtest\": \"same-but-once\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"classification\": \"supported\", \"spec_section\": \"\", \"issue\": \"\"";
+        let mut collision = base.replacen(
             "\"test\": \"t\", \"subtest\": \"s\"",
             "\"test\": \"t\", \"subtest\": \"same-but-once\"",
             1,
         );
+        // Insert the duplicate row right after the renamed first row:
+        // anchor on the renamed row's subtest field, then splice before
+        // the closing `]` of the first file's subtests array. The array
+        // close follows the row's `}` — find both in order.
+        let anchor2 = "\"test\": \"t\", \"subtest\": \"same-but-once\"";
+        let pos = collision.find(anchor2).expect("fixture shape");
+        let after = &collision[pos..];
+        let row_end = after.find('}').expect("fixture shape");
+        let mut with_dup = collision[..pos + row_end + 1].to_owned();
+        with_dup.push_str(", {");
+        with_dup.push_str(dup_row);
+        with_dup.push('}');
+        with_dup.push_str(&collision[pos + row_end + 1..]);
+        collision = with_dup;
+        let _ = first_row;
         // Also verify cross-file reuse stays allowed: give the SECOND file
         // the same subtest name — must still load.
         let mut cross_ok = minimal_manifest("PASS");
@@ -1341,9 +2322,11 @@ mod tests {
         // Insert a second file entry with the same `path` before the
         // closing of the `files` array (i.e. right before the final `]`).
         let cut = base.rfind(']').expect("fixture shape changed");
-        let dup_tail = ",{\"path\": \"corpus/a.js\", \"upstream_path\": \"FileAPI/blob/a.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"sha256\": \"".to_owned()
+        let dup_tail = ",{\"path\": \"corpus/a.js\", \"upstream_path\": \"FileAPI/blob/a.any.js\", \"upstream_blob_sha\": \"43c29ada4d5455410ab40c79c5982de2b973d2ba\", \"upstream_sha256\": \"".to_owned()
+            + &"f".repeat(64)
+            + "\", \"sha256\": \""
             + &"e".repeat(64)
-            + "\", \"group\": \"FileAPI/blob\", \"capability\": \"blob\", \"subtests\": [{\"test\": \"t2\", \"subtest\": \"s2\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\"}]}";
+            + "\", \"group\": \"FileAPI/blob\", \"capability\": \"blob-constructor\", \"provenance\": \"direct\", \"subtests\": [{\"test\": \"t2\", \"subtest\": \"s2\", \"status\": \"PASS\", \"reason\": \"\", \"capability\": \"blob-constructor\", \"owner\": \"\", \"review_by\": \"\", \"trace\": \"\", \"classification\": \"supported\", \"spec_section\": \"\", \"issue\": \"\"}]}";
         let mut dup_path = base[..cut].to_owned();
         dup_path.push_str(&dup_tail);
         dup_path.push_str(&base[cut..]);

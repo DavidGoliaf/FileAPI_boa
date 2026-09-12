@@ -1,0 +1,2854 @@
+{
+ "FileAPI/blob/Blob-array-buffer.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.arrayBuffer()",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.arrayBuffer() empty Blob data",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.arrayBuffer() non-ascii input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.arrayBuffer() non-unicode input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.arrayBuffer() concurrent reads",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-bytes.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.bytes()",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.bytes() empty Blob data",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.bytes() non-ascii input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.bytes() non-unicode input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.bytes() concurrent reads",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-constructor-detached-buffer.any.js": {
+  "capability": "blob-constructor",
+  "subtests": [
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "reason": "detachBuffer needs MessageChannel postMessage transfer; MessageChannel is not a host binding",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "Blob from a detached ArrayBufferView should be empty",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "reason": "detachBuffer needs MessageChannel postMessage transfer; MessageChannel is not a host binding",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "Blob from a detached ArrayBufferView with offset should be empty",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "reason": "detachBuffer needs MessageChannel postMessage transfer; MessageChannel is not a host binding",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "Blob from a detached ArrayBuffer should be empty",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "reason": "detachBuffer needs MessageChannel postMessage transfer; MessageChannel is not a host binding",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "Blob from a detached ArrayBufferView mixed with string, detached part ignored",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-constructor-endings.any.js": {
+  "capability": "blob-constructor",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Valid \"endings\" value: \"transparent\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Valid \"endings\" value: \"native\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: null",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: \"\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: \"invalidEnumValue\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: \"Transparent\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: \"NATIVE\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: 0",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Invalid \"endings\" value: {}",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Exception propagation from options",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "The \"endings\" options property is used",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-constructor.any.js": {
+  "capability": "blob-constructor",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob interface object",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob constructor with no arguments",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob constructor with no arguments, without 'new'",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob constructor without brackets",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob constructor with undefined as first argument",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing non-objects, Dates and RegExps for blobParts should throw a TypeError.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "A plain object with custom @@iterator should be treated as a sequence for the blobParts argument.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "blobParts not an object: boolean",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "blobParts not an object: BigInt",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "blobParts not an object: string",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "blobParts not an object: Symbol",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "blobParts not an object: number",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "The length getter should be invoked and any exceptions should be propagated.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "ToUint32 should be applied to the length and any exceptions should be propagated.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Getters and value conversions should happen in order until an exception is thrown.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "ToString should be called on elements of the blobParts array and any exceptions should be propagated.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "options properties should be accessed in lexicographic order.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Arguments should be evaluated from left to right.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "A plain object with @@iterator should be treated as a sequence for the blobParts argument.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "A plain object with @@iterator and a length property should be treated as a sequence for the blobParts argument.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "A String object should be treated as a sequence for the blobParts argument.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "A Uint8Array object should be treated as a sequence for the blobParts argument.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Changes to the blobParts array should be reflected in the returned Blob (pop).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Changes to the blobParts array should be reflected in the returned Blob (unshift).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "ToString should be called on elements of the blobParts array.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "ArrayBuffer elements of the blobParts array should be supported.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing typed arrays as elements of the blobParts array should work.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing a Float16Array as element of the blobParts array should work.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing a Float64Array as element of the blobParts array should work.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing BigInt typed arrays as elements of the blobParts array should work.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Array with two blobs",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Array with two buffers",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Array with two bufferviews",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Array with mixed types",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing \"abc\" for options should throw",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing 123 for options should throw",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing 123.4 for options should throw",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing true for options should throw",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing null (index 0) for options should use the defaults.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing null (index 0) for options should use the defaults (with newlines).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing undefined (index 1) for options should use the defaults.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing undefined (index 1) for options should use the defaults (with newlines).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing object \"[object Object]\" (index 2) for options should use the defaults.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing object \"[object Object]\" (index 2) for options should use the defaults (with newlines).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing object \"[object Object]\" (index 3) for options should use the defaults.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing object \"[object Object]\" (index 3) for options should use the defaults (with newlines).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing object \"/regex/\" (index 4) for options should use the defaults.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing object \"/regex/\" (index 4) for options should use the defaults (with newlines).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing function \"function() {}\" (index 5) for options should use the defaults.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Passing function \"function() {}\" (index 5) for options should use the defaults (with newlines).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"a\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"A\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"text/html\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"TEXT/HTML\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"text/plain;charset=utf-8\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"å\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"𐑾\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \" image/gif \"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"\\timage/gif\\t\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"image/gif;\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"İmage/gif\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"ımage/gif\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"image/gif\\0\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"unknown/unknown\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"text/plain\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob",
+    "subtest": "Blob with type \"image/png\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "Boa @@iterator lookup on Boolean.prototype differs from the pinned browser behavior; tracked as host gap, not PASS",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "blobParts not an object: boolean with Boolean.prototype[Symbol.iterator]",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "Boa @@iterator lookup on String.prototype differs from the pinned browser behavior",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "blobParts not an object: string with String.prototype[Symbol.iterator]",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "Boa @@iterator lookup on Number.prototype differs from the pinned browser behavior",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "blobParts not an object: number with Number.prototype[Symbol.iterator]",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "Boa @@iterator lookup on BigInt.prototype differs from the pinned browser behavior",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "blobParts not an object: BigInt with BigInt.prototype[Symbol.iterator]",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "Boa @@iterator lookup on Symbol.prototype differs from the pinned browser behavior",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "blobParts not an object: Symbol with Symbol.prototype[Symbol.iterator]",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs MessageChannel postMessage transfer; MessageChannel is not a host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "Passing a FrozenArray as the blobParts array should work (FrozenArray<MessagePort>).",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "trial-raw shows 4 TIMEOUT rows for non-ASCII type titles (manifest/harness title-encoding gap); tracked as host gap until the runner names them byte-exactly",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD Blob",
+    "status": "NOTRUN",
+    "subtest": "DYNAMIC: non-ASCII Blob type matrix",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-newobject.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.stream() returns [NewObject]",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() returns [NewObject]",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.arrayBuffer() returns [NewObject]",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.bytes() returns [NewObject]",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-slice-overflow.any.js": {
+  "capability": "blob-slice",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "slice start is negative, relativeStart will be max((size + start), 0)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "slice start is greater than blob size, relativeStart will be min(start, size)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "slice end is negative, relativeEnd will be max((size + end), 0)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "slice end is greater than blob size, relativeEnd will be min(end, size)",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-slice.any.js": {
+  "capability": "blob-slice",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "no-argument Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "blob1.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "blob2.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "undefined start/end Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "undefined start Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "undefined end Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "null type Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "undefined type Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "no type Blob slice",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slices",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,6).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,7).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (0,8).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,6).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,7).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,8).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (1,9).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,6).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (2,7).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (3,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (3,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (3,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (3,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (4,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (4,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (4,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (4,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (4,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (4,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (5,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (5,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (5,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (5,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (5,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (6,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (6,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (6,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (6,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (7,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (7,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (7,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (8,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (8,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (8,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (8,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (9,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (9,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (9,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test (9,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,6).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,7).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (0,8).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,6).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,7).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,8).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (1,9).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,6).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (2,7).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (3,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (3,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (3,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (3,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (4,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (4,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (4,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (4,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (4,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (4,5).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (5,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (5,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (5,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (5,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (5,4).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (6,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (6,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (6,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (6,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (7,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (7,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (7,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (8,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (8,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (8,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (8,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (9,0).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (9,1).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (9,2).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Slicing test: slice (9,3).",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Invalid contentType (\"te\\0xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Invalid contentType (\"te\\txt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Invalid contentType (\"te\\x1fxt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Invalid contentType (\"text/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Invalid contentType (\"ÿ\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"TEXT/PLAIN\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te(xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te)xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te,xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te/xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te:xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te;xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te<xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te=xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te>xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te?xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te@xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te[xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te\\\"xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te\\\\xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te]xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"text/plain;charset = UTF-8\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"text/plain;charset=UTF-8\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te{xt/plain\")",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD Blob slice",
+    "subtest": "Valid contentType (\"te}xt/plain\")",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-stream.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.stream()",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.stream() empty Blob",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.stream() non-unicode input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Reading Blob.stream() with BYOB reader",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs garbageCollect host hook; GC timing is not deterministic in this harness",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD reading",
+    "status": "NOTRUN",
+    "subtest": "Blob.stream() garbage collection of blob shouldn't break stream consumption",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "capability": "worker-runtime",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs garbageCollect host hook; GC timing is not deterministic in this harness",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD reading",
+    "status": "NOTRUN",
+    "subtest": "Blob.stream() garbage collection of stream shouldn't break stream consumption",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-text.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text()",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() empty blob data",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() multi-element array in constructor",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() non-unicode",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() different charset param in type option",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() different charset param with non-ascii input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() invalid utf-8 input",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.text() concurrent reads",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/blob/Blob-textStream.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "textStream method existence",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() basic functionality",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() with empty blob",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() with multi-part blob",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() ignores type charset (UTF-16LE)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() ignores invalid type charset (invalid-charset)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() ignores type charset (iso-8859-1)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob.textStream() can be called multiple times",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/file/File-constructor-endings.any.js": {
+  "capability": "file-constructor",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Valid \"endings\" value: \"transparent\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Valid \"endings\" value: \"native\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: null",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: \"\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: \"invalidEnumValue\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: \"Transparent\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: \"NATIVE\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: 0",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid \"endings\" value: {}",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Exception propagation from options",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "The \"endings\" options property is used",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/file/File-constructor.any.js": {
+  "capability": "file-constructor",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "File interface object exists",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Required arguments",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "empty fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "DOMString fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unicode DOMString fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "String object fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Empty Blob fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Blob fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Empty File fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "File fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "ArrayBuffer fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Typed array fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Various fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Number in fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Array in fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Object in fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Object with toString in fileBits",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Custom @@iterator",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using fileName",
+    "trace": "M9E-WPT-02"
+   },
+    {
+     "capability": "file-constructor",
+     "classification": "supported",
+     "issue": "docs/reviews/M9E-handoff.md",
+     "reason": "hand-audited: upstream expects dummy/foo verbatim but the normative File API replaces every U+002F (/) with U+003A (:); product emits the spec-mandated dummy:foo",
+     "spec_section": "FileAPI WD File",
+     "status": "FAIL",
+     "subtest": "No replacement when using special character in fileName",
+     "trace": "M9E-WPT-02"
+    },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using null fileName",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using number fileName",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using empty string fileName",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using lastModified",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Misusing name",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unknown properties are ignored",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "capability": "navigation",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs document.body platform object; no DOM in this harness",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD File",
+    "status": "NOTRUN",
+    "subtest": "HTMLBodyElement in fileBits",
+    "trace": "M9E-WPT-03"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid bits argument: \"hello\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid bits argument: 0",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid bits argument: null",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: text/plain",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: text/plain;charset=UTF-8",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: TEXT/PLAIN",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: 𝓽𝓮𝔁𝓽/𝔭𝔩𝔞𝔦𝔫",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: ascii/nonprintable\u001f",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: ascii/nonprintable",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: nonasciiî",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: nonasciiሴ",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Using type in File constructor: nonparsable",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid property bag: 123",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid property bag: 123.4",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid property bag: true",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Invalid property bag: \"abc\"",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unusual but valid property bag: null",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unusual but valid property bag: undefined",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unusual but valid property bag: 1,2,3",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unusual but valid property bag: /regex/",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Unusual but valid property bag: function() {}",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Bits argument: object that throws",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD File",
+    "subtest": "Property bag propagates exceptions",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/file/send-file-formdata-controls.any.js": {
+  "capability": "file-constructor",
+  "subtests": [
+   {
+    "capability": "fetch",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs FormData + fetch POST to echo-content.py; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD File",
+    "status": "NOTRUN",
+    "subtest": "file-level exclusion: formdata upload",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/file/send-file-formdata-punctuation.any.js": {
+  "capability": "file-constructor",
+  "subtests": [
+   {
+    "capability": "fetch",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs FormData + fetch POST to echo-content.py; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD File",
+    "status": "NOTRUN",
+    "subtest": "file-level exclusion: formdata upload",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/file/send-file-formdata-utf-8.any.js": {
+  "capability": "file-constructor",
+  "subtests": [
+   {
+    "capability": "fetch",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs FormData + fetch POST to echo-content.py; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD File",
+    "status": "NOTRUN",
+    "subtest": "file-level exclusion: formdata upload",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/file/send-file-formdata.any.js": {
+  "capability": "file-constructor",
+  "subtests": [
+   {
+    "capability": "fetch",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs FormData + fetch POST to echo-content.py; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD File",
+    "status": "NOTRUN",
+    "subtest": "file-level exclusion: formdata upload",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+  "FileAPI/fileReader.any.js": {
+   "capability": "filereader",
+   "subtests": [
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD FileReader",
+     "subtest": "FileReader interface object",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD FileReader",
+     "subtest": "no-argument FileReader constructor",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "capability": "filereader",
+     "classification": "supported",
+     "issue": "docs/reviews/M9E-handoff.md",
+     "reason": "hand-audited: upstream requires sync abort dispatch (handler runs before abort() returns) but the M9-C executor protocol queues the abort terminal through poll_io/run_jobs; product settles to the same DONE state asynchronously",
+     "spec_section": "FileAPI WD FileReader",
+     "status": "FAIL",
+     "subtest": "FileReader States -- abort",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD FileReader",
+     "subtest": "FileReader States -- events",
+     "trace": "M9E-WPT-02"
+    }
+   ]
+  },
+ "FileAPI/idlharness.any.js": {
+  "capability": "blob-constructor",
+  "subtests": [
+   {
+    "capability": "network-wpt-server",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "needs /resources/WebIDLParser.js + idlharness.js; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD IDL",
+    "status": "NOTRUN",
+    "subtest": "file-level exclusion: idlharness",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/Determining-Encoding.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob Determing Encoding with encoding argument",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob Determing Encoding with type attribute",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob Determing Encoding with UTF-8 BOM",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob Determing Encoding without anything implying charset.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob Determing Encoding with UTF-16BE BOM",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Blob Determing Encoding with UTF-16LE BOM",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/FileReader-event-handler-attributes.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "FileReader.onloadstart: initial value",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "FileReader.onprogress: initial value",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "FileReader.onload: initial value",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "FileReader.onabort: initial value",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "FileReader.onerror: initial value",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "FileReader.onloadend: initial value",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/FileReader-multiple-reads.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "test FileReader InvalidStateError exception for readAsText",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "test FileReader InvalidStateError exception for readAsDataURL",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "test FileReader InvalidStateError exception for readAsArrayBuffer",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "test FileReader InvalidStateError exception in onloadstart event for readAsArrayBuffer",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "test FileReader no InvalidStateError exception in loadend event handler for readAsArrayBuffer",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "test abort and restart in onloadstart event for readAsText",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "A new read in an abort handler suppresses the old read loadend",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "A new read in a load handler suppresses the old read loadend",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+  "FileAPI/reading-data-section/filereader_abort.any.js": {
+   "capability": "filereader",
+   "subtests": [
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD FileReader",
+     "subtest": "Aborting before read",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "capability": "filereader",
+     "classification": "supported",
+     "issue": "docs/reviews/M9E-handoff.md §3 (sync-abort double-pair: test's own .then() re-arms wait_for + re-aborts; needs upstream EventWatcher queue semantics, product dispatches exactly one pair per TZ §7.3)",
+     "owner": "m9e",
+     "reason": "open defect: second abort() inside the test's own .then() continuation dispatches a phantom second abort/loadend pair (2 events observed, 1 expected); product emits exactly one pair per abort() per TZ §7.3",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD FileReader",
+     "status": "FAIL",
+     "subtest": "Aborting after read",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD FileReader",
+     "subtest": "Aborting a reused reader after a previous read completed",
+     "trace": "M9E-WPT-02"
+    }
+   ]
+  },
+ "FileAPI/reading-data-section/filereader_error.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "async_test #1",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/filereader_events.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "events are dispatched in the correct order for an empty blob",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "events are dispatched in the correct order for a non-empty blob",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/filereader_readAsArrayBuffer.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "async_test #1",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/filereader_readAsBinaryString.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "async_test #1",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+  "FileAPI/reading-data-section/filereader_readAsDataURL.any.js": {
+   "capability": "filereader",
+   "subtests": [
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD reading",
+     "subtest": "FileReader readyState during readAsDataURL",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD reading",
+     "subtest": "readAsDataURL result for Blob with specified MIME type",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "capability": "filereader",
+     "classification": "supported",
+     "issue": "docs/reviews/M9E-handoff.md",
+     "reason": "hand-audited: upstream expects data:application/octet-stream;base64,... for empty-type Blobs but the crate contract (M4, pinned by m4_filereader_async/m4_filereader_sync suites) emits data:;base64,... verbatim",
+     "spec_section": "FileAPI WD reading",
+     "status": "FAIL",
+     "subtest": "readAsDataURL result for Blob with unspecified MIME type",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "capability": "filereader",
+     "classification": "supported",
+     "issue": "docs/reviews/M9E-handoff.md",
+     "reason": "hand-audited: same empty-type data-URL contract as above (empty Blob reads data:;base64,)",
+     "spec_section": "FileAPI WD reading",
+     "status": "FAIL",
+     "subtest": "readAsDataURL result for empty Blob",
+     "trace": "M9E-WPT-02"
+    }
+   ]
+  },
+ "FileAPI/reading-data-section/filereader_readAsText.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "readAsText should correctly read UTF-8.",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "readAsText should correctly read UTF-16.",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/filereader_readAsText_blob_type_charset.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "readAsText() uses the charset parameter of the Blob's type (windows-1252)",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "readAsText() decodes a windows-1252 Blob body using the type's charset",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "readAsText() encoding argument overrides the Blob type's charset",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+ "FileAPI/reading-data-section/filereader_readystate.any.js": {
+  "capability": "filereader",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD FileReader",
+    "subtest": "async_test #1",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+  "FileAPI/reading-data-section/filereader_result.any.js": {
+   "capability": "filereader",
+   "subtests": [
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD reading",
+     "subtest": "readAsText",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD reading",
+     "subtest": "readAsDataURL",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD reading",
+     "subtest": "readAsArrayBuffer",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD reading",
+     "subtest": "readAsBinaryString",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"loadstart\" event for readAsText",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"loadstart\" event for readAsDataURL",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"loadstart\" event for readAsArrayBuffer",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"loadstart\" event for readAsBinaryString",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"progress\" event for readAsText",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"progress\" event for readAsDataURL",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"progress\" event for readAsArrayBuffer",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "worker-runtime",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs EventWatcher microtask interleaving between dispatch and packaging; host pump settles synchronously per job (runs green only in browsers)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD reading",
+     "status": "NOTRUN",
+     "subtest": "result is null during \"progress\" event for readAsBinaryString",
+     "trace": "M9E-WPT-03"
+    }
+   ]
+  },
+ "FileAPI/unicode.any.js": {
+  "capability": "promise-reads",
+  "subtests": [
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Test that strings are not NFC normalized by Blob constructor",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Test that strings are not NFC normalized by File constructor",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Test that unpaired surrogates are replaced by Blob constructor",
+    "trace": "M9E-WPT-02"
+   },
+   {
+    "classification": "supported",
+    "spec_section": "FileAPI WD reading",
+    "subtest": "Test that unpaired surrogates are replaced by File constructor",
+    "trace": "M9E-WPT-02"
+   }
+  ]
+ },
+  "FileAPI/url/url-format.any.js": {
+   "capability": "blob-url",
+   "subtests": [
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD BlobURL",
+     "subtest": "Generated Blob URLs are unique",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD BlobURL",
+     "subtest": "Blob URL starts with \"blob:\"",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "classification": "supported",
+     "spec_section": "FileAPI WD BlobURL",
+     "subtest": "Blob URL starts with \"blob:\" for Files",
+     "trace": "M9E-WPT-02"
+    },
+    {
+     "capability": "navigation",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs WHATWG URL constructor + location.origin; URL shim is create/revoke-only by design (M6 scope)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD BlobURL",
+     "status": "NOTRUN",
+     "subtest": "Origin of Blob URL matches our origin",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "navigation",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs WHATWG URL constructor + location.origin; URL shim is create/revoke-only by design (M6 scope)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD BlobURL",
+     "status": "NOTRUN",
+     "subtest": "Blob URL parses correctly",
+     "trace": "M9E-WPT-03"
+    },
+    {
+     "capability": "navigation",
+     "classification": "unsupported-host-capability",
+     "issue": "QUESTIONS.md Q1-Q3",
+     "owner": "m9e",
+     "reason": "needs WHATWG URL constructor + location.origin; URL shim is create/revoke-only by design (M6 scope)",
+     "review_by": "2027-09-08",
+     "spec_section": "FileAPI WD BlobURL",
+     "status": "NOTRUN",
+     "subtest": "Origin of Blob URL matches our origin for Files",
+     "trace": "M9E-WPT-03"
+    }
+   ]
+  },
+ "FileAPI/url/url-with-fetch.any.js": {
+  "capability": "blob-url",
+  "subtests": [
+   {
+    "capability": "fetch",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "url-with-fetch needs fetch/Request/XHR plus /common/gc.js; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD BlobURL",
+    "status": "NOTRUN",
+    "subtest": "DYNAMIC: url-with-fetch fetch/XHR matrix",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ },
+ "FileAPI/url/url-with-xhr.any.js": {
+  "capability": "blob-url",
+  "subtests": [
+   {
+    "capability": "fetch",
+    "classification": "unsupported-host-capability",
+    "issue": "QUESTIONS.md Q1-Q3",
+    "owner": "m9e",
+    "reason": "url-with-xhr needs fetch/Request/XHR plus /common/gc.js; no host binding",
+    "review_by": "2027-09-08",
+    "spec_section": "FileAPI WD BlobURL",
+    "status": "NOTRUN",
+    "subtest": "DYNAMIC: url-with-xhr fetch/XHR matrix",
+    "trace": "M9E-WPT-03"
+   }
+  ]
+ }
+}

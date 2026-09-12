@@ -3,8 +3,9 @@
 Reference: upstream `web-platform-tests/wpt`
 `0968c868d8095217d18d86b34c7f21dccae58768` (`master` 2026-09-07).
 Normative base stays WD 23.08.2026 per TZ §1.6; only behaviorally
-verifiable divergences observed through the adapted M7 run are listed.
-No latest-draft change is adopted without a separate decision.
+verifiable divergences observed through the adapted M7 run are listed,
+followed by the M9-E direct-run findings. No latest-draft change is
+adopted without a separate decision.
 
 ## Verified divergences (adapted run, all PASS)
 
@@ -81,3 +82,49 @@ HTML input UI, navigation, Fetch dereference, MediaSource, real browser
 Window/Worker orchestration and the WPT server have no binding surface
 in M1–M6 and are recorded as exact capability gaps, not behavior
 differences. No new normative requirement is introduced by M7.
+
+## M9-E direct-run findings (36 upstream files, 417 executable subtests)
+
+- Sync `abort()` dispatches `abort`+`loadend` back-to-back on the calling
+  stack (TZ §7.3). Pinned `fileReader.any.js` ("FileReader States --
+  abort") asserts exactly this (handler runs before `abort()` returns);
+  the pre-existing M4/M9-C suites pin it
+  (`abort_before_first_job_emits_only_abort_loadend`,
+  `loadstart_abort_then_restart_emits_only_new_operation`). The M9-E gate
+  does NOT re-verify this path through `fileReader.any.js`: that upstream
+  row is a recorded open defect (see below) because the M9-C executor
+  protocol queues the abort terminal through `poll_io`/`run_jobs` and the
+  `unreached_func` reassignment lands first. No product change in M9-E;
+  the defect is harness-observable only.
+- `filereader_result` "result is null during loadstart/progress" holds by
+  construction: packaging publishes only at EOF (`finish_at_eof`), so
+  every non-terminal continuation observes null. The 8 `progress`-matrix
+  rows that need browser microtask interleaving between dispatch and
+  packaging are exact `worker-runtime` NOTRUN exclusions, not failures.
+- `url-format` origin/parse rows need the WHATWG URL constructor plus
+  `location.origin`; the URL shim stays create/revoke-only by M6 design,
+  so the 3 rows are exact `navigation` NOTRUN exclusions.
+- `readAsDataURL` for empty-type Blobs: pinned upstream
+  (`filereader_readAsDataURL.any.js`, two rows) expects
+  `data:application/octet-stream;base64,...`, but the crate contract
+  (M4, pinned by `m4_filereader_async::read_as_data_url_exact_packaging`
+  and `m4_filereader_sync::sync_data_url_exact_packaging`) emits the Blob
+  type verbatim (`data:;base64,...`). Recorded as open defects (2);
+  changing the packaging would break the M4 suites and is out of scope
+  for M9-E.
+- `File` name `dummy/foo`: pinned upstream (`File-constructor.any.js`,
+  "No replacement when using special character in fileName") expects the
+  slash verbatim, but the normative File API replaces every U+002F with
+  U+003A and the crate (M2, `normalize_file_name`) emits `dummy:foo`.
+  Recorded as an open defect (1); the product follows the spec, not the
+  upstream row.
+- Open defects (5 total, all recorded `supported`/`FAIL`, release-red):
+  `filereader_abort.any.js :: Aborting after read` — the test's own
+  `.then()` continuation re-arms `wait_for(['abort','loadend'])` and
+  calls `abort()` a second time after the sync dispatch already delivered
+  the pair; the harness observes a phantom second pair (`2 !== 1`).
+  Product behavior (exactly one pair per `abort()`) matches TZ §7.3;
+  the fix needs upstream EventWatcher queue semantics. Plus the
+  `fileReader.any.js` sync-abort row and the two `readAsDataURL`
+  empty-type rows and the `File` slash row above. See
+  `docs/reviews/M9E-handoff.md` §3.

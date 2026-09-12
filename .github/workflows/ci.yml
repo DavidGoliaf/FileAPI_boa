@@ -29,7 +29,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov,cargo-hack
 
-      # Work order M8 §5 (M1–M7 order preserved, then M8).
+      # Work order M9-E (M1–M8 order preserved, then M9-A…M9-D, then M9-E).
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -90,24 +90,48 @@ jobs:
       - name: cargo test (M8 observability)
         run: cargo test --package boa_fapi --test m8_observability --all-features -- --nocapture
 
-      - name: WPT strict run
-        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --json target/wpt-report.json --junit target/wpt-report.xml
+      - name: WPT smoke run (offline, no upstream checkout)
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --smoke --json target/wpt-smoke.json
+
+      - name: WPT upstream checkout (pinned commit, FileAPI scope)
+        run: |
+          git init --quiet target/pinned-wpt
+          git -C target/pinned-wpt remote add origin https://github.com/web-platform-tests/wpt
+          git -C target/pinned-wpt fetch --quiet --depth 1 origin 0968c868d8095217d18d86b34c7f21dccae58768
+          git -C target/pinned-wpt checkout --quiet FETCH_HEAD -- FileAPI/
+
+      - name: WPT strict run (pinned upstream gate)
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict --json target/wpt-report.json --junit target/wpt-report.xml
 
       - name: WPT strict run (threads 2, ordered output)
-        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --strict --threads 2 --json target/wpt-report-t2.json
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict --threads 2 --json target/wpt-report-t2.json
 
-      - name: WPT report check (actual PASS/NOTRUN only)
+      - name: WPT report check (strict gate + determinism)
         shell: pwsh
         run: >
           $json = Get-Content target/wpt-report.json -Raw | ConvertFrom-Json;
-          $bad = @($json.files | ForEach-Object { $_.subtests } | Where-Object { $_.actual -ne 'PASS' -and $_.actual -ne 'NOTRUN' });
-          if ($bad.Count -ne 0) { throw "unexpected WPT statuses: $($bad.Count)" }
+          if ($json.mode -ne 'WPT_STRICT') { throw "expected WPT_STRICT mode, got $($json.mode)" };
+          if ($json.strict_pass -ne $true) { throw "strict_pass must be true (open defects are recorded FAIL, never unexpected)" };
+          if ($json.summary.unexpected -ne 0) { throw "unexpected rows must be 0, got $($json.summary.unexpected)" };
+          if ($json.summary.defects -ne 5) { throw "expected 5 recorded open defects, got $($json.summary.defects)" };
+          $sha1 = (Get-FileHash target/wpt-report.json -Algorithm SHA256).Hash;
+          $sha2 = (Get-FileHash target/wpt-report-t2.json -Algorithm SHA256).Hash;
+          if ($sha1 -ne $sha2) { throw "threads 1/2 JSON must be byte-identical: $sha1 vs $sha2" }
+
+      - name: WPT negative control (mutated upstream must fail)
+        shell: pwsh
+        run: >
+          Copy-Item -Recurse target/pinned-wpt target/mutated-wpt;
+          Add-Content -Path target/mutated-wpt/FileAPI/blob/Blob-slice.any.js -Value "// M9-E negative control: mutated upstream byte";
+          cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/mutated-wpt --strict --json target/wpt-mutated.json;
+          if ($LASTEXITCODE -eq 0) { throw "mutated upstream run must exit non-zero" }
 
       - name: Upload WPT reports
         uses: actions/upload-artifact@v4
         with:
           name: wpt-reports-${{ matrix.os }}
           path: |
+            target/wpt-smoke.json
             target/wpt-report.json
             target/wpt-report.xml
             target/wpt-report-t2.json

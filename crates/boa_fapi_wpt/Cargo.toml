@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 boa_engine = { workspace = true }
 boa_fapi = { path = "../boa_fapi", version = "0.1.0" }
+boa_fapi_core = { path = "../boa_fapi_core", version = "0.1.0" }
+bytes = { workspace = true }
 thiserror = { workspace = true }
 
 [[bin]]

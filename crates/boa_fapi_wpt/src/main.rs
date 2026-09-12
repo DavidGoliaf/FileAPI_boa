@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use boa_fapi_wpt::manifest::{Manifest, ManifestError, load_manifest};
+use boa_fapi_wpt::manifest::{Manifest, ManifestError, load_manifest_for_mode};
 use boa_fapi_wpt::report;
 use boa_fapi_wpt::runner::{
     ActualStatus, FileResult, RunError, RunOptions, SubtestResult, run_file, scrub_detail,
@@ -27,6 +27,9 @@ use boa_fapi_wpt::runner::{
 struct Args {
     manifest: String,
     strict: bool,
+    smoke: bool,
+    expectations: Option<String>,
+    upstream_root: Option<String>,
     threads: usize,
     filter: Option<String>,
     json: Option<String>,
@@ -39,6 +42,9 @@ impl Args {
         let mut args = Self {
             manifest: String::new(),
             strict: false,
+            smoke: false,
+            expectations: None,
+            upstream_root: None,
             threads: 1,
             filter: None,
             json: None,
@@ -53,6 +59,23 @@ impl Args {
                     args.manifest = argv.get(index).cloned().ok_or("--manifest needs a value")?;
                 }
                 "--strict" => args.strict = true,
+                "--smoke" => args.smoke = true,
+                "--expectations" => {
+                    index += 1;
+                    args.expectations = Some(
+                        argv.get(index)
+                            .cloned()
+                            .ok_or("--expectations needs a value")?,
+                    );
+                }
+                "--upstream-root" => {
+                    index += 1;
+                    args.upstream_root = Some(
+                        argv.get(index)
+                            .cloned()
+                            .ok_or("--upstream-root needs a value")?,
+                    );
+                }
                 "--threads" => {
                     index += 1;
                     let raw = argv.get(index).cloned().ok_or("--threads needs a value")?;
@@ -95,6 +118,24 @@ impl Args {
         }
         if args.manifest.is_empty() {
             return Err("--manifest <path> is required".to_owned());
+        }
+        // Mode rules (M9-E §2): `--smoke` is the offline developer path
+        // (schema 1 accepted, reported as ADAPTED_SMOKE); `--strict` is
+        // the normative gate and requires `--expectations` plus
+        // `--upstream-root`. The two modes are exclusive.
+        if args.smoke && args.strict {
+            return Err("--smoke cannot be combined with --strict".to_owned());
+        }
+        if args.strict {
+            if args.expectations.is_none() {
+                return Err("--strict needs --expectations <path>".to_owned());
+            }
+            if args.upstream_root.is_none() {
+                return Err("--strict needs --upstream-root <dir>".to_owned());
+            }
+        }
+        if args.smoke && (args.expectations.is_some() || args.upstream_root.is_some()) {
+            return Err("--smoke takes no --expectations/--upstream-root".to_owned());
         }
         Ok(args)
     }
@@ -297,7 +338,7 @@ fn worker_main(argv: &[String]) -> i32 {
         }
     };
     let today = today_utc();
-    let manifest = match load_manifest(&manifest_text, &today) {
+    let manifest = match load_manifest_for_mode(&manifest_text, &today, false) {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!("boa_fapi_wpt: {}", format_manifest_error(&error));
@@ -337,7 +378,14 @@ fn worker_main(argv: &[String]) -> i32 {
     match run_file(file, text, &options) {
         Ok(row) => {
             // Single-line worker report: compact JSON of the one FileResult.
-            let json = report::to_json(&manifest, std::slice::from_ref(&row), true);
+            let rows = std::slice::from_ref(&row);
+            let summary = report::summarize(
+                report::RunMode::Smoke,
+                rows,
+                &|_| file.provenance.token().to_owned(),
+                &|_, _| false,
+            );
+            let json = report::to_json(&manifest, rows, true, report::RunMode::Smoke, &summary);
             // Bound stdout: one line, corpus-capped length.
             let mut line = json;
             line.retain(|c| c != '\n' && c != '\r');
@@ -666,7 +714,7 @@ fn worker_json_to_row(
     json: &str,
     file: &boa_fapi_wpt::manifest::ManifestFile,
 ) -> Option<FileResult> {
-    use boa_fapi_wpt::manifest::{ExpectedStatus, parse_json};
+    use boa_fapi_wpt::manifest::parse_json;
     let root = parse_json(json).ok()?;
     let files = root.field("files")?.as_arr()?;
     if files.len() != 1 {
@@ -678,18 +726,33 @@ fn worker_json_to_row(
         return None;
     }
     let subtests = entry.field("subtests")?.as_arr()?;
-    if subtests.len() != file.subtests.len() {
-        return None;
-    }
-    let mut rows = Vec::new();
-    for (sub_json, expected) in subtests.iter().zip(file.subtests.iter()) {
+    // Order-tolerant row matching with explicit extras (M9-E): the worker
+    // serializes rows in manifest order, but the parent must not turn a
+    // row-count/order skew into silent corruption. Match by exact (test,
+    // subtest) id, accept any order; surface harness-recorded ids outside
+    // the manifest as explicit `unexpected:<name>` FAIL rows (runner §5.3
+    // contract) instead of degrading the whole file to TIMEOUT. Missing
+    // ids, duplicate ids, or unknown status tokens stay corruption.
+    let mut by_id: std::collections::BTreeMap<(String, String), &boa_fapi_wpt::manifest::Json> =
+        std::collections::BTreeMap::new();
+    for sub_json in subtests.iter() {
         let test = sub_json.field("test")?.as_str()?;
         let subtest = sub_json.field("subtest")?.as_str()?;
-        let actual = sub_json.field("actual")?.as_str()?;
-        let detail = sub_json.field("detail")?.as_str().unwrap_or("");
-        if test != expected.test || subtest != expected.subtest {
+        if by_id
+            .insert((test.to_owned(), subtest.to_owned()), sub_json)
+            .is_some()
+        {
             return None;
         }
+    }
+    let mut rows = Vec::new();
+    for expected in file.subtests.iter() {
+        let key = (expected.test.clone(), expected.subtest.clone());
+        let sub_json = by_id.remove(&key)?;
+        let actual = sub_json.field("actual")?.as_str()?;
+        let detail = sub_json.field("detail")?.as_str().unwrap_or("");
+        let test = expected.test.as_str();
+        let subtest = expected.subtest.as_str();
         let actual = match actual {
             "PASS" => ActualStatus::Pass,
             "FAIL" => ActualStatus::Fail,
@@ -701,13 +764,38 @@ fn worker_json_to_row(
             test: test.to_owned(),
             subtest: subtest.to_owned(),
             actual,
-            expected: if expected.expected.token() == "PASS" {
-                ExpectedStatus::Pass
-            } else {
-                ExpectedStatus::NotRun
-            },
+            expected: expected.expected,
             detail: scrub_detail(detail),
             trace: expected.trace.clone(),
+            elapsed_ms: 0,
+        });
+    }
+    // Leftover worker ids are harness-recorded extras: one explicit FAIL
+    // row each (never silent, never whole-file TIMEOUT).
+    let mut extras: Vec<((String, String), String)> = Vec::new();
+    for ((test, subtest), sub_json) in by_id {
+        if !subtest.starts_with("unexpected:") {
+            return None;
+        }
+        let detail = sub_json.field("detail")?.as_str().unwrap_or("").to_owned();
+        match sub_json.field("actual")?.as_str()? {
+            "FAIL" => extras.push(((test, subtest), detail)),
+            _ => return None,
+        }
+    }
+    extras.sort();
+    for ((test, subtest), detail) in extras {
+        rows.push(SubtestResult {
+            test,
+            subtest,
+            actual: ActualStatus::Fail,
+            expected: boa_fapi_wpt::manifest::ExpectedStatus::Pass,
+            detail: scrub_detail(&detail),
+            trace: file
+                .subtests
+                .first()
+                .map(|s| s.trace.clone())
+                .unwrap_or_default(),
             elapsed_ms: 0,
         });
     }
@@ -783,6 +871,13 @@ fn run_files_parallel(
         return Err("filter matched no manifest files".to_owned());
     }
     // Chunk round-robin across slots for stable assignment.
+    // NOTE: a global `--timeout-ms` override REPLACES the per-file wall
+    // deadline (diagnostic knob, never the gate default): the manifest's
+    // own `timeout_ms`/`default_timeout_ms` bounds each worker otherwise.
+    // A small global override with a heavy file (Blob-slice fans out
+    // ~280 promise reads across one worker) kills the worker mid-pump
+    // and reports whole-file TIMEOUT — that is the knob working, not a
+    // product failure. The gate never passes `--timeout-ms`.
     let mut chunks: Vec<Vec<usize>> = vec![Vec::new(); slots];
     for (position, index) in selected.into_iter().enumerate() {
         chunks[position % slots].push(index);
@@ -792,21 +887,21 @@ fn run_files_parallel(
     // threads (only validated file records by index).
     let manifest_path = args.manifest.clone();
     let timeout_override = args.timeout_ms;
-    let manifest_owned = Manifest {
-        source: manifest.source.clone(),
-        corpus_root: manifest.corpus_root.clone(),
-        default_timeout_ms: manifest.default_timeout_ms,
-        files: manifest.files.clone(),
-    };
+    let manifest_owned = manifest.for_worker(
+        manifest.source.clone(),
+        manifest.corpus_root.clone(),
+        manifest.default_timeout_ms,
+        manifest.files.clone(),
+    );
     let mut handles = Vec::new();
     for chunk in chunks {
         let manifest_path = manifest_path.clone();
-        let manifest_owned = Manifest {
-            source: manifest_owned.source.clone(),
-            corpus_root: manifest_owned.corpus_root.clone(),
-            default_timeout_ms: manifest_owned.default_timeout_ms,
-            files: manifest_owned.files.clone(),
-        };
+        let manifest_owned = manifest_owned.for_worker(
+            manifest_owned.source.clone(),
+            manifest_owned.corpus_root.clone(),
+            manifest_owned.default_timeout_ms,
+            manifest_owned.files.clone(),
+        );
         let exe = exe.clone();
         handles.push(std::thread::spawn(
             move || -> Result<Vec<(usize, FileResult)>, String> {
@@ -859,6 +954,189 @@ fn run_files_parallel(
     Ok(by_index.into_values().collect())
 }
 
+/// Verifies the pinned upstream tree under `--upstream-root` (M9-E §3).
+///
+/// No shell, no network: only [`std::fs`] reads under the given root.
+/// Checks, in order:
+///
+/// 1. `wpt-inventory.json` (beside the manifest) pins the same
+///    repository/commit as the manifest source;
+/// 2. every inventory path resolves strictly inside the canonicalized
+///    root (no absolute path, no `..` escape, no symlink escape — any
+///    symlink on the candidate prefix is a launch error; case collisions
+///    between two inventory paths resolving to one canonical path are a
+///    launch error);
+/// 3. the enumerated `FileAPI/**` file set under the root equals the
+///    inventory set exactly (missing/extra file is a launch error);
+/// 4. every manifest `upstream_path` is in the inventory and its raw
+///    bytes hash to the manifest `upstream_sha256` (changed file is a
+///    launch error; `upstream_blob_sha` is never evidence).
+///
+/// Error details carry only manifest-relative logical paths, never
+/// absolute filesystem paths.
+///
+/// The inventory file is located beside `manifest_path` (the `--manifest`
+/// argument); the upstream tree is enumerated with `std::fs` only.
+fn verify_upstream_tree_impl(
+    manifest: &Manifest,
+    upstream_root: &str,
+    manifest_path: Option<&str>,
+) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+    let root = Path::new(upstream_root);
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| "cannot resolve --upstream-root".to_owned())?;
+    // Inventory lives beside the manifest; fall back to CWD-relative.
+    let inventory_text = match manifest_path {
+        Some(path) => {
+            let anchor = Path::new(path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| Path::new(".").to_path_buf());
+            std::fs::read_to_string(anchor.join("wpt-inventory.json"))
+                .map_err(|_| "cannot read wpt-inventory.json".to_owned())?
+        }
+        None => std::fs::read_to_string("wpt-inventory.json")
+            .map_err(|_| "cannot read wpt-inventory.json".to_owned())?,
+    };
+    verify_upstream_tree_with_inventory(manifest, &canonical_root, &inventory_text)?;
+    let _ = (BTreeMap::<String, String>::new(), BTreeSet::<String>::new());
+    Ok(())
+}
+
+/// Pure inventory/tree comparison: parses `wpt-inventory.json`, checks the
+/// pinned source, enumerates `FileAPI/**` under the canonical root and
+/// compares hashes for every manifest `upstream_path`.
+fn verify_upstream_tree_with_inventory(
+    manifest: &Manifest,
+    canonical_root: &std::path::Path,
+    inventory_text: &str,
+) -> Result<(), String> {
+    use boa_fapi_wpt::manifest::{Json, parse_json};
+    use std::collections::{BTreeMap, BTreeSet};
+    let root = parse_json(inventory_text).map_err(|_| "bad wpt-inventory.json".to_owned())?;
+    let repository = root
+        .field("repository")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
+    let commit = root
+        .field("commit")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
+    if repository != manifest.source.repository || commit != manifest.source.commit {
+        return Err("inventory source mismatch".to_owned());
+    }
+    let entries = root
+        .field("files")
+        .and_then(Json::as_arr)
+        .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
+    let mut inventory: BTreeMap<String, String> = BTreeMap::new();
+    for entry in entries {
+        let path = entry
+            .field("path")
+            .and_then(Json::as_str)
+            .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
+        let sha256 = entry
+            .field("sha256")
+            .and_then(Json::as_str)
+            .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
+        if !path.starts_with("FileAPI/") || path.contains('\\') || sha256.len() != 64 {
+            return Err(format!("bad inventory entry `{path}`"));
+        }
+        if inventory
+            .insert(path.to_owned(), sha256.to_owned())
+            .is_some()
+        {
+            return Err(format!("duplicate inventory entry `{path}`"));
+        }
+    }
+    // Case-collision guard: two inventory paths must not canonicalize to
+    // one filesystem path (checked after enumeration below per actual
+    // on-disk resolution).
+    let mut on_disk: BTreeMap<String, String> = BTreeMap::new();
+    let mut stack = vec![canonical_root.join("FileAPI")];
+    while let Some(dir) = stack.pop() {
+        // Symlink directories are rejected: traversal must stay inside.
+        let dir_meta = std::fs::symlink_metadata(&dir)
+            .map_err(|_| "cannot enumerate --upstream-root".to_owned())?;
+        if dir_meta.file_type().is_symlink() {
+            return Err("symlink escape in --upstream-root".to_owned());
+        }
+        let read =
+            std::fs::read_dir(&dir).map_err(|_| "cannot enumerate --upstream-root".to_owned())?;
+        for child in read {
+            let child = child.map_err(|_| "cannot enumerate --upstream-root".to_owned())?;
+            let file_type = child
+                .file_type()
+                .map_err(|_| "cannot enumerate --upstream-root".to_owned())?;
+            if file_type.is_symlink() {
+                return Err("symlink escape in --upstream-root".to_owned());
+            }
+            let path = child.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                let canonical = path
+                    .canonicalize()
+                    .map_err(|_| "cannot enumerate --upstream-root".to_owned())?;
+                if !canonical.starts_with(canonical_root) {
+                    return Err("upstream escape in --upstream-root".to_owned());
+                }
+                let relative = canonical
+                    .strip_prefix(canonical_root)
+                    .map_err(|_| "upstream escape in --upstream-root".to_owned())?;
+                let mut logical = relative.to_string_lossy().replace('\\', "/");
+                if !logical.starts_with("FileAPI/") {
+                    // Canonical root itself may be cased differently; the
+                    // logical path is anchored at FileAPI.
+                    logical = format!("FileAPI/{}", logical);
+                }
+                if on_disk
+                    .insert(logical.clone(), canonical.to_string_lossy().into_owned())
+                    .is_some()
+                {
+                    return Err(format!("case collision at `{logical}`"));
+                }
+            }
+        }
+    }
+    let disk_set: BTreeSet<String> = on_disk.keys().cloned().collect();
+    let inv_set: BTreeSet<String> = inventory.keys().cloned().collect();
+    if disk_set != inv_set {
+        let missing: Vec<&String> = inv_set.difference(&disk_set).collect();
+        let extra: Vec<&String> = disk_set.difference(&inv_set).collect();
+        if let Some(path) = missing.first() {
+            return Err(format!("upstream file missing `{path}`"));
+        }
+        if let Some(path) = extra.first() {
+            return Err(format!("upstream file extra `{path}`"));
+        }
+        return Err("upstream inventory drift".to_owned());
+    }
+    // Raw-content evidence for every manifest upstream file.
+    for file in &manifest.files {
+        let Some(expected) = inventory.get(&file.upstream_path) else {
+            return Err(format!("upstream file missing `{}`", file.upstream_path));
+        };
+        if expected != &file.upstream_sha256 {
+            return Err(format!("upstream hash drift for `{}`", file.upstream_path));
+        }
+        let candidate = canonical_root.join(&file.upstream_path);
+        let bytes = std::fs::read(&candidate)
+            .map_err(|_| format!("cannot read upstream file `{}`", file.upstream_path))?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(format!("upstream file too large `{}`", file.upstream_path));
+        }
+        let digest = sha256_hex(&bytes);
+        if digest != file.upstream_sha256 {
+            return Err(format!("upstream hash drift for `{}`", file.upstream_path));
+        }
+    }
+    Ok(())
+}
+
 /// Runs the strict gate and optionally writes reports.
 fn run(argv: &[String]) -> Result<i32, String> {
     let args = Args::parse(argv)?;
@@ -867,9 +1145,23 @@ fn run(argv: &[String]) -> Result<i32, String> {
     if args.strict && args.filter.is_some() {
         return Err("--filter cannot be combined with --strict".to_owned());
     }
+    if args.smoke && args.filter.is_some() {
+        return Err("--filter cannot be combined with --smoke".to_owned());
+    }
     let manifest_text = read_text(&args.manifest)?;
     let today = today_utc();
-    let manifest = load_manifest(&manifest_text, &today).map_err(|e| format_manifest_error(&e))?;
+    let manifest = load_manifest_for_mode(&manifest_text, &today, args.strict)
+        .map_err(|e| format_manifest_error(&e))?;
+    // Mode/schema agreement (M9-E §2): smoke accepts schema 1 (legacy
+    // adapted manifest) or schema 2 (runs the same corpus, still labelled
+    // ADAPTED_SMOKE); strict requires schema 2 plus inventory and
+    // expectations.
+    if args.smoke && manifest.schema_version() < boa_fapi_wpt::manifest::MIN_SMOKE_SCHEMA_VERSION {
+        return Err("smoke needs manifest schema >= 1".to_owned());
+    }
+    if args.strict && manifest.schema_version() != boa_fapi_wpt::manifest::SCHEMA_VERSION {
+        return Err("strict needs manifest schema_version 2".to_owned());
+    }
     if args.threads == 0 {
         return Err("--threads must be >= 1".to_owned());
     }
@@ -882,6 +1174,26 @@ fn run(argv: &[String]) -> Result<i32, String> {
     // Hash/path validation first: every CLI path (sequential and
     // parallel) reuses the same validated texts.
     let texts = verify_hashes(&args.manifest, &manifest)?;
+    // Strict-only gate inputs (M9-E §3/§4): inventory + expectations are
+    // verified before any file executes.
+    let expectations = if args.strict {
+        let Some(upstream_root) = args.upstream_root.clone() else {
+            return Err("--strict needs --upstream-root <dir>".to_owned());
+        };
+        let Some(expectations_path) = args.expectations.clone() else {
+            return Err("--strict needs --expectations <path>".to_owned());
+        };
+        verify_upstream_tree_impl(&manifest, &upstream_root, Some(args.manifest.as_str()))?;
+        let expectations_text = read_text(&expectations_path)?;
+        let rows =
+            boa_fapi_wpt::manifest::load_expectations(&expectations_text, &today, &manifest.source)
+                .map_err(|e| format!("expectations error: {e}"))?;
+        boa_fapi_wpt::manifest::resolve_expectations(&manifest, &rows)
+            .map_err(|e| format!("expectations error: {e}"))?;
+        Some(rows)
+    } else {
+        None
+    };
     // Every CLI file execution — including default `--threads 1` (F12) —
     // runs through the isolated worker path with the wall deadline: the
     // in-process pump guard cannot interrupt a hung `run_jobs()`, so only
@@ -889,12 +1201,60 @@ fn run(argv: &[String]) -> Result<i32, String> {
     // number of concurrent children; rows always re-sort by manifest
     // index. `run_file` stays the library mapping for unit tests.
     let slots = args.threads.min(manifest.files.len().max(1));
-    let files = run_files_parallel(&args, &manifest, slots, &texts)?;
+    let mut files = run_files_parallel(&args, &manifest, slots, &texts)?;
     if files.is_empty() {
         return Err("filter matched no manifest files".to_owned());
     }
+    // Tracker rows (`DYNAMIC: ...` NOTRUN exclusions) attach to their
+    // manifest file here so reports and totals cover every gate id. The
+    // worker never executes them; smoke mode (no expectations file) skips
+    // this step and reports executable rows only.
+    //
+    // File-level exclusion rows (non-`.any.js` inventory files, no manifest
+    // entry by design) are NOT attached per file: they have no executing
+    // file to belong to. They are reported as a synthetic summary section
+    // below (`exclusions` already counts only executed NOTRUN rows; the
+    // JSON `files` array keeps exactly the manifest files in order, so
+    // threads 1/2 stay byte-identical).
+    if let Some(rows) = expectations.as_ref() {
+        for file in files.iter_mut() {
+            let Some(manifest_file) = manifest.files.iter().find(|f| f.path == file.path) else {
+                continue;
+            };
+            file.subtests
+                .extend(boa_fapi_wpt::manifest::tracker_subtests(
+                    manifest_file,
+                    rows,
+                ));
+        }
+    }
+    let mode = if args.smoke {
+        report::RunMode::Smoke
+    } else {
+        report::RunMode::Strict
+    };
+    let provenance_of = |path: &str| -> String {
+        manifest
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.provenance.token().to_owned())
+            .unwrap_or_else(|| "adapted".to_owned())
+    };
+    let acceptance = |test: &str, subtest: &str| {
+        manifest
+            .files
+            .iter()
+            .flat_map(|f| &f.subtests)
+            .find(|s| s.test == test && s.subtest == subtest)
+            .is_some_and(|s| {
+                s.classification == boa_fapi_wpt::manifest::Classification::ProjectAcceptance
+            })
+    };
+    let summary = report::summarize(mode, &files, &provenance_of, &acceptance);
     let strict_ok = report::strict_pass(&files);
-    let json = report::to_json(&manifest, &files, strict_ok);
+    let release_ok = report::release_green(&files);
+    let json = report::to_json(&manifest, &files, strict_ok, mode, &summary);
     let junit = report::to_junit(&manifest, &files);
     if let Some(path) = args.json.as_ref() {
         std::fs::write(path, json).map_err(|_| format!("cannot write `{path}`"))?;
@@ -904,10 +1264,21 @@ fn run(argv: &[String]) -> Result<i32, String> {
     if let Some(path) = args.junit.as_ref() {
         std::fs::write(path, junit).map_err(|_| format!("cannot write `{path}`"))?;
     }
-    summarize(&files);
+    print_summary(mode, &summary, files.len());
     if args.strict && !strict_ok {
         return Err("strict gate failed".to_owned());
     }
+    if args.strict && !release_ok {
+        // Recorded open defects satisfy the strict comparison
+        // (`strict_pass: true`, exit 0 — the gate DID verify every row)
+        // but keep the release gate red: M9-F must not ship with known
+        // FAIL. Stderr note, never stdout (reports stay deterministic).
+        eprintln!(
+            "boa_fapi_wpt: note: {} open defect(s) recorded (expected FAIL); release gate stays red",
+            summary.defects
+        );
+    }
+    let _ = expectations;
     Ok(0)
 }
 
@@ -917,26 +1288,20 @@ fn format_manifest_error(error: &ManifestError) -> String {
 
 /// Prints the stable human summary (counts only, no secrets/paths detail).
 ///
-/// `NOTRUN` rows count separately from `PASS`/`FAIL`: a gap is never
-/// reported as a pass.
-fn summarize(files: &[FileResult]) {
-    let mut pass = 0;
-    let mut notrun = 0;
-    let mut fail = 0;
-    for file in files {
-        for sub in &file.subtests {
-            if sub.actual.token() == "PASS" && sub.expected.token() == "PASS" {
-                pass += 1;
-            } else if sub.actual.token() == "NOTRUN" && sub.expected.token() == "NOTRUN" {
-                notrun += 1;
-            } else {
-                fail += 1;
-            }
-        }
-    }
+/// Smoke mode prints the `ADAPTED_SMOKE` label; strict mode prints the
+/// `WPT_STRICT` label with the upstream/smoke/defects/exclusions split
+/// (M9-E §2): adapted smoke PASS is never reported as WPT conformance,
+/// and open defects (expected FAIL) are never merged into PASS.
+fn print_summary(mode: report::RunMode, summary: &report::Summary, files: usize) {
     println!(
-        "wpt: {pass} passed, {notrun} notrun, {fail} unexpected ({} files)",
-        files.len()
+        "{}: {} upstream passed, {} smoke passed, {} defects, {} exclusions, {} unexpected ({} files)",
+        mode.token(),
+        summary.upstream_pass,
+        summary.smoke_pass,
+        summary.defects,
+        summary.exclusions,
+        summary.unexpected,
+        files
     );
 }
 
@@ -1004,11 +1369,13 @@ mod tests {
             "boa_fapi_wpt",
             "--manifest",
             "wpt-manifest.json",
+            "--expectations",
+            "expectations.json",
+            "--upstream-root",
+            "wpt-checkout",
             "--strict",
             "--threads",
             "2",
-            "--filter",
-            "corpus/blob",
             "--json",
             "target/report.json",
             "--junit",
@@ -1024,12 +1391,63 @@ mod tests {
         if let Ok(args) = parsed {
             assert_eq!(args.manifest, "wpt-manifest.json");
             assert!(args.strict);
+            assert!(!args.smoke);
+            assert_eq!(args.expectations.as_deref(), Some("expectations.json"));
+            assert_eq!(args.upstream_root.as_deref(), Some("wpt-checkout"));
             assert_eq!(args.threads, 2);
-            assert_eq!(args.filter.as_deref(), Some("corpus/blob"));
             assert_eq!(args.json.as_deref(), Some("target/report.json"));
             assert_eq!(args.junit.as_deref(), Some("target/report.xml"));
             assert_eq!(args.timeout_ms, Some(42));
         }
+    }
+
+    #[test]
+    fn cli_parser_accepts_smoke_without_gate_inputs() {
+        let argv = ["boa_fapi_wpt", "--manifest", "wpt-manifest.json", "--smoke"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let parsed = Args::parse(&argv);
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            assert!(parsed.smoke);
+            assert!(!parsed.strict);
+        }
+    }
+
+    #[test]
+    fn cli_parser_rejects_mode_conflicts() {
+        // Smoke + strict are exclusive.
+        let both = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--smoke".to_owned(),
+            "--strict".to_owned(),
+            "--expectations".to_owned(),
+            "expectations.json".to_owned(),
+            "--upstream-root".to_owned(),
+            "wpt-checkout".to_owned(),
+        ];
+        assert!(Args::parse(&both).is_err());
+        // Strict without gate inputs is rejected.
+        let strict_only = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--strict".to_owned(),
+        ];
+        assert!(Args::parse(&strict_only).is_err());
+        // Smoke with gate inputs is rejected.
+        let smoke_gate = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--smoke".to_owned(),
+            "--expectations".to_owned(),
+            "expectations.json".to_owned(),
+        ];
+        assert!(Args::parse(&smoke_gate).is_err());
     }
 
     #[test]
