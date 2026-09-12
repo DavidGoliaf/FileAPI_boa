@@ -213,6 +213,14 @@ fn internal_binding_modules_expose_no_public_items() {
             if module == "clone_bridge.rs" && trimmed.starts_with("pub fn ") {
                 continue;
             }
+            // M9-D-R2 documents its GC/drop test-only arbitration through
+            // `#[doc(hidden)] __test_*` helpers: they are explicitly not
+            // part of the host surface (never re-exported from `lib.rs`),
+            // run the production finalizer arbitration (not a cleanup
+            // bypass), and are asserted absent from `lib.rs` below.
+            if module == "streams.rs" && trimmed.starts_with("pub fn __test_") {
+                continue;
+            }
             assert!(
                 !starts_public || starts_crate_public,
                 "{module} must not expose public items: {trimmed}"
@@ -900,6 +908,9 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
     for required in [
         "poll_io",
         "has_pending_io",
+        "io_active_count",
+        "stream_payload_count",
+        "stream_operation_count",
         "io_executor",
         "io_wake",
         "FileIoExecutor",
@@ -924,4 +935,17 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
         !lib_rs.contains("pub use blob::BlobNative"),
         "lib.rs must not expose BlobNative"
     );
+    // M9-D-R2 `__test_*` helpers stay module-internal: they are reachable
+    // from integration tests through the `#[doc(hidden)]` path on the
+    // handle/module, never as re-exported host API.
+    for forbidden in [
+        "__test_live_stream",
+        "__test_drop_live_stream",
+        "__test_drop_",
+    ] {
+        assert!(
+            !lib_rs.contains(forbidden),
+            "lib.rs public surface must not expose {forbidden}"
+        );
+    }
 }

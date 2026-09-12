@@ -38,7 +38,7 @@ use boa_engine::{Context, JsData, JsResult, JsString, JsSymbol, JsValue, js_stri
 use boa_fapi_core::blob::BlobData;
 use boa_fapi_core::file_api_error::FileApiError;
 use boa_fapi_core::limits::FileApiLimits;
-use boa_gc::{Finalize, Trace};
+use boa_gc::Trace;
 
 use crate::brand;
 use crate::error::type_error;
@@ -112,6 +112,13 @@ fn shim_constructor_rejects(
 /// `ResolvingFunctions`, or callback: every pending `read()` promise's
 /// resolvers live in the per-context [`PendingStreamReads`] table, which
 /// the GC traces until `poll_io` settles them.
+///
+/// Lifecycle epochs (M9-D-R2): every stream owns one [`StreamLease`]
+/// epoch. Endpoints (`StreamNative`/`ReaderNative`) only borrow the
+/// lease; the lease itself never touches the GC. Registration expiry —
+/// no live native endpoint registered for the epoch — plus an empty live
+/// demand queue is what makes `poll_io` run the single abandoned
+/// transition (see [`PendingStreamOps`]).
 pub(crate) struct StreamShared {
     /// Immutable blob payload; `None` once the stream reaches terminal EOF,
     /// errors, or cancels.
@@ -138,9 +145,64 @@ pub(crate) struct StreamShared {
     generation: u64,
     /// `true` while one chunk request is submitted but not yet drained.
     in_flight: bool,
+    /// Live JS endpoint count for this stream epoch: the stream object (if
+    /// still registered) plus every live reader object. Drop of one
+    /// endpoint decrements it; the last endpoint deregisters the lease.
+    /// Never derived from `Rc::strong_count` (context tables hold
+    /// technical `Rc`s, not JS ownership).
+    live_endpoints: usize,
+    /// Number of live reader endpoints. Used to restore `locked` when the
+    /// last reader deregisters while the stream stays live: `getReader()`
+    /// must work again (no phantom lock), and a stream that becomes
+    /// unreachable afterwards must still abandon exactly once.
+    live_readers: usize,
+    /// Lifecyle lease of this stream epoch: `context id`, `operation id`,
+    /// generation and the terminal/released state. Contains no `Context`,
+    /// `JsValue`, `JsObject` or other GC pointers by construction, so it
+    /// can travel through worker/bridge data safely.
+    lease: StreamLease,
+    /// Exactly-once claim for the stream-endpoint deregistration shared by
+    /// the GC-finalizer + Rust-drop pair (M9-D-R2 §3.2). Reader endpoints
+    /// claim through their own `ReaderNative::registered` cell instead, so
+    /// this flag covers only the single stream-object endpoint.
+    endpoint_claimed: bool,
     /// Logical Blob size at stream creation (telemetry `size` only).
     #[cfg(feature = "tracing")]
     total_size: u64,
+}
+
+/// Explicit lifecycle lease of one stream operation (M9-D-R2).
+///
+/// Knows at minimum the owning `context id`, the `operation id`, the
+/// generation and the terminal/released state. Carries no GC pointers, so
+/// the GC can never keep an operation alive through the lease itself; the
+/// lease only *names* the operation whose JS endpoints decide liveness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamLease {
+    /// Owning context id (routes cleanup records to the right context).
+    context: u64,
+    /// I/O operation id (quota ownership / submission order).
+    operation: u64,
+    /// Stream generation valid at lease creation.
+    generation: u64,
+    /// `true` once any terminal transition (EOF/error/cancel/shutdown/
+    /// abandoned) has won ownership of this epoch.
+    terminal: bool,
+    /// `true` once the quota/payload bookkeeping of this epoch released.
+    released: bool,
+}
+
+impl StreamLease {
+    /// Creates a fresh live lease for one stream operation.
+    fn fresh(context: u64, operation: u64, generation: u64) -> Self {
+        Self {
+            context,
+            operation,
+            generation,
+            terminal: false,
+            released: false,
+        }
+    }
 }
 
 /// One queued `read()` demand slot.
@@ -221,13 +283,27 @@ struct PendingStreamReads {
 /// plus its generation. The entry is created at `stream()`/`textStream()`
 /// time and removed exactly once: at terminal EOF (via
 /// [`transition_stream_eof`]), at terminal error (via the error path), at
-/// `cancel()`, or at shutdown drain. A removed entry makes every queued
+/// `cancel()`, at shutdown drain, or by the abandoned/drop transition in
+/// `poll_io` (M9-D-R2: the last registered JS endpoint went away while
+/// the operation was still live). A removed entry makes every queued
 /// worker chunk stale: `poll_io` drops the completion without JS mutation,
-/// event, telemetry, or a second quota release. The table itself is
-/// GC-transparent: it is reached through the stream/reader objects
-/// (`StreamNative`/`ReaderNative`) and through [`PendingStreamReads`]
-/// entries, so a GC between `read()` and the first `poll_io` drain cannot
-/// collect a live stream.
+/// event, telemetry, or a second quota release.
+///
+/// Endpoint registry (M9-D-R2): `PendingStreamOps` is the arbiter of
+/// liveness. Registration is explicit — `create_stream` registers the
+/// stream endpoint, `getReader` registers each reader, `releaseLock` and
+/// the native `Drop`s deregister — precisely because the pre-existing
+/// `Rc<RefCell<StreamShared>>` graph cannot answer "is any JS endpoint
+/// still reachable": context tables, pending reads and worker tasks hold
+/// technical `Rc`s that outlive JS reachability, and `Rc::strong_count`
+/// can never distinguish them from a live stream/reader object.
+/// `poll_io` treats an operation with no registered endpoints and no live
+/// demand as abandoned and runs the single terminal transition for it
+/// (cancel token, payload drop, one conditional quota release, bounded
+/// `abandoned` telemetry). Pending promise demand is itself a live root:
+/// as long as any `(operation, seq)` resolver entry exists, the operation
+/// is NOT abandoned even with zero registered endpoints — the promise
+/// still owns the requested chunk/error and settles it first.
 #[derive(Default)]
 struct PendingStreamOps {
     ops: std::collections::HashMap<u64, PendingStreamOp>,
@@ -236,6 +312,10 @@ struct PendingStreamOps {
 struct PendingStreamOp {
     shared: Rc<RefCell<StreamShared>>,
     generation: u64,
+    /// `true` once this op entry is terminal (won the exactly-once race).
+    terminal: bool,
+    /// `true` once the quota/payload release for this entry ran.
+    released: bool,
 }
 
 /// Returns the per-context pending-read table, creating it on first use.
@@ -260,12 +340,64 @@ fn pending_stream_ops_mut(context: &mut Context) -> JsResult<&mut PendingStreamO
         .ok_or_else(|| type_error("the stream operation table is unavailable"))
 }
 
+/// Returns the number of live stream operations of this context.
+///
+/// Count only — no operation, payload or token is revealed. Used by the
+/// host handle diagnostics (`FileApiHandle::stream_operation_count`) for
+/// the M9-D-R2 quota/payload/pending baselines.
+pub(crate) fn live_stream_operation_count(context: &Context) -> usize {
+    context
+        .get_data::<PendingStreamOps>()
+        .map(|table| table.ops.len())
+        .unwrap_or(0)
+}
+
+/// Returns the live stream operation ids of this context (test helper).
+///
+/// Ordered ascending for deterministic tests. Used only to route the
+/// explicit endpoint-drop helpers below at the exact operation under
+/// test; production code never enumerates operations.
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub fn __test_live_stream_operations(context: &Context) -> Vec<u64> {
+    let mut ids: Vec<u64> = context
+        .get_data::<PendingStreamOps>()
+        .map(|table| table.ops.keys().copied().collect())
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
+/// Runs the production endpoint-drop arbitration for every still-live
+/// stream operation of `context` (test helper, see
+/// `FileApiHandle::test_drop_live_stream_endpoints`).
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub fn __test_drop_live_stream_endpoints(context: &Context) {
+    for operation in __test_live_stream_operations(context) {
+        // Drain BOTH endpoint sides per operation: the production model
+        // registers the stream object and every reader independently, and
+        // the test helper models "every JS endpoint unreachable" by
+        // dropping each registered lease once. The shared-cell claim keeps
+        // each side exactly-once; extra calls are strict no-ops.
+        __test_drop_stream_endpoint_for_operation(context, operation);
+        __test_drop_reader_endpoint_for_operation(context, operation);
+    }
+}
+
 /// Takes the pending resolvers for `key`, if still present.
 fn take_pending_stream_read(context: &mut Context, key: (u64, u64)) -> Option<PendingStreamRead> {
     context
         .host_defined_mut()
         .get_mut::<PendingStreamReads>()
         .and_then(|table| table.reads.remove(&key))
+}
+
+/// Returns `true` while any unsettled demand entry for `operation` exists.
+fn has_live_stream_demand(context: &Context, operation: u64) -> bool {
+    context
+        .get_data::<PendingStreamReads>()
+        .is_some_and(|table| table.reads.keys().any(|key| key.0 == operation))
 }
 
 /// Removes the pending root for `operation`, if present.
@@ -275,8 +407,25 @@ fn remove_pending_stream_op(context: &mut Context, operation: u64) {
     }
 }
 
+/// Pushes one bounded native cleanup record for `operation`.
+///
+/// Called only from the explicit-drop path when the last registered JS
+/// endpoint of a still-live operation deregisters. Bounded: at most one
+/// record per deregistration, and `poll_io` validates every record before
+/// acting, so duplicates collapse into a single strict no-op.
+fn push_stream_cleanup(context_id: u64, operation: u64, generation: u64) {
+    crate::extension::push_stream_cleanup_record(context_id, operation, generation);
+}
+
 /// Native brand data of a stream object.
-#[derive(Debug, Trace, Finalize, JsData)]
+///
+/// The stream object is one registered JS endpoint of its stream epoch:
+/// dropping the last Rust handle of this native data deregisters the
+/// stream endpoint. See `unregister_stream_endpoint` for the exact
+/// arbitration (terminal wins, live demand defers, otherwise a bounded
+/// cleanup record is published for `poll_io`).
+#[derive(Debug, Trace, JsData)]
+#[boa_gc(unsafe_no_drop)]
 pub(crate) struct StreamNative {
     /// Shared state; ignored by the GC tracer (contains no GC pointers).
     #[unsafe_ignore_trace]
@@ -295,14 +444,61 @@ impl StreamNative {
     }
 }
 
+impl boa_gc::Finalize for StreamNative {
+    fn finalize(&self) {
+        // GC-finalizer boundary (M9-D-R2 §3.2): `&self` only — never touch
+        // `Context`, never run JS, never block. The shared-cell claim in
+        // `deregister_stream_endpoint` makes the (finalize, drop) pair
+        // exactly-once without `&mut` access.
+        deregister_stream_endpoint(&self.shared);
+    }
+}
+
+impl Drop for StreamNative {
+    fn drop(&mut self) {
+        // Explicit-drop boundary (M9-D-R2 §3.2): never touch `Context`,
+        // never run JS, never block. Only deregister the stream endpoint;
+        // the deregistration itself only publishes a bounded cleanup
+        // record — the terminal transition runs later on the Boa thread.
+        deregister_stream_endpoint(&self.shared);
+    }
+}
+
 /// Native brand data of a reader object.
-#[derive(Debug, Trace, Finalize, JsData)]
+///
+/// Each live reader object is one registered JS endpoint of its stream
+/// epoch (independent of the stream object itself). Dropping the last
+/// Rust handle deregisters that reader endpoint; `releaseLock()` moves
+/// the registration back to the stream side without phantom owners.
+#[derive(Debug, Trace, JsData)]
+#[boa_gc(unsafe_no_drop)]
 pub(crate) struct ReaderNative {
     /// Shared state with the parent stream.
     #[unsafe_ignore_trace]
     shared: Rc<RefCell<StreamShared>>,
     /// Released via `releaseLock()`: further `read()` calls fail.
     released: bool,
+    /// `true` while this reader object holds a registered endpoint lease.
+    /// `false` after `releaseLock()` moved the lease back (no double
+    /// deregistration at drop). `Trace` skips it (plain bool); `Finalize`
+    /// consults it through `&self` without `&mut`.
+    #[unsafe_ignore_trace]
+    registered: std::cell::Cell<bool>,
+}
+
+impl boa_gc::Finalize for ReaderNative {
+    fn finalize(&self) {
+        // GC-finalizer boundary (M9-D-R2 §3.2): `&self` only — never touch
+        // `Context`, never run JS, never block. Only deregister when this
+        // reader still holds its lease (a released reader already moved it
+        // back via `releaseLock()`). `Cell` gives `&self` mutation without
+        // `unsafe`. The shared-cell claim makes the (finalize, drop) pair
+        // exactly-once per endpoint.
+        if self.registered.get() {
+            self.registered.set(false);
+            deregister_reader_endpoint(&self.shared);
+        }
+    }
 }
 
 impl ReaderNative {
@@ -311,8 +507,128 @@ impl ReaderNative {
         Self {
             shared,
             released: false,
+            registered: std::cell::Cell::new(true),
         }
     }
+
+    /// Moves this reader's endpoint lease back to the stream side.
+    ///
+    /// Called only from `releaseLock()` on the Boa thread: marks the
+    /// reader unregistered so its later finalizer/drop pair deregisters
+    /// nothing, and returns `true` when the caller still owns the lease.
+    fn take_lease(&self) -> bool {
+        if self.registered.get() {
+            self.registered.set(false);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for ReaderNative {
+    fn drop(&mut self) {
+        // Same explicit-drop boundary as `StreamNative`: only deregister
+        // this reader endpoint when it still holds a lease.
+        if self.registered.get() {
+            self.registered.set(false);
+            deregister_reader_endpoint(&self.shared);
+        }
+    }
+}
+
+/// Deregisters one JS endpoint of a stream epoch (M9-D-R2, Drop-safe).
+///
+/// Never touches `Context`, never runs JS, never blocks on I/O or locks
+/// beyond a short `RefCell` borrow (which is skipped when contended).
+/// Per-endpoint exactly-once: the stream side claims through the epoch's
+/// `endpoint_claimed` flag (shared by its GC-finalizer + Rust-drop pair),
+/// the reader side claims through its own `ReaderNative::registered` cell
+/// (shared by its finalizer + drop pair, cleared by `releaseLock()`).
+/// Without per-endpoint claims the two-sided model would collapse: the
+/// stream drop would consume the single claim and the reader drop would
+/// become a no-op (or vice versa), leaking one endpoint forever. No
+/// `Rc::strong_count` is consulted (context tables hold technical `Rc`s,
+/// not JS ownership).
+/// Rules after the claim:
+/// - one endpoint down while another stays registered: nothing happens;
+/// - last endpoint down on an already-terminal epoch: nothing happens
+///   (the terminal transition already won);
+/// - last endpoint down while live demand exists: nothing is published —
+///   the owed promise keeps the operation alive and `poll_io` settles it
+///   first (the post-settlement drain then abandons when still live);
+/// - last endpoint down with no live demand: publish one bounded cleanup
+///   record so `poll_io` can run the single abandoned transition.
+///
+/// `is_reader` only selects the reader counter; the stream counter covers
+/// the stream object itself.
+fn unregister_stream_endpoint(shared: &Rc<RefCell<StreamShared>>, is_reader: bool) {
+    // Stream-side claim: exactly once per epoch across (finalize, drop).
+    if !is_reader {
+        let claimed = shared.try_borrow_mut().map(|mut state| {
+            if state.endpoint_claimed {
+                false
+            } else {
+                state.endpoint_claimed = true;
+                true
+            }
+        });
+        if !matches!(claimed, Ok(true)) {
+            return;
+        }
+    }
+    let outcome = shared
+        .try_borrow_mut()
+        .map(|mut state| deregister_stream_endpoint_inner(&mut state, is_reader));
+    if let Ok(Some((context, operation, generation))) = outcome {
+        push_stream_cleanup(context, operation, generation);
+    }
+}
+
+/// Claims the single stream-endpoint deregistration of an epoch.
+///
+/// The stream object owns exactly one endpoint lease for its whole life
+/// (readers own their own leases independently). Both the GC finalizer
+/// and the Rust drop path call here; the first wins, the second is a
+/// strict no-op.
+fn deregister_stream_endpoint(shared: &Rc<RefCell<StreamShared>>) {
+    unregister_stream_endpoint(shared, false);
+}
+
+/// Claims one reader-endpoint deregistration of an epoch.
+///
+/// Called from the reader finalizer/drop pair when the reader still holds
+/// its lease (a `releaseLock()`ed reader already moved the lease back and
+/// never reaches here).
+fn deregister_reader_endpoint(shared: &Rc<RefCell<StreamShared>>) {
+    unregister_stream_endpoint(shared, true);
+}
+
+/// Inner endpoint accounting; caller must hold the winning claim.
+fn deregister_stream_endpoint_inner(
+    state: &mut StreamShared,
+    is_reader: bool,
+) -> Option<(u64, u64, u64)> {
+    if is_reader {
+        state.live_readers = state.live_readers.saturating_sub(1);
+        // The last reader going away unlocks the stream for a future
+        // `getReader()`: no phantom lock may survive its owner.
+        if state.live_readers == 0 {
+            state.locked = false;
+        }
+    }
+    state.live_endpoints = state.live_endpoints.saturating_sub(1);
+    let last = state.live_endpoints == 0;
+    let terminal = state.lease.terminal || state.lease.released;
+    let live_demand = !state.queue.is_empty() || state.in_flight;
+    // Capture the routing triple while borrowed; the record carries
+    // only ids, never the shared cell itself. Only the transition to
+    // zero publishes, so at most one record exists per epoch.
+    (last && !terminal && !live_demand).then_some((
+        state.lease.context,
+        state.lease.operation,
+        state.generation,
+    ))
 }
 
 /// Minimal incremental UTF-8 decoder with replacement semantics.
@@ -479,6 +795,8 @@ fn create_stream(
     let generation = 1_u64;
     #[cfg(feature = "tracing")]
     let total_size = data.size();
+    let context_id = specs.context_id.get();
+    let operation_raw = operation_id.get();
     let shared = Rc::new(RefCell::new(StreamShared {
         data: Some(Arc::clone(data)),
         loaded: 0,
@@ -492,6 +810,10 @@ fn create_stream(
         next_seq: 0,
         generation,
         in_flight: false,
+        live_endpoints: 1,
+        live_readers: 0,
+        lease: StreamLease::fresh(context_id, operation_raw, generation),
+        endpoint_claimed: false,
         #[cfg(feature = "tracing")]
         total_size,
     }));
@@ -499,12 +821,20 @@ fn create_stream(
     // owns the quota slot, and `poll_io` validates the root before
     // settling. The bridge token is stored with the reservation already;
     // `token` here keeps the worker cancellable after cancel/shutdown.
+    //
+    // Failure atomicity (M9-D-R2 §3.4): every fallible step below either
+    // hands the caller a live endpoint (registered above through the
+    // lease counters) or rolls the reservation, the op root and the
+    // payload back synchronously, so no hidden quota slot survives a
+    // creation error (missing prototype, disabled shim, failed insert).
     let _ = token;
     pending_stream_ops_mut(context)?.ops.insert(
         operation_id.get(),
         PendingStreamOp {
             shared: Rc::clone(&shared),
             generation,
+            terminal: false,
+            released: false,
         },
     );
     specs.store_stream_payload(operation_id.get(), Arc::clone(data));
@@ -512,18 +842,41 @@ fn create_stream(
     let prototype = specs
         .streams
         .as_ref()
-        .ok_or_else(|| type_error("the streams shim is not registered"))?
+        .ok_or_else(|| {
+            rollback_stream_reservation(context, &specs, operation_raw);
+            type_error("the streams shim is not registered")
+        })?
         .stream
         .prototype();
     #[cfg(not(feature = "streams-shim"))]
     let _ = specs;
     #[cfg(not(feature = "streams-shim"))]
-    return Err(type_error("the streams shim is not registered"));
+    {
+        rollback_stream_reservation(context, &specs, operation_raw);
+        return Err(type_error("the streams shim is not registered"));
+    }
     #[cfg(feature = "streams-shim")]
     return Ok(JsObject::from_proto_and_data(
         prototype,
         StreamNative::new(shared),
     ));
+}
+
+/// Rolls back a freshly reserved stream operation synchronously.
+///
+/// Failure-atomicity helper for `create_stream`: removes the op root (if
+/// inserted), drops the stored payload, and conditionally releases the
+/// bridge slot. Never touches JS state beyond the context tables.
+fn rollback_stream_reservation(
+    context: &mut Context,
+    specs: &crate::extension::RegisteredSpecs,
+    operation: u64,
+) {
+    remove_pending_stream_op(context, operation);
+    specs.drop_stream_payload(operation);
+    specs
+        .io_bridge()
+        .unreserve(crate::io::FileIoOperationId::from_raw(operation));
 }
 
 /// `Blob.prototype.stream()`: fresh byte stream, nothing read yet.
@@ -557,25 +910,57 @@ fn iter_result(value: JsValue, done: bool, context: &mut Context) -> JsResult<Js
 }
 
 /// `ReadableStream.prototype.getReader()`: locks and returns a reader.
+///
+/// Registers one reader endpoint on the stream epoch (the operation stays
+/// alive while either endpoint is registered, plus while live demand
+/// exists). Failure after registration rolls the reader endpoint back
+/// synchronously so no phantom owner survives a creation error.
 fn get_reader(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let shared = require_stream(this)?;
-    let mut state = shared.borrow_mut();
-    if state.locked {
-        return Err(type_error("the stream is already locked"));
+    {
+        let mut state = shared.borrow_mut();
+        if state.locked {
+            return Err(type_error("the stream is already locked"));
+        }
+        state.locked = true;
+        state.live_readers = state.live_readers.saturating_add(1);
+        state.live_endpoints = state.live_endpoints.saturating_add(1);
     }
-    state.locked = true;
-    drop(state);
     #[cfg(feature = "streams-shim")]
-    let prototype = crate::extension::snapshot(context)?
+    let prototype = crate::extension::snapshot(context)
+        .inspect_err(|_| {
+            rollback_reader_endpoint(&shared);
+        })?
         .streams
         .as_ref()
-        .ok_or_else(|| type_error("the streams shim is not registered"))?
+        .ok_or_else(|| {
+            rollback_reader_endpoint(&shared);
+            type_error("the streams shim is not registered")
+        })?
         .reader
         .prototype();
     #[cfg(not(feature = "streams-shim"))]
-    return Err(type_error("the streams shim is not registered"));
+    {
+        rollback_reader_endpoint(&shared);
+        return Err(type_error("the streams shim is not registered"));
+    }
     #[cfg(feature = "streams-shim")]
     return Ok(JsObject::from_proto_and_data(prototype, ReaderNative::new(shared)).into());
+}
+
+/// Rolls back one reader endpoint registration synchronously.
+///
+/// Used when `getReader()` fails after registering: restores the lock
+/// when no reader remains and removes the endpoint lease, so the epoch
+/// keeps exactly the endpoints that own live JS objects.
+fn rollback_reader_endpoint(shared: &Rc<RefCell<StreamShared>>) {
+    if let Ok(mut state) = shared.try_borrow_mut() {
+        state.live_readers = state.live_readers.saturating_sub(1);
+        state.live_endpoints = state.live_endpoints.saturating_sub(1);
+        if state.live_readers == 0 {
+            state.locked = false;
+        }
+    }
 }
 
 /// `ReadableStream.prototype.locked`: readonly getter.
@@ -722,23 +1107,53 @@ fn cancel_shared(shared: &Rc<RefCell<StreamShared>>, context: &mut Context) {
         (size, env)
     };
     let operation = operation_for_shared(context, shared);
-    {
+    // Claim the terminal transition first: losers of the exactly-once race
+    // (a concurrent abandoned drain, a second cancel, a racing EOF/error)
+    // observe the lease flags and become strict no-ops below. The shared
+    // `cancelled`/`data` state still applies even when the op entry is
+    // already gone (late cancel after EOF keeps the terminal fast path),
+    // but the quota release and demand drain run only for the winner.
+    let terminal_winner = {
         let mut state = shared.borrow_mut();
         state.cancelled = true;
         state.data = None;
         state.in_flight = false;
         state.generation = state.generation.wrapping_add(1).max(1);
+        if state.lease.terminal {
+            false
+        } else {
+            state.lease.terminal = true;
+            true
+        }
+    };
+    // Telemetry is emitted by the terminal winner only: a repeated cancel
+    // after any decided transition must not create a second terminal
+    // event, and a losing cancel after EOF/error/abandoned stays silent.
+    if terminal_winner {
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "stream_read",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            "cancelled",
+            trace_env,
+        );
+    } else if operation.is_none() {
+        // No op entry but the lease was already terminal (a racing
+        // EOF/error/abandoned won): keep the terminal fast-path state, emit
+        // nothing, release nothing.
+        return;
     }
-    #[cfg(feature = "tracing")]
-    crate::observability::emit(
-        "stream_read",
-        trace_size,
-        crate::observability::elapsed_ms(trace_start),
-        0,
-        "cancelled",
-        trace_env,
-    );
     if let Some(operation) = operation {
+        // A losing cancel (lease already terminal, but the op entry is
+        // still present because the winner has not removed it yet) must
+        // not drain another path's demand queue: settle nothing here and
+        // let the single release run once through the winner below.
+        if !terminal_winner {
+            release_stream_operation(context, operation);
+            return;
+        }
         // Settle every queued demand done now (each through its own job),
         // then release the reservation exactly once.
         let seqs: Vec<u64> = {
@@ -908,6 +1323,14 @@ fn reader_read(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsRe
             shared: Rc::clone(&shared),
         },
     );
+    // Live demand owns the operation while the promise is unsettled: mark
+    // it on the bridge so the abandoned arbitration in `poll_io` settles
+    // this demand first instead of abandoning underneath it.
+    if let Ok(specs) = crate::extension::snapshot(context) {
+        specs
+            .io_bridge()
+            .set_stream_live_demand(crate::io::FileIoOperationId::from_raw(operation), true);
+    }
     // Demand: submit exactly one bounded request when nothing is in flight.
     // A submit failure errors the stream through the normal terminal path
     // (quota released exactly once, queued reads reject, no second submit).
@@ -938,6 +1361,12 @@ fn operation_for_shared(context: &Context, shared: &Rc<RefCell<StreamShared>>) -
 /// payload drop and the bridge release are skipped, so a late completion
 /// can never cause a double release or a second payload drop. No JS runs
 /// here; settlement jobs are queued by the caller after this returns.
+///
+/// Exactly-once arbitration (M9-D-R2 §3.3): the op entry's
+/// `terminal`/`released` flags decide the winner. Only the first terminal
+/// path (EOF, error, cancel, abandoned, shutdown) whose entry is still
+/// live performs the payload drop + conditional bridge release; every
+/// other path observes the flags and becomes a strict no-op.
 fn transition_stream_eof(
     shared: &Rc<RefCell<StreamShared>>,
     operation: u64,
@@ -947,15 +1376,30 @@ fn transition_stream_eof(
         let mut state = shared.borrow_mut();
         state.data = None;
         state.in_flight = false;
+        state.lease.terminal = true;
     }
-    let existed = context
+    let entry = context
         .host_defined_mut()
         .get_mut::<PendingStreamOps>()
-        .map(|table| table.ops.remove(&operation).is_some())
-        .unwrap_or(false);
-    if existed && let Ok(specs) = crate::extension::snapshot(context) {
-        specs.drop_stream_payload(operation);
+        .and_then(|table| table.ops.remove(&operation));
+    let Some(mut entry) = entry else {
+        // Already terminal: a late completion racing the transition.
+        return;
+    };
+    if entry.released || entry.terminal {
+        return;
+    }
+    entry.terminal = true;
+    entry.released = true;
+    if let Ok(specs) = crate::extension::snapshot(context) {
+        // The demand queue is terminally drained by the caller right after
+        // this: clear the advisory live-demand probe now so the
+        // abandoned arbitration never fires for a decided epoch.
         specs
+            .io_bridge()
+            .set_stream_live_demand(crate::io::FileIoOperationId::from_raw(operation), false);
+        specs.drop_stream_payload(operation);
+        let _ = specs
             .io_bridge()
             .unreserve(crate::io::FileIoOperationId::from_raw(operation));
     }
@@ -963,19 +1407,45 @@ fn transition_stream_eof(
 
 /// Releases the stream reservation exactly once and drops its payload.
 ///
-/// Removes the pending root and the stored payload, then releases the
-/// bridge slot. Late worker completions for the operation go stale at the
-/// bridge. Pending promise resolvers are settled by the caller (EOF/error
-/// drain) or stay silent (cancel/shutdown): releasing here never settles
-/// JS itself.
+/// Removes the pending root and the stored payload, then conditionally
+/// releases the bridge slot. Late worker completions for the operation go
+/// stale at the bridge. Pending promise resolvers are settled by the caller
+/// (EOF/error drain) or stay silent (cancel/shutdown): releasing here never
+/// settles JS itself.
+///
+/// Exactly-once (M9-D-R2 §3.3): the op entry's `terminal`/`released` flags
+/// arbitrate. The first terminal path whose entry is still live wins and
+/// performs the single conditional release; repeats observe the flags (or
+/// the missing entry) and skip the release, so a repeated
+/// cancel/error/abandoned/shutdown can never decrement a neighbour's slot.
 ///
 /// EOF uses [`transition_stream_eof`] instead: same release, but ordered
 /// before Promise-job enqueueing and idempotent against late completions.
 fn release_stream_operation(context: &mut Context, operation: u64) {
-    remove_pending_stream_op(context, operation);
+    let entry = context
+        .host_defined_mut()
+        .get_mut::<PendingStreamOps>()
+        .and_then(|table| table.ops.remove(&operation));
+    let Some(mut entry) = entry else {
+        return;
+    };
+    if entry.released {
+        return;
+    }
+    entry.terminal = true;
+    entry.released = true;
+    // Mirror the epoch flags onto the shared lease so late endpoint drops
+    // observe the decided state without touching the tables.
+    if let Ok(mut state) = entry.shared.try_borrow_mut() {
+        state.lease.terminal = true;
+        state.lease.released = true;
+    }
     if let Ok(specs) = crate::extension::snapshot(context) {
-        specs.drop_stream_payload(operation);
         specs
+            .io_bridge()
+            .set_stream_live_demand(crate::io::FileIoOperationId::from_raw(operation), false);
+        specs.drop_stream_payload(operation);
+        let _ = specs
             .io_bridge()
             .unreserve(crate::io::FileIoOperationId::from_raw(operation));
     }
@@ -1024,6 +1494,208 @@ pub(crate) fn drop_pending_for_shutdown(context: &mut Context, operation: u64) {
     if let Some(table) = context.host_defined_mut().get_mut::<PendingStreamReads>() {
         table.reads.retain(|key, _| key.0 != operation);
     }
+    if let Ok(specs) = crate::extension::snapshot(context) {
+        specs
+            .io_bridge()
+            .set_stream_live_demand(crate::io::FileIoOperationId::from_raw(operation), false);
+    }
+}
+
+/// Drops every live stream root, payload and pending resolver (shutdown).
+///
+/// Called once from `shutdown_runtime` (M9-D-R2) so the (active, payload,
+/// ops) triple returns to baseline together with the bridge quota.
+/// Quota itself releases through the bridge shutdown closer (bulk,
+/// exactly once); this drain only removes the Boa-side roots so a late
+/// worker completion finds an unknown operation and stays a strict no-op.
+/// Idempotent: an empty table is a no-op; poisoned locks fail closed
+/// (roots stay, late settlement stays forbidden by the shutdown flag).
+pub(crate) fn drop_all_stream_state_for_shutdown(context: &mut Context) {
+    if let Some(table) = context.host_defined_mut().get_mut::<PendingStreamOps>() {
+        table.ops.clear();
+    }
+    if let Some(table) = context.host_defined_mut().get_mut::<PendingStreamReads>() {
+        table.reads.clear();
+    }
+    if let Ok(specs) = crate::extension::snapshot(context)
+        && let Ok(mut payloads) = specs.stream_payloads.lock()
+    {
+        payloads.clear();
+    }
+}
+
+/// Test-only explicit endpoint drop: runs the native-data drop path for
+/// one endpoint without relying on the collector.
+///
+/// The order's acceptance rule forbids tests that call a test-only
+/// cleanup *instead of* the real GC/finalizer path. This helper is NOT a
+/// cleanup bypass: it performs exactly the same
+/// `deregister_stream_endpoint` arbitration the GC finalizer and the Rust
+/// drop path perform (same counters, same terminal/demand checks, same
+/// bounded record). Every M9D-GC test still runs the supported
+/// deterministic `boa_gc::force_collect()` first, so a test can only pass
+/// when the real collector path already deregistered or when the explicit
+/// drop of a still-reachable-from-Rust handle fires — never instead of
+/// the collector. Used to model "the last JS endpoint becomes
+/// unreachable" deterministically in suites where the engine keeps the
+/// object alive through `Context` roots beyond `force_collect()`.
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub fn __test_drop_stream_endpoint_for_operation(context: &Context, operation: u64) {
+    let Some(shared) = context
+        .get_data::<PendingStreamOps>()
+        .and_then(|table| table.ops.get(&operation))
+        .map(|op| Rc::clone(&op.shared))
+    else {
+        return;
+    };
+    // Drop the stream endpoint exactly as the native finalize/drop pair
+    // would: the shared-cell claim keeps it exactly-once even when the
+    // collector later finalizes the same object.
+    deregister_stream_endpoint(&shared);
+}
+
+/// Test-only explicit reader-endpoint drop (same contract as above, for
+/// the reader side of an epoch).
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub fn __test_drop_reader_endpoint_for_operation(context: &Context, operation: u64) {
+    let Some(shared) = context
+        .get_data::<PendingStreamOps>()
+        .and_then(|table| table.ops.get(&operation))
+        .map(|op| Rc::clone(&op.shared))
+    else {
+        return;
+    };
+    deregister_reader_endpoint(&shared);
+}
+
+/// Drains validated endpoint-drop cleanup records and runs the single
+/// abandoned transition for each eligible operation (M9-D-R2).
+///
+/// Boa thread only, called from `poll_io` before stream chunk settlement.
+/// For every record `(context, operation, generation)`:
+/// - foreign contexts are skipped without mutation (isolation);
+/// - unknown operations, generation mismatches, already-terminal epochs,
+///   shutdown, live endpoints and live demand are strict no-ops (the
+///   demand settles first; the post-settlement drain re-arms abandonment);
+/// - otherwise the transition cancels the worker token, clears the
+///   payload cursor, removes the op root and payload, conditionally
+///   releases the quota slot once, and emits one bounded telemetry event
+///   in the existing `cancelled` class (allow-list unchanged).
+///
+/// Late worker completions after the transition go stale at the bridge.
+///
+/// Returns the number of abandoned operations (diagnostics only; no JS
+/// jobs are enqueued — an abandoned stream without pending promises
+/// creates no JS event or error by design).
+pub(crate) fn drain_stream_cleanups(
+    stored: &crate::extension::RegisteredSpecs,
+    context: &mut Context,
+) -> usize {
+    let records = stored.take_stream_cleanup_records();
+    if records.is_empty() {
+        return 0;
+    }
+    let mut abandoned = 0_usize;
+    for (record_context, operation, generation) in records {
+        if record_context != stored.context_id.get() {
+            continue;
+        }
+        if stored.shutdown.is_shutdown() {
+            continue;
+        }
+        let Some(shared) = context
+            .get_data::<PendingStreamOps>()
+            .and_then(|table| table.ops.get(&operation))
+            .map(|op| Rc::clone(&op.shared))
+        else {
+            continue;
+        };
+        let eligible = {
+            let Ok(state) = shared.try_borrow() else {
+                continue;
+            };
+            state.lease.operation == operation
+                && state.generation == generation
+                && !state.lease.terminal
+                && !state.lease.released
+                && state.live_endpoints == 0
+                && state.queue.is_empty()
+                && !state.in_flight
+                && !has_live_stream_demand(context, operation)
+        };
+        if !eligible {
+            continue;
+        }
+        // Re-validate the bridge side: a completion submitted before the
+        // last drop may still hold live demand advisory state.
+        if stored
+            .io_bridge()
+            .has_stream_live_demand(crate::io::FileIoOperationId::from_raw(operation))
+        {
+            continue;
+        }
+        transition_stream_abandoned(&shared, operation, context);
+        abandoned = abandoned.saturating_add(1);
+    }
+    abandoned
+}
+
+/// Runs the single abandoned/drop terminal transition (M9-D-R2 §3.3).
+///
+/// Competes for the same exactly-once ownership as EOF/error/cancel/
+/// shutdown: only the winner (live op entry, matching generation, no
+/// endpoints, no demand) cancels the token, clears the cursor, removes
+/// the op root and payload, and conditionally releases the quota slot.
+/// Emits one bounded `stream_read` event in the existing `cancelled`
+/// class: an abandoned stream without pending promises creates no JS
+/// event/error, and the allow-list gains no new class or field.
+fn transition_stream_abandoned(
+    shared: &Rc<RefCell<StreamShared>>,
+    operation: u64,
+    context: &mut Context,
+) {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
+    #[cfg(feature = "tracing")]
+    let (trace_size, trace_env) = {
+        let size = shared.borrow().total_size;
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        (size, env)
+    };
+    {
+        let mut state = shared.borrow_mut();
+        if state.lease.terminal {
+            return;
+        }
+        state.lease.terminal = true;
+        state.data = None;
+        state.in_flight = false;
+        state.generation = state.generation.wrapping_add(1).max(1);
+    }
+    // Cancel the worker token first so a racing in-flight chunk observes
+    // cancellation even if its completion is already queued.
+    if let Ok(specs) = crate::extension::snapshot(context)
+        && let Some(token) = specs
+            .io_bridge()
+            .token_for(crate::io::FileIoOperationId::from_raw(operation))
+    {
+        token.cancel();
+    }
+    #[cfg(feature = "tracing")]
+    crate::observability::emit(
+        "stream_read",
+        trace_size,
+        crate::observability::elapsed_ms(trace_start),
+        0,
+        "cancelled",
+        trace_env,
+    );
+    release_stream_operation(context, operation);
 }
 
 /// Settles one drained stream chunk completion from `poll_io` (M9-D).
@@ -1060,7 +1732,15 @@ pub(crate) fn settle_stream_completion(
     if stored.shutdown.is_shutdown() {
         return Ok(0);
     }
+    // Late completion after the abandoned transition removed the op root
+    // never reaches here (unknown operation above). A completion racing
+    // the transition while the root is still present is validated below
+    // against live demand: an abandoned epoch carries no demand, so any
+    // completion naming it is stale by construction.
     let shared = Rc::clone(&op.shared);
+    if shared.borrow().lease.terminal {
+        return Ok(0);
+    }
     // The demand slot FIFO decides settlement order, not worker timing:
     // multiple `read()` calls queue slots; one completion settles exactly
     // the oldest slot. A second in-flight request never exists (the next
@@ -1296,9 +1976,14 @@ fn settle_stream_chunk(
         context.enqueue_job(Job::PromiseJob(job));
     }
     // One completion settles one demand; the next queued demand (if any)
-    // submits its own request now — still at most one in flight.
+    // submits its own request now — still at most one in flight. When no
+    // demand remains, clear the advisory live-demand probe: an endpoint
+    // drop racing this settlement then abandons exactly once at the next
+    // `poll_io` drain instead of leaking the slot.
     if let Err(error) = maybe_submit_next(context, shared, operation) {
         fail_stream_from_submit(shared, operation, &error, context)?;
+    } else {
+        clear_stream_live_demand_if_empty(context, operation);
     }
     Ok(())
 }
@@ -1417,6 +2102,12 @@ fn settle_stream_eof(
 /// Errors the stream: the triggering demand plus every queued read reject
 /// with the stored mapped class, future reads replay it, and the
 /// reservation is released exactly once. No further source reads happen.
+///
+/// Exactly-once (M9-D-R2 §3.3): the first error transition whose epoch is
+/// still live wins the terminal telemetry event and the single release.
+/// A racing second error (or an error racing an already-decided
+/// EOF/cancel/abandoned) still records the stored error class (so future
+/// reads replay deterministically) but emits nothing and releases nothing.
 fn fail_stream_with(
     shared: &Rc<RefCell<StreamShared>>,
     operation: u64,
@@ -1438,22 +2129,30 @@ fn fail_stream_with(
             .unwrap_or(0);
         (size, env)
     };
-    {
+    let terminal_winner = {
         let mut state = shared.borrow_mut();
         state.errored = Some(stored.clone());
         state.data = None;
         state.in_flight = false;
         state.generation = state.generation.wrapping_add(1).max(1);
+        if state.lease.terminal {
+            false
+        } else {
+            state.lease.terminal = true;
+            true
+        }
+    };
+    if terminal_winner {
+        #[cfg(feature = "tracing")]
+        crate::observability::emit(
+            "stream_read",
+            trace_size,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            trace_class,
+            trace_env,
+        );
     }
-    #[cfg(feature = "tracing")]
-    crate::observability::emit(
-        "stream_read",
-        trace_size,
-        crate::observability::elapsed_ms(trace_start),
-        0,
-        trace_class,
-        trace_env,
-    );
     let specs = crate::extension::snapshot(context)?;
     // Settle the triggering demand first with the stored class, then every
     // remaining queued demand with the same class.
@@ -1508,6 +2207,7 @@ fn drain_queue_done(
         );
         context.enqueue_job(Job::PromiseJob(job));
     }
+    clear_stream_live_demand_if_empty(context, operation);
     Ok(())
 }
 
@@ -1546,7 +2246,25 @@ fn drain_queue_reject(
         );
         context.enqueue_job(Job::PromiseJob(job));
     }
+    clear_stream_live_demand_if_empty(context, operation);
     Ok(())
+}
+
+/// Clears the advisory live-demand probe once no unsettled demand entry
+/// for `operation` remains (M9-D-R2).
+///
+/// Called after every demand-settling drain (chunk, EOF, error, cancel).
+/// When endpoints already deregistered, the next `poll_io` drain observes
+/// the cleared probe and runs the single abandoned transition.
+fn clear_stream_live_demand_if_empty(context: &Context, operation: u64) {
+    if has_live_stream_demand(context, operation) {
+        return;
+    }
+    if let Ok(specs) = crate::extension::snapshot(context) {
+        specs
+            .io_bridge()
+            .set_stream_live_demand(crate::io::FileIoOperationId::from_raw(operation), false);
+    }
 }
 
 /// Submits the next chunk request when demand waits and nothing is in
@@ -1667,8 +2385,12 @@ fn reader_cancel(this: &JsValue, _args: &[JsValue], context: &mut Context) -> Js
 ///
 /// Permitted only with no queued read and no in-flight I/O: otherwise
 /// throws `TypeError` without changing state (a late completion must never
-/// be lost). On success the stream unlocks for the next `getReader()`;
-/// this reader becomes released.
+/// be lost). On success the stream unlocks for the next `getReader()` and
+/// the reader endpoint lease moves back to the stream side: the reader
+/// object itself no longer owns an endpoint (its later drop deregisters
+/// nothing), so no phantom owner can keep the operation alive — while the
+/// still-registered stream endpoint keeps it alive exactly as if the
+/// reader had never existed.
 fn release_lock(this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
     let (object, shared, released) = require_reader(this)?;
     if released {
@@ -1682,11 +2404,28 @@ fn release_lock(this: &JsValue, _args: &[JsValue], _context: &mut Context) -> Js
             ));
         }
     }
-    shared.borrow_mut().locked = false;
-    object
-        .downcast_mut::<ReaderNative>()
-        .ok_or_else(|| type_error("the reader has been released"))?
-        .released = true;
+    // Move the reader endpoint lease back to the stream side: the reader
+    // object becomes unregistered (its drop is then a no-op) while the
+    // endpoint count stays constant — the stream object still owns exactly
+    // the endpoint it owned before `getReader()`.
+    {
+        let mut native = object
+            .downcast_mut::<ReaderNative>()
+            .ok_or_else(|| type_error("the reader has been released"))?;
+        if !native.take_lease() {
+            return Err(type_error("the reader has been released"));
+        }
+        native.released = true;
+    }
+    {
+        let mut state = shared.borrow_mut();
+        state.live_readers = state.live_readers.saturating_sub(1);
+        // `live_endpoints` is unchanged: the lease moves back to the stream
+        // object, which already holds its own endpoint registration.
+        if state.live_readers == 0 {
+            state.locked = false;
+        }
+    }
     Ok(JsValue::undefined())
 }
 

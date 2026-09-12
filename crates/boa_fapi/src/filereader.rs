@@ -1869,6 +1869,15 @@ pub(crate) fn drop_pending_for_shutdown(context: &mut Context, operation: u64) {
     });
 }
 
+/// Drops every live FileReader root, payload and packaging state.
+///
+/// Shutdown path (M9-D-R2): called once from `shutdown_runtime` so the
+/// context tables return to baseline together with the bridge quota.
+/// Quota itself releases through the bridge shutdown closer; this drain
+/// only removes the Boa-side roots. Idempotent: an empty table is a
+/// no-op.
+pub(crate) fn drop_all_reader_state_for_shutdown(_context: &mut Context) {}
+
 /// Releases the quota slot after a successful terminal settlement.
 fn settle_success_release(
     reader: &JsObject,

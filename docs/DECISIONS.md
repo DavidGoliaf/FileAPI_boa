@@ -1085,3 +1085,101 @@ backpressure за пределами terminal EOF не меняются. Нов�
 после EOF, затем после error, затем после cancel (до R1 доказывал только
 cancel-recovery); новые тесты `text_tail_eof_terminates_state_and_frees_quota`
 и `eof_late_completion_is_strict_noop_without_second_telemetry`.
+
+## ADR-0046 (M9-D-R2): GC/drop lifecycle для Streams I/O
+
+Контекст: приёмка M9A–M9E показала оставшуюся ветку M9-D §3: созданный,
+но брошенный stream (последний доступный JS endpoint недостижим, `read`/
+`cancel` не вызывались) удерживал `IoBridge` reservation и payload до
+shutdown. `StreamNative`/`ReaderNative` не владели lifecycle lease, а
+derived `Finalize` только уничтожал native data, не удаляя context-owned
+operation. При `max_concurrent_reads_per_global = 1` второй stream был
+ошибочно quota-blocked; при стандартном лимите серия недостижимых
+непрочитанных stream занимала все slots навсегда.
+
+Решение — явная endpoint/demand ownership + finalizer-to-Boa-thread
+cleanup boundary + exactly-once arbitration, без `unsafe` и без новых
+зависимостей:
+
+1. Модель JS endpoint/demand ownership: живыми JS endpoints считаются
+   stream и выданные им reader objects. `StreamShared` несёт счётчики
+   `live_endpoints`/`live_readers` и lease `StreamLease { context,
+   operation, generation, terminal, released }` (только opaque ids, без
+   `Context`/`JsValue`/`JsObject`/GC-указателей). `create_stream`
+   регистрирует stream endpoint (1,0), `getReader` — reader endpoint
+   (+1,+1, с синхронным rollback при ошибке), `releaseLock` перемещает
+   lease reader обратно на stream side без phantom owner (endpoint count
+   неизменен, `locked` сбрасывается). Drop одного endpoint не завершает
+   operation, пока достижим другой. Pending read Promise — самостоятельный
+   живой demand: потеря stream/reader не отменяет достижимый Promise
+   (он обязан получить запрошенный chunk/error); advisory probe
+   `IoBridge::stream_live_demand` + проверка `PendingStreamReads` держат
+   операцию живой до settlement последнего demand, после чего
+   post-settlement drain перевооружает abandonment. На `Rc::strong_count`
+   не полагаемся: context tables и pending entries держат технические
+   `Rc`, не равные JS ownership.
+2. Finalizer-to-Boa-thread cleanup boundary: GC finalizer не мутирует
+   `Context` и не исполняет JS. Stream side клеймится через
+   `endpoint_claimed` во shared cell (пара finalizer+drop ровно один раз),
+   reader side — через собственный `Cell<bool> registered` в
+   `ReaderNative` (finalizer доступен через `&self`; `releaseLock`
+   сбрасывает lease заранее). Клейм выполняет только
+   `deregister_*_inner` учёт и публикует bounded native cleanup record
+   `(context, operation, generation)` в context-pinned очередь
+   (`RegisteredSpecs::stream_cleanups`, registry + orphan routing, cap
+   1024, fail-closed при overflow) — без bytes/paths/JS values, без
+   блокировок на I/O, без неограниченного lock wait. `poll_io` (Boa
+   thread) дренит записи до и после stream chunks, валидирует каждую
+   (свой контекст, живой op root, та же generation, не terminal, ноль
+   endpoints, пустая очередь, не in-flight, нет live demand incl.
+   bridge probe) и только тогда выполняет single abandoned transition.
+   Stale записи (cancel/EOF/error/shutdown уже победили) — strict no-op.
+3. Exactly-once arbitration и conditional release: EOF, text-tail EOF,
+   error, cancel, abandoned/drop и shutdown конкурируют за одну terminal
+   ownership transition (флаги `terminal`/`released` в op entry + lease).
+   Только победитель отменяет token при необходимости, удаляет operation
+   root и payload, освобождает quota slot и создаёт не более одного
+   terminal telemetry event. `IoBridge::unreserve`/`release` стали
+   условно-идемпотентными (`-> bool`): повторный release неизвестного id
+   возвращает `false` и не уменьшает `active` чужого запроса (одного
+   `saturating_sub` недостаточно — требуется доказательство существования
+   reservation через token entry). Late completion после abandoned/drop —
+   strict no-op: без JS mutation, Promise settlement, повторного release,
+   payload drop и telemetry (unknown-operation + lease-terminal guards).
+4. Поведение telemetry для abandoned stream: отдельный bounded класс не
+   вводится — abandoned transition эмитит одно `stream_read` событие в
+   существующем классе `cancelled` (allow-list M8 неизменна: те же 6
+   полей, те же 10 классов). Abandoned stream без pending Promise не
+   создаёт JS event/error (возвращаемое значение drain — только host
+   diagnostics, jobs не ставятся). Cancel/error/EOF telemetry теперь тоже
+   эмитится только победителем terminal гонки (повторный cancel после
+   решённого transition молчит).
+5. Failure atomicity: после успешного `reserve()` каждый fallible шаг
+   `create_stream`/`getReader` либо возвращает объект с живым lease, либо
+   синхронно откатывает reservation, op root и payload
+   (`rollback_stream_reservation`/`rollback_reader_endpoint`); скрытых
+   quota slots не остаётся (проверены missing-prototype, locked-reader,
+   queued-demand releaseLock, QueueFull submit paths).
+6. Shutdown: `shutdown_runtime` дополнительно дренит все stream op
+   roots/payloads/resolvers через context tables (quota bulk-релиз идёт
+   через bridge closer ровно один раз); late completions после shutdown —
+   strict no-op с полным (active, payload, ops) baseline.
+
+Безопасная интеграция с Boa GC достигнута текущим публичным API
+(`Trace`/`Finalize` derive + `#[boa_gc(unsafe_no_drop)]` для ручного
+`Drop`, `Cell` для `&self`-мутации в finalizer, без ручного
+`unsafe impl Trace`): вопрос в `docs/QUESTIONS.md` не потребовался,
+тестовых hook вместо настоящего GC/drop path нет (каждый M9D-GC тест
+выполняет поддерживаемый deterministic `boa_gc::force_collect()` первым;
+`__test_*` helpers выполняют ту же production arbitration для объектов,
+удерживаемых `Context` roots, а `poll_io` остаётся единственным местом
+transition). Новых зависимостей нет; `cargo-deny` не меняется. Count-only
+host diagnostics (`io_active_count`, `stream_payload_count`,
+`stream_operation_count`) — публичные счётчики без раскрытия
+операций/payload/token (guards обновлены: `__test_*` разрешены только в
+`streams.rs` через `#[doc(hidden)]` и запрещены в `lib.rs`).
+
+Последствия: trace rows `M9D-GC-01…06` в `docs/spec-matrix.md`;
+M9D handoff дополняется новым rework-handoff (исторический
+M9D-EOF-LIFECYCLE-handoff не переписывается); `docs/architecture.md`
+§Layer 2c дополняется GC/drop абзацем.

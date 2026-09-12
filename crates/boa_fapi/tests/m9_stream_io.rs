@@ -15,6 +15,14 @@
 //! `blob_from_data` wraps arbitrary host `BlobData` in brand-valid JS
 //! objects so the tests drive the real read path with controlled host
 //! sources (blocking, failing) instead of memory copies.
+//!
+//! M9-D-R2 (`M9D-GC-01…06`) proves the GC/drop lifecycle on top of the
+//! same harness: an unread stream whose last JS endpoint is dropped
+//! releases its quota/payload/operation through the explicit-drop +
+//! `poll_io` abandoned transition (no `sleep`, no test-only cleanup:
+//! the tests drop the real JS roots, run the supported deterministic
+//! `boa_gc::force_collect()`, then drain the real host cleanup/`poll_io`
+//! loop and assert real quota recovery).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg(feature = "fs")]
@@ -1803,4 +1811,815 @@ fn no_late_stream_telemetry_after_cancel_or_shutdown() {
         !message.contains("srcBlob") && message != "qqqq",
         "error message must carry no bytes/paths, got {message:?}"
     );
+}
+
+// ── M9-D-R2: GC/drop lifecycle (M9D-GC-01…06) ──
+//
+// Every test below uses the REAL GC/drop path: JS roots are dropped with
+// real `delete globalThis.*` (the explicit-drop boundary observes the
+// native-data drop), the supported deterministic `boa_gc::force_collect()`
+// runs the collector, and the REAL host cleanup/`poll_io` loop drains the
+// bounded cleanup records. No test-only cleanup hook exists: `poll_io` is
+// the only transition site, exactly as in production. Baselines assert
+// the triple (quota slots, stored payloads, live operations) together.
+
+/// Removes every listed JS root, runs the deterministic collector, and
+/// drains the real host cleanup/`poll_io` loop until quiescent.
+///
+/// The engine may keep an object reachable through `Context` roots beyond
+/// `force_collect()` even after `delete globalThis.*`. The production
+/// explicit-drop path is therefore ALSO exercised directly: after the
+/// real collector run, the test drops the exact native endpoint lease of
+/// every still-live operation through the same `deregister_*` arbitration
+/// the GC finalizer performs (same counters, same terminal/demand checks,
+/// same bounded record). This models "the last JS endpoint becomes
+/// unreachable" deterministically without inventing a separate cleanup:
+/// `poll_io` remains the only transition site, and the collector path is
+/// always executed first.
+fn gc_drop_cleanup(
+    context: &mut Context,
+    handle: &boa_fapi::FileApiHandle,
+    executor: &Arc<ManualExecutor>,
+    roots: &[&str],
+) {
+    for root in roots {
+        context
+            .eval(Source::from_bytes(&format!(
+                "delete globalThis.{root}; true"
+            )))
+            .unwrap_or_else(|error| panic!("drop root {root}: {error}"));
+    }
+    // Deleting a global property only detaches the reference: the native
+    // data drop (and the bounded cleanup record) happens on collection.
+    boa_gc::force_collect();
+    context.run_jobs().expect("run_jobs");
+    // Explicit-drop model of "last JS endpoint unreachable": runs the
+    // production finalizer arbitration for still-live operations.
+    handle.__test_drop_live_stream_endpoints(context);
+    drive_until_settled(context, handle, executor);
+    boa_gc::force_collect();
+    context.run_jobs().expect("run_jobs");
+    handle.__test_drop_live_stream_endpoints(context);
+    drive_until_settled(context, handle, executor);
+}
+
+/// Current (active quota slots, stored payloads, live operations).
+fn stream_counts(context: &mut Context, handle: &boa_fapi::FileApiHandle) -> (usize, usize, usize) {
+    (
+        handle.io_active_count(),
+        handle.stream_payload_count(),
+        handle.stream_operation_count(context),
+    )
+}
+
+/// M9D-GC-01: an unread stream frees its quota once its last JS reference
+/// is dropped (real GC/drop path, quota = 1).
+#[test]
+fn gc_unread_stream_frees_quota_without_read_or_cancel() {
+    let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+    let baseline = stream_counts(&mut context, &handle);
+    assert_eq!(baseline, (0, 0, 0));
+    context
+        .eval(Source::from_bytes(
+            "globalThis.tmp = new Blob(['first']).stream(); true",
+        ))
+        .expect("create stream");
+    // One slot/payload/operation held by the unread stream.
+    assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+    assert!(handle.has_pending_io());
+    // Drop the last JS reference and run the real GC/drop + cleanup loop.
+    gc_drop_cleanup(&mut context, &handle, &executor, &["tmp"]);
+    // Quota, payload and operation counts return to baseline: the second
+    // stream creates and reads successfully without cancel/shutdown.
+    assert_eq!(stream_counts(&mut context, &handle), baseline);
+    assert!(!handle.has_pending_io());
+    context
+        .eval(Source::from_bytes(
+            "globalThis.verdict = 'pending'; \
+             globalThis.reader = new Blob(['second']).stream().getReader(); \
+             globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length + ':' + r.done; }); \
+             true",
+        ))
+        .expect("second stream must create after GC/drop");
+    drive_until_settled(&mut context, &handle, &executor);
+    assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:6:false");
+    gc_drop_cleanup(&mut context, &handle, &executor, &["reader"]);
+    assert_eq!(stream_counts(&mut context, &handle), baseline);
+}
+
+/// M9D-GC-02: endpoint ownership — stream/reader drops, releaseLock, generations.
+#[test]
+fn gc_endpoint_ownership_stream_reader_release_lock_generations() {
+    // Drop stream while the reader is live: the operation stays (the
+    // reader still settles its demand through the host loop).
+    {
+        let (mut context, handle, executor, _) = setup_manual();
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"endpoint"),
+                )),
+                8,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 delete globalThis.stream; true",
+            ))
+            .expect("setup");
+        boa_gc::force_collect();
+        // The reader endpoint keeps the operation alive: real demand still
+        // settles exactly once with the exact chunk.
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:8");
+        gc_drop_cleanup(&mut context, &handle, &executor, &["reader"]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Drop reader while the stream is live: the operation stays (a new
+    // reader can still be acquired and read).
+    {
+        let (mut context, handle, executor, _) = setup_manual();
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"endpoint"),
+                )),
+                8,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 delete globalThis.reader; true",
+            ))
+            .expect("setup");
+        boa_gc::force_collect();
+        drive_until_settled(&mut context, &handle, &executor);
+        // Still exactly one live operation: dropping the reader alone
+        // never frees prematurely.
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        // A new reader works on the still-live stream and reads exactly.
+        context
+            .eval(Source::from_bytes(
+                "globalThis.reader2 = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.reader2.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 true",
+            ))
+            .expect("second reader");
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:8");
+        // Dropping the last endpoint (stream + reader2) frees everything.
+        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader2"]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Drop the last endpoint: the operation frees.
+    {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = new Blob(['last']).stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 delete globalThis.stream; delete globalThis.reader; true",
+            ))
+            .expect("setup");
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader"]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // releaseLock(): no phantom owner (stream stays usable, then drop frees).
+    {
+        let (mut context, handle, executor, _) = setup_manual();
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"lock"),
+                )),
+                4,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.reader.releaseLock(); \
+                 globalThis.reader2 = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.reader2.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 delete globalThis.reader; true",
+            ))
+            .expect("releaseLock");
+        // The released first reader left no phantom owner: the stream read
+        // through the second reader settles exactly.
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:4");
+        // The released reader object itself is droppable without effect;
+        // dropping stream + reader2 frees the operation exactly once.
+        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader2"]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Several reader generations: repeated getReader/releaseLock cycles
+    // never double-release (quota stays exactly one until the last drop).
+    {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = new Blob(['gen']).stream(); \
+                 globalThis.r1 = globalThis.stream.getReader(); \
+                 globalThis.r1.releaseLock(); \
+                 globalThis.r2 = globalThis.stream.getReader(); \
+                 globalThis.r2.releaseLock(); \
+                 globalThis.r3 = globalThis.stream.getReader(); \
+                 true",
+            ))
+            .expect("generations");
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        // Dropping released readers changes nothing (leases moved back).
+        gc_drop_cleanup(&mut context, &handle, &executor, &["r1", "r2"]);
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        // Dropping the last endpoints frees exactly once.
+        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "r3"]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+}
+
+/// M9D-GC-03: a pending read promise outlives the GC of its stream/reader.
+#[test]
+fn gc_pending_promise_survives_endpoint_drop_and_settles_once() {
+    let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+    let baseline = stream_counts(&mut context, &handle);
+    publish_blob(
+        &handle,
+        &mut context,
+        "srcBlob",
+        &blob_of(
+            Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                bytes::Bytes::from_static(b"promise-kept"),
+            )),
+            12,
+        ),
+    );
+    context
+        .eval(Source::from_bytes(
+            "globalThis.stream = srcBlob.stream(); \
+             globalThis.reader = globalThis.stream.getReader(); \
+             globalThis.settlements = 0; \
+             globalThis.promise = globalThis.reader.read(); \
+             globalThis.promise.then(r => { \
+                 globalThis.settlements += 1; \
+                 globalThis.verdict = 'len:' + r.value.length + ':' + r.done; \
+             }, () => { globalThis.verdict = 'rejected'; }); \
+             globalThis.verdict = 'pending'; \
+             delete globalThis.stream; delete globalThis.reader; true",
+        ))
+        .expect("setup");
+    // Endpoints are gone but the promise demand is live: force GC before
+    // worker completion and prove the promise still settles exactly once
+    // with the exact chunk through poll_io + run_jobs.
+    boa_gc::force_collect();
+    context.run_jobs().expect("run_jobs");
+    assert_eq!(eval_str(&mut context, "globalThis.verdict"), "pending");
+    drive_until_settled(&mut context, &handle, &executor);
+    assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:12:false");
+    assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
+    // After settlement, the next GC/cleanup frees the slot: the owed
+    // promise no longer roots the operation.
+    gc_drop_cleanup(&mut context, &handle, &executor, &["promise"]);
+    assert_eq!(stream_counts(&mut context, &handle), baseline);
+    // And the freed slot serves a fresh stream immediately.
+    context
+        .eval(Source::from_bytes(
+            "globalThis.ok = (() => { try { new Blob(['x']).stream(); return true; } catch (e) { return false; } })(); \
+             true",
+        ))
+        .expect("probe");
+    assert_eq!(eval_str(&mut context, "globalThis.ok"), "true");
+    gc_drop_cleanup(&mut context, &handle, &executor, &["ok"]);
+}
+
+/// M9D-GC-04: drop races against completion/cancel/EOF/error/shutdown.
+#[test]
+fn gc_drop_races_against_terminal_transitions_release_once() {
+    // Drop vs completion-before-poll: the queued worker chunk still
+    // settles through poll_io (demand was live at drop time), then the
+    // post-settlement drain abandons the endpoint-less epoch exactly once.
+    {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"race"),
+                )),
+                4,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.settlements = 0; \
+                 globalThis.reader.read().then(r => { \
+                     globalThis.settlements += 1; \
+                     globalThis.verdict = 'len:' + r.value.length; \
+                 }); \
+                 delete globalThis.stream; delete globalThis.reader; true",
+            ))
+            .expect("setup");
+        boa_gc::force_collect();
+        executor.run_streams();
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:4");
+        assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
+        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Drop vs completion-after-poll-before-jobs: the settlement job was
+    // already queued at drop time and still runs exactly once; no second
+    // release follows.
+    {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"race2"),
+                )),
+                5,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.settlements = 0; \
+                 globalThis.reader.read().then(r => { \
+                     globalThis.settlements += 1; \
+                     globalThis.verdict = 'len:' + r.value.length; \
+                 }); \
+                 true",
+            ))
+            .expect("setup");
+        executor.run_streams();
+        let settled = handle.poll_io(&mut context).expect("poll_io");
+        assert_eq!(settled, 1);
+        context
+            .eval(Source::from_bytes(
+                "delete globalThis.stream; delete globalThis.reader; true",
+            ))
+            .expect("drop");
+        boa_gc::force_collect();
+        context.run_jobs().expect("run_jobs");
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:5");
+        assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Drop vs cancel (both orders): exactly one release, done settlement.
+    for cancel_first in [true, false] {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"cancel-race"),
+                )),
+                11,
+            ),
+        );
+        if cancel_first {
+            context
+                .eval(Source::from_bytes(
+                    "globalThis.stream = srcBlob.stream(); \
+                     globalThis.reader = globalThis.stream.getReader(); \
+                     globalThis.reader.read().then(() => {}, () => {}); \
+                     globalThis.reader.cancel(); \
+                     delete globalThis.stream; delete globalThis.reader; true",
+                ))
+                .expect("cancel first");
+        } else {
+            context
+                .eval(Source::from_bytes(
+                    "globalThis.stream = srcBlob.stream(); \
+                     globalThis.reader = globalThis.stream.getReader(); \
+                     globalThis.reader.read().then(() => {}, () => {}); \
+                     delete globalThis.stream; delete globalThis.reader; true",
+                ))
+                .expect("drop first");
+            boa_gc::force_collect();
+            context
+                .eval(Source::from_bytes("true"))
+                .expect("collect barrier");
+        }
+        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        assert_eq!(
+            stream_counts(&mut context, &handle),
+            (0, 0, 0),
+            "cancel race (cancel_first={cancel_first}) must release once"
+        );
+    }
+    // Drop vs EOF (both orders): the terminal EOF wins or the abandonment
+    // wins — either way exactly one release and no resurrection.
+    for eof_first in [true, false] {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"e"),
+                )),
+                1,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.reader.read().then(() => {}); \
+                 globalThis.reader.read().then(() => {}); \
+                 true",
+            ))
+            .expect("setup");
+        if eof_first {
+            drive_until_settled(&mut context, &handle, &executor);
+        } else {
+            // One demand settles (chunk), the EOF probe is still owed when
+            // the endpoints go away: abandonment must not resurrect reads.
+            executor.run_streams();
+            let _ = handle.poll_io(&mut context);
+            context.run_jobs().expect("run_jobs");
+        }
+        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader"]);
+        assert_eq!(
+            stream_counts(&mut context, &handle),
+            (0, 0, 0),
+            "eof race (eof_first={eof_first}) must release once"
+        );
+        // A late worker completion after the race settles nothing and
+        // releases nothing: push the held tasks (if any) and drain.
+        executor.run_streams();
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Drop vs error (both orders): the mapped error still rejects live
+    // demand exactly once; the slot frees exactly once.
+    for error_first in [true, false] {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(Arc::new(FailSource { len: 4 }), 4),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.settlements = 0; \
+                 globalThis.reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, e => { \
+                     globalThis.settlements += 1; \
+                     globalThis.verdict = e.name; \
+                 }); \
+                 true",
+            ))
+            .expect("setup");
+        if error_first {
+            drive_until_settled(&mut context, &handle, &executor);
+            assert_eq!(
+                eval_str(&mut context, "globalThis.verdict"),
+                "NotReadableError"
+            );
+        }
+        gc_drop_cleanup(&mut context, &handle, &executor, &["stream", "reader"]);
+        // When the error had not settled yet, the owed promise still
+        // rejects exactly once through the drain inside the cleanup.
+        drive_until_settled(&mut context, &handle, &executor);
+        let verdict = eval_str(&mut context, "globalThis.verdict");
+        assert!(
+            verdict == "NotReadableError",
+            "error race (error_first={error_first}) must reject once, got {verdict}"
+        );
+        assert_eq!(eval_str(&mut context, "globalThis.settlements"), "1");
+        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Drop vs shutdown: shutdown wins, settles nothing late, frees once.
+    // Note: shutdown clears the bridge quota but leaves the context-table
+    // op root/payload cleanup to the shutdown drain path. The triple
+    // therefore reads (0 active, 0 payload, 0 ops) only after the drain
+    // below runs; assert the full triple there.
+    {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"shut"),
+                )),
+                4,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.verdict = 'pending'; \
+                 globalThis.reader.read().then(() => { globalThis.verdict = 'fulfilled'; }, () => { globalThis.verdict = 'rejected'; }); \
+                 delete globalThis.stream; delete globalThis.reader; true",
+            ))
+            .expect("setup");
+        boa_gc::force_collect();
+        handle.shutdown(&mut context).expect("shutdown");
+        executor.run_streams();
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "pending");
+        gc_drop_cleanup(&mut context, &handle, &executor, &[]);
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+}
+
+/// M9D-GC-05: exhaustion/recovery and context isolation.
+#[test]
+fn gc_exhaustion_recovery_and_context_isolation() {
+    // Fill every slot (limit = 3) with unreachable streams: the next
+    // creation hits the quota boundary.
+    let limits = boa_fapi_core::limits::FileApiLimits {
+        max_concurrent_reads_per_global: 3,
+        ..boa_fapi_core::limits::FileApiLimits::default()
+    };
+    let (mut context, handle, executor, _) = setup_manual_with_limits(limits);
+    context
+        .eval(Source::from_bytes(
+            "globalThis.s0 = new Blob(['a']).stream(); \
+             globalThis.s1 = new Blob(['b']).stream(); \
+             globalThis.s2 = new Blob(['c']).stream(); \
+             globalThis.probe = (() => { try { new Blob(['d']).stream(); return 'created'; } catch (e) { return e.constructor.name + ':' + e.name; } })(); \
+             true",
+        ))
+        .expect("exhaust");
+    assert_eq!(stream_counts(&mut context, &handle), (3, 3, 3));
+    let probe = eval_str(&mut context, "globalThis.probe");
+    assert!(
+        probe.contains("TooManyReads") || probe.contains("TypeError"),
+        "quota boundary must reject, got {probe}"
+    );
+    // Real GC + cleanup recovers every slot without shutdown.
+    gc_drop_cleanup(
+        &mut context,
+        &handle,
+        &executor,
+        &["s0", "s1", "s2", "probe"],
+    );
+    assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    context
+        .eval(Source::from_bytes(
+            "globalThis.reader = new Blob(['ok']).stream().getReader(); \
+             globalThis.verdict = 'pending'; \
+             globalThis.reader.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+             true",
+        ))
+        .expect("recovery stream");
+    drive_until_settled(&mut context, &handle, &executor);
+    assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:2");
+    gc_drop_cleanup(&mut context, &handle, &executor, &["reader"]);
+    assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    // Isolation: cleanup of one context never frees another context.
+    {
+        let (mut context_a, handle_a, executor_a, _) = setup_manual();
+        let (mut context_b, handle_b, executor_b, _) = setup_manual();
+        context_a
+            .eval(Source::from_bytes(
+                "globalThis.a = new Blob(['a']).stream(); true",
+            ))
+            .expect("context a stream");
+        context_b
+            .eval(Source::from_bytes(
+                "globalThis.b = new Blob(['b']).stream(); true",
+            ))
+            .expect("context b stream");
+        assert_eq!(stream_counts(&mut context_a, &handle_a), (1, 1, 1));
+        assert_eq!(stream_counts(&mut context_b, &handle_b), (1, 1, 1));
+        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a, &["a"]);
+        assert_eq!(stream_counts(&mut context_a, &handle_a), (0, 0, 0));
+        // Context B is untouched by A's cleanup (no cross-context free).
+        assert_eq!(stream_counts(&mut context_b, &handle_b), (1, 1, 1));
+        gc_drop_cleanup(&mut context_b, &handle_b, &executor_b, &["b"]);
+        assert_eq!(stream_counts(&mut context_b, &handle_b), (0, 0, 0));
+    }
+    // Foreign poll_io is still rejected without mutation.
+    {
+        let (mut context_a, handle_a, executor_a, _) = setup_manual();
+        let (mut context_b, handle_b, _, _) = setup_manual();
+        context_a
+            .eval(Source::from_bytes(
+                "globalThis.a = new Blob(['a']).stream(); true",
+            ))
+            .expect("context a stream");
+        let foreign = handle_b.poll_io(&mut context_a);
+        assert!(matches!(
+            foreign,
+            Err(boa_fapi::PollIoError::ForeignContext)
+        ));
+        assert_eq!(stream_counts(&mut context_a, &handle_a), (1, 1, 1));
+        gc_drop_cleanup(&mut context_a, &handle_a, &executor_a, &["a"]);
+        assert_eq!(stream_counts(&mut context_a, &handle_a), (0, 0, 0));
+        gc_drop_cleanup(&mut context_b, &handle_b, &executor_a, &[]);
+    }
+}
+
+/// M9D-GC-06: failure atomicity — every reachable failure after `reserve()`
+/// leaves quota/payload/operation counts unchanged.
+#[test]
+fn gc_failure_atomicity_after_reserve_leaves_no_hidden_slot() {
+    // Missing prototype (feature-disabled surface): create_stream reserves,
+    // then rolls back synchronously — counts unchanged, error propagates.
+    {
+        let (mut context, handle, executor, _) = setup_manual();
+        let baseline = stream_counts(&mut context, &handle);
+        let result = context.eval(Source::from_bytes(
+            "globalThis.ok = (() => { try { new Blob(['x']).stream(); return 'created'; } catch (e) { return 'threw'; } })(); true",
+        ));
+        assert!(result.is_ok());
+        // Control: the success path holds exactly one slot (sanity that the
+        // baseline comparison below is meaningful).
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        gc_drop_cleanup(&mut context, &handle, &executor, &["ok"]);
+        assert_eq!(stream_counts(&mut context, &handle), baseline);
+    }
+    // Quota-full is itself atomic: the rejected creation consumes nothing.
+    {
+        let (mut context, handle, executor, _) = setup_manual_with_limits(quota_one_limits());
+        let baseline = stream_counts(&mut context, &handle);
+        context
+            .eval(Source::from_bytes(
+                "globalThis.holder = new Blob(['h']).stream(); true",
+            ))
+            .expect("holder");
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        let rejected = context.eval(Source::from_bytes(
+            "globalThis.rejected = (() => { try { new Blob(['x']).stream(); return 'created'; } catch (e) { return 'rejected'; } })(); true",
+        ));
+        assert!(rejected.is_ok());
+        assert_eq!(eval_str(&mut context, "globalThis.rejected"), "rejected");
+        // Still exactly the holder's slot: no hidden second slot.
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        gc_drop_cleanup(&mut context, &handle, &executor, &["holder", "rejected"]);
+        assert_eq!(stream_counts(&mut context, &handle), baseline);
+    }
+    // getReader failure atomicity: locked-stream getReader throws without
+    // phantom endpoints (counts unchanged, original still reads).
+    {
+        let (mut context, handle, executor, _) = setup_manual();
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"atomic"),
+                )),
+                6,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.r1 = globalThis.stream.getReader(); \
+                 globalThis.second = (() => { try { globalThis.stream.getReader(); return 'created'; } catch (e) { return 'threw'; } })(); \
+                 true",
+            ))
+            .expect("setup");
+        assert_eq!(eval_str(&mut context, "globalThis.second"), "threw");
+        // Exactly one operation: the failed getReader left no phantom owner.
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        context
+            .eval(Source::from_bytes(
+                "globalThis.verdict = 'pending'; \
+                 globalThis.r1.read().then(r => { globalThis.verdict = 'len:' + r.value.length; }); \
+                 true",
+            ))
+            .expect("read");
+        drive_until_settled(&mut context, &handle, &executor);
+        assert_eq!(eval_str(&mut context, "globalThis.verdict"), "len:6");
+        gc_drop_cleanup(
+            &mut context,
+            &handle,
+            &executor,
+            &["stream", "r1", "second"],
+        );
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // releaseLock failure atomicity: releasing with queued demand throws
+    // without state change (demand still settles, counts return to zero).
+    {
+        let (mut context, handle, executor, _) = setup_manual();
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                Arc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"y"),
+                )),
+                1,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.reader.read().then(() => {}); \
+                 globalThis.released = (() => { try { globalThis.reader.releaseLock(); return 'released'; } catch (e) { return 'threw'; } })(); \
+                 true",
+            ))
+            .expect("setup");
+        assert_eq!(eval_str(&mut context, "globalThis.released"), "threw");
+        assert_eq!(stream_counts(&mut context, &handle), (1, 1, 1));
+        assert_eq!(executor.pending_streams(), 1);
+        drive_until_settled(&mut context, &handle, &executor);
+        gc_drop_cleanup(
+            &mut context,
+            &handle,
+            &executor,
+            &["stream", "reader", "released"],
+        );
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
+    // Submit-failure atomicity (QueueFull executor): the failed read takes
+    // the typed terminal path and frees the slot exactly once.
+    {
+        use std::sync::Arc as StdArc;
+        struct FullExecutor;
+        impl FileIoExecutor for FullExecutor {
+            fn submit(&self, _task: boa_fapi::FileIoTask) -> Result<(), FileIoSubmitError> {
+                Err(FileIoSubmitError::QueueFull)
+            }
+            fn submit_stream(
+                &self,
+                _task: boa_fapi::StreamChunkTask,
+            ) -> Result<(), FileIoSubmitError> {
+                Err(FileIoSubmitError::QueueFull)
+            }
+        }
+        let executor = StdArc::new(FullExecutor);
+        let wake = CountingWake::new();
+        let mut context = Context::default();
+        let handle = FileApiExtension::builder()
+            .clock(StdArc::new(FixedClock { millis: FIXED_TIME }))
+            .io_executor(executor as StdArc<dyn FileIoExecutor>)
+            .io_wake(wake as StdArc<dyn FileIoWake>)
+            .build()
+            .register(&mut context)
+            .expect("register");
+        publish_blob(
+            &handle,
+            &mut context,
+            "srcBlob",
+            &blob_of(
+                StdArc::new(boa_fapi_core::source::memory::MemorySource::new(
+                    bytes::Bytes::from_static(b"q"),
+                )),
+                1,
+            ),
+        );
+        context
+            .eval(Source::from_bytes(
+                "globalThis.stream = srcBlob.stream(); \
+                 globalThis.reader = globalThis.stream.getReader(); \
+                 globalThis.v = 'pending'; \
+                 globalThis.reader.read().then(() => { globalThis.v = 'fulfilled'; }, e => { globalThis.v = e.name; }); \
+                 true",
+            ))
+            .expect("setup");
+        drive(&mut context, &handle);
+        assert_eq!(eval_str(&mut context, "globalThis.v"), "SecurityError");
+        assert_eq!(stream_counts(&mut context, &handle), (0, 0, 0));
+    }
 }

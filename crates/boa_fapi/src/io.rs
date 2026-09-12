@@ -855,6 +855,14 @@ struct BridgeState {
     /// as stale by `take_completions`.
     order: VecDeque<u64>,
     tokens: HashMap<u64, CancellationToken>,
+    /// Live demand probe for stream operations (M9-D-R2): `true` while the
+    /// Boa thread holds at least one unsettled `(operation, seq)` resolver
+    /// entry for the id. Set at `read()` submit time, cleared when the last
+    /// demand settles or the operation terminates. Lets `poll_io` tell
+    /// "endpoints gone but promise still owed a chunk" (must settle first)
+    /// from "endpoints gone and nothing owed" (may abandon now) without
+    /// touching Boa state from a finalizer.
+    stream_live_demand: HashMap<u64, bool>,
     /// FileReader chunk completions keyed by operation id. One reader
     /// operation holds exactly one reserved slot (`tokens`/`order` shared
     /// with promise reads); each chunk pushes one entry here, and the Boa
@@ -1005,24 +1013,39 @@ impl IoBridge {
     /// Removes the operation from the submission order as well, so a stale
     /// late completion can never match a future operation. Any queued
     /// reader/stream chunks for the operation are dropped with it.
-    pub(crate) fn unreserve(&self, operation_id: FileIoOperationId) {
+    ///
+    /// Conditional-idempotent (M9-D-R2): returns `true` only when the
+    /// operation held a live reservation (a token entry existed). A repeat
+    /// release of an unknown id returns `false` and never decrements
+    /// another operation's `active` slot: `active` moves only when a
+    /// reservation actually existed, so double-release cannot leak into a
+    /// neighbour's quota.
+    pub(crate) fn unreserve(&self, operation_id: FileIoOperationId) -> bool {
         if let Ok(mut state) = self.state.lock() {
-            state.tokens.remove(&operation_id.0);
+            if state.tokens.remove(&operation_id.0).is_none() {
+                // Unknown or already released: strict no-op. Queued chunks
+                // are already gone with the first release (or never
+                // existed), so nothing else is touched.
+                return false;
+            }
             state.completed.remove(&operation_id.0);
             state.completions.remove(&operation_id.0);
             state.reader_completions.remove(&operation_id.0);
             state.stream_completions.remove(&operation_id.0);
+            state.stream_live_demand.remove(&operation_id.0);
             state.chunk_reservations.remove(&operation_id.0);
             if let Some(position) = state.order.iter().position(|id| *id == operation_id.0) {
                 state.order.remove(position);
             }
             state.active = state.active.saturating_sub(1);
+            return true;
         }
+        false
     }
 
     /// Releases one slot after a polled settlement (exactly once).
-    pub(crate) fn release(&self, operation_id: FileIoOperationId) {
-        self.unreserve(operation_id);
+    pub(crate) fn release(&self, operation_id: FileIoOperationId) -> bool {
+        self.unreserve(operation_id)
     }
 
     /// Builds the worker task for one FileReader chunk.
@@ -1052,6 +1075,34 @@ impl IoBridge {
             cancel: token,
             bridge: Arc::clone(self),
         }
+    }
+
+    /// Marks whether `operation_id` currently owns live unsettled read
+    /// demand (M9-D-R2).
+    ///
+    /// Boa thread only, called at stream `read()` submit time (`true`) and
+    /// when the last demand of the operation settles or terminates
+    /// (`false`). Unknown ids are ignored: the entry is advisory for the
+    /// abandoned/drop arbitration in `poll_io`, never quota itself.
+    pub(crate) fn set_stream_live_demand(&self, operation_id: FileIoOperationId, live: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.tokens.contains_key(&operation_id.0) {
+                return;
+            }
+            if live {
+                state.stream_live_demand.insert(operation_id.0, true);
+            } else {
+                state.stream_live_demand.remove(&operation_id.0);
+            }
+        }
+    }
+
+    /// Returns `true` while `operation_id` owns live unsettled read demand.
+    pub(crate) fn has_stream_live_demand(&self, operation_id: FileIoOperationId) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .is_some_and(|state| state.stream_live_demand.contains_key(&operation_id.0))
     }
 
     /// Returns the cancellation token of a live reservation, if present.
@@ -1445,7 +1496,6 @@ impl IoBridge {
     }
 
     /// Returns the number of reserved active operations (diagnostics).
-    #[allow(dead_code)]
     pub(crate) fn active_count(&self) -> usize {
         self.state.lock().map(|state| state.active).unwrap_or(0)
     }
@@ -1464,6 +1514,7 @@ impl IoBridge {
             state.completed.clear();
             state.reader_completions.clear();
             state.stream_completions.clear();
+            state.stream_live_demand.clear();
             state.chunk_reservations.clear();
             state.order.clear();
             state.active = 0;
@@ -1687,7 +1738,15 @@ mod tests {
         };
         // This models the EOF transition: the operation is terminal and its
         // slot is free before any late worker completion can be accepted.
-        bridge.unreserve(eof_operation);
+        assert!(bridge.unreserve(eof_operation));
+        // Conditional-idempotent release (M9-D-R2 §3.3): a repeat release
+        // of the same unknown id is a strict no-op and must not decrement
+        // another operation's slot.
+        assert!(!bridge.unreserve(eof_operation));
+        assert!(
+            matches!(bridge.state.lock().map(|state| state.active), Ok(0)),
+            "repeat release must not touch quota"
+        );
         let replacement = bridge.reserve();
         assert!(replacement.is_ok(), "replacement reservation must succeed");
         let Ok((live_operation, _)) = replacement else {
@@ -1709,6 +1768,39 @@ mod tests {
             matches!(bridge.state.lock().map(|state| state.active), Ok(1)),
             "late completion must not release the replacement stream slot"
         );
-        bridge.unreserve(live_operation);
+        // A foreign release (unknown id) is a strict no-op as well: the
+        // live slot survives it.
+        assert!(!bridge.unreserve(FileIoOperationId::from_raw(u64::MAX - 7)));
+        assert!(
+            matches!(bridge.state.lock().map(|state| state.active), Ok(1)),
+            "foreign release must not touch the live slot"
+        );
+        assert!(bridge.unreserve(live_operation));
+    }
+
+    #[test]
+    fn stream_live_demand_probe_tracks_unsettled_reads() {
+        let bridge = IoBridge::new(
+            FileApiContextId(9),
+            2,
+            Arc::new(RejectingExecutor),
+            Arc::new(NoopWake),
+            crate::lifecycle::ShutdownFlag::new(),
+        );
+        let Ok((operation, _)) = bridge.reserve() else {
+            return;
+        };
+        // Unknown-id probes are ignored (advisory only, never quota).
+        bridge.set_stream_live_demand(FileIoOperationId::from_raw(u64::MAX - 3), true);
+        assert!(!bridge.has_stream_live_demand(FileIoOperationId::from_raw(u64::MAX - 3)));
+        assert!(!bridge.has_stream_live_demand(operation));
+        bridge.set_stream_live_demand(operation, true);
+        assert!(bridge.has_stream_live_demand(operation));
+        bridge.set_stream_live_demand(operation, false);
+        assert!(!bridge.has_stream_live_demand(operation));
+        // Release clears the probe with the reservation.
+        bridge.set_stream_live_demand(operation, true);
+        assert!(bridge.unreserve(operation));
+        assert!(!bridge.has_stream_live_demand(operation));
     }
 }

@@ -308,12 +308,117 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) io_poll_budget: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
     /// Opaque identity of this registration's I/O context.
     pub(crate) context_id: crate::io::FileApiContextId,
+    /// Context-pinned sink for bounded stream endpoint-drop cleanup
+    /// records (M9-D-R2).
+    ///
+    /// Native `Drop` impls (`StreamNative`/`ReaderNative`) cannot touch
+    /// `Context`, so they publish their `(context, operation, generation)`
+    /// triple here through the `Arc`-pinned specs. The queue is bounded
+    /// (see [`push_stream_cleanup_record`]) and drained only by `poll_io`
+    /// on the owning Boa thread, which validates every record against the
+    /// live tables before running the single abandoned transition. Holds
+    /// only opaque ids — no bytes, paths, or JS values. Shared (not
+    /// duplicated) between specs and handle so drops observe the same
+    /// queue `poll_io` drains.
+    #[cfg(feature = "streams-shim")]
+    pub(crate) stream_cleanups:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64, u64)>>>,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
     /// Opaque identity stored at registration time: a repeat `register`
     /// with the same identity is idempotent, a different identity is
     /// rejected without mutation.
     pub(crate) identity: RegistrationIdentity,
+}
+
+/// Maximum queued stream cleanup records per context (M9-D-R2).
+///
+/// Bounded so a burst of endpoint drops can never grow memory without a
+/// bound: one record per live operation is sufficient (duplicates collapse
+/// at drain time into a single strict no-op), and the cap is generous
+/// against the quota limit itself.
+#[cfg(feature = "streams-shim")]
+pub(crate) const MAX_STREAM_CLEANUP_RECORDS: usize = 1024;
+
+/// Publishes one bounded native cleanup record for a deregistered stream
+/// endpoint (M9-D-R2 finalizer boundary).
+///
+/// Drop-safe: takes only opaque ids, never touches `Context`, never runs
+/// JS, never blocks on I/O. The record is routed through the
+/// context-pinned [`RegisteredSpecs::stream_cleanups`] queue when the
+/// registry still knows the context; otherwise it falls back to a
+/// process-wide pending queue keyed by context id that `poll_io` consults
+/// for the same context. Overflow drops the newest record (fail-closed:
+/// the operation stays reserved until an explicit terminal path or
+/// shutdown releases it — never a silent double free).
+#[cfg(feature = "streams-shim")]
+pub(crate) fn push_stream_cleanup_record(context: u64, operation: u64, generation: u64) {
+    // Fast path: route through the live registry entry when present.
+    let routed = stream_cleanup_registrywith(|registry| {
+        if let Some(queue) = registry.get(&context)
+            && let Ok(mut queue) = queue.lock()
+        {
+            if queue.len() < MAX_STREAM_CLEANUP_RECORDS {
+                queue.push_back((context, operation, generation));
+            }
+            // Bounded overflow: drop the newest (fail-closed, see above).
+            return true;
+        }
+        false
+    });
+    if !routed {
+        // Registry entry gone (context destroyed or never registered):
+        // keep the record in the orphan queue so a still-live `poll_io`
+        // for the same context id can observe it; shutdown drops orphans.
+        if let Ok(mut orphans) = stream_cleanup_orphans().lock()
+            && orphans.len() < MAX_STREAM_CLEANUP_RECORDS
+        {
+            orphans.push_back((context, operation, generation));
+        }
+    }
+}
+
+/// Process-wide registry of per-context cleanup queues (M9-D-R2).
+///
+/// Maps owning context id → the `Arc`-pinned queue stored in that
+/// context's [`RegisteredSpecs`]. Entries are added at `register()` and
+/// removed at shutdown; the orphan queue below holds records whose
+/// context entry is gone.
+#[cfg(feature = "streams-shim")]
+fn stream_cleanup_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<u64, StreamCleanupQueue>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, StreamCleanupQueue>>,
+    > = OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Orphan cleanup records whose context entry is gone (see above).
+#[cfg(feature = "streams-shim")]
+fn stream_cleanup_orphans() -> &'static std::sync::Mutex<std::collections::VecDeque<(u64, u64, u64)>>
+{
+    use std::sync::OnceLock;
+    static ORPHANS: OnceLock<std::sync::Mutex<std::collections::VecDeque<(u64, u64, u64)>>> =
+        OnceLock::new();
+    ORPHANS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+#[cfg(feature = "streams-shim")]
+type StreamCleanupQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64, u64)>>>;
+
+#[cfg(feature = "streams-shim")]
+fn stream_cleanup_registrywith<R>(
+    f: impl FnOnce(&std::collections::HashMap<u64, StreamCleanupQueue>) -> R,
+) -> R {
+    // Lock poisoning must not break the Drop path: fall back to the
+    // orphan queue instead of panicking inside a finalizer.
+    let empty = std::collections::HashMap::new();
+    match stream_cleanup_registry().lock() {
+        Ok(registry) => f(&registry),
+        Err(_) => f(&empty),
+    }
 }
 
 impl RegisteredSpecs {
@@ -500,6 +605,36 @@ impl RegisteredSpecs {
         if let Ok(mut map) = self.stream_payloads.lock() {
             map.remove(&operation);
         }
+    }
+
+    /// Takes every queued stream endpoint-drop cleanup record for this
+    /// context (M9-D-R2).
+    ///
+    /// Drains the context-pinned queue plus any orphan records routed to
+    /// this context id. Called only from `poll_io` on the owning Boa
+    /// thread; every record is validated by the caller before acting.
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn take_stream_cleanup_records(&self) -> Vec<(u64, u64, u64)> {
+        let mut out = Vec::new();
+        if let Ok(mut queue) = self.stream_cleanups.lock() {
+            while let Some(record) = queue.pop_front() {
+                out.push(record);
+            }
+        }
+        if let Ok(mut orphans) = stream_cleanup_orphans().lock() {
+            let context = self.context_id.get();
+            let mut index = 0_usize;
+            while index < orphans.len() {
+                if orphans[index].0 == context
+                    && let Some(record) = orphans.remove(index)
+                {
+                    out.push(record);
+                    continue;
+                }
+                index = index.saturating_add(1);
+            }
+        }
+        out
     }
 
     /// Rebuilds the owning handle from a specs snapshot (test helper).
@@ -980,6 +1115,26 @@ impl FileApiExtension {
             let bridge = Arc::clone(&bridge);
             shutdown.track(move || bridge.shutdown());
         }
+        #[cfg(feature = "streams-shim")]
+        let stream_cleanups: StreamCleanupQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        #[cfg(feature = "streams-shim")]
+        {
+            let queue = Arc::clone(&stream_cleanups);
+            shutdown.track(move || {
+                // Shutdown drops pending cleanup records: every live
+                // operation releases through the shutdown path instead.
+                if let Ok(mut queue) = queue.lock() {
+                    queue.clear();
+                }
+                if let Ok(mut orphans) = stream_cleanup_orphans().lock() {
+                    orphans.retain(|(context, _, _)| *context != context_id.get());
+                }
+                if let Ok(mut registry) = stream_cleanup_registry().lock() {
+                    registry.remove(&context_id.get());
+                }
+            });
+        }
         let specs = RegisteredSpecs {
             blob: blob_spec,
             file: file_spec,
@@ -1005,6 +1160,8 @@ impl FileApiExtension {
             stream_payloads: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            #[cfg(feature = "streams-shim")]
+            stream_cleanups: Arc::clone(&stream_cleanups),
             #[cfg(feature = "dom-shim")]
             io_poll_budget: std::sync::Arc::new(std::sync::Mutex::new(None)),
             context_id,
@@ -1012,6 +1169,15 @@ impl FileApiExtension {
             identity: self.config.identity,
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
+        #[cfg(feature = "streams-shim")]
+        {
+            // Route native Drop records to this context's queue. The
+            // registry holds only the queue Arc (no Context/JS), so drops
+            // on any thread publish without touching Boa state.
+            if let Ok(mut registry) = stream_cleanup_registry().lock() {
+                registry.insert(context_id.get(), Arc::clone(&stream_cleanups));
+            }
+        }
 
         Ok(FileApiHandle {
             specs: specs.clone(),
@@ -1639,6 +1805,17 @@ impl FileApiHandle {
         // shared queue is preserved per operation kind) and each becomes at
         // most one settlement Boa job; a stale completion (cancel/error/
         // shutdown) settles nothing.
+        //
+        // M9-D-R2 abandoned/drop arbitration runs before stream chunks:
+        // validated endpoint-drop cleanup records transition operations
+        // whose last JS endpoint went away (no live demand) through the
+        // single abandoned terminal path. Live demand always settles
+        // first: the post-settlement drain re-arms abandonment when the
+        // epoch is still live.
+        #[cfg(feature = "streams-shim")]
+        {
+            let _ = crate::streams::drain_stream_cleanups(&stored, context);
+        }
         #[cfg(feature = "dom-shim")]
         let budget = stored.io_poll_budget();
         let reader_completions = bridge.take_reader_completions();
@@ -1683,15 +1860,22 @@ impl FileApiHandle {
             bridge.wake_host();
         }
         // M9-D stream chunks drain next, in submission order per stream.
-        // Shutdown drops the late chunk and releases its quota exactly
-        // once; a stale completion (unknown operation/generation) settles
-        // nothing inside `settle_stream_completion`.
+        // Shutdown drops the late chunk, releases its quota exactly once
+        // AND removes the context-table op root/payload/resolvers, so the
+        // (active, payload, ops) triple returns to baseline without a
+        // second drain: late completions after shutdown are strict no-ops
+        // (unknown operation, no JS, no telemetry, no second release).
+        // Stale completions (unknown operation/generation) settle nothing
+        // inside `settle_stream_completion`. A second abandoned drain runs
+        // after chunk settlement: operations whose last demand just
+        // settled while endpoints were already gone abandon now, without
+        // waiting for another host-loop turn.
         #[cfg(feature = "streams-shim")]
         {
             let stream_completions = bridge.take_stream_completions();
             for completion in stream_completions {
                 if self.is_shutdown() || bridge.is_shutdown() {
-                    bridge.unreserve(completion.operation_id());
+                    let _ = bridge.unreserve(completion.operation_id());
                     stored.drop_stream_payload(completion.operation_id().get());
                     crate::streams::drop_pending_for_shutdown(
                         context,
@@ -1704,14 +1888,7 @@ impl FileApiHandle {
                         .unwrap_or(0),
                 );
             }
-        }
-        #[cfg(not(feature = "streams-shim"))]
-        {
-            // Without the shim no stream task can exist; any queued entry
-            // would be foreign — drain defensively without settling.
-            for completion in bridge.take_stream_completions() {
-                bridge.unreserve(completion.operation_id());
-            }
+            let _ = crate::streams::drain_stream_cleanups(&stored, context);
         }
         let completions = bridge.take_completions();
         for completion in completions {
@@ -1760,6 +1937,54 @@ impl FileApiHandle {
     /// host loop uses it together with its own quiescence check.
     pub fn has_pending_io(&self) -> bool {
         self.specs.io.has_pending()
+    }
+
+    /// Returns the number of live I/O quota slots of this context.
+    ///
+    /// Count only — no operation, payload or token is revealed. Intended
+    /// for host diagnostics and tests (M9-D-R2 quota/payload/pending
+    /// baselines); it cannot insert, resolve or mutate.
+    pub fn io_active_count(&self) -> usize {
+        self.specs.io.active_count()
+    }
+
+    /// Returns the number of stored stream payloads of this context.
+    ///
+    /// Count only — no payload is revealed. Intended for host diagnostics
+    /// and tests (M9-D-R2 quota/payload/pending baselines).
+    #[cfg(feature = "streams-shim")]
+    pub fn stream_payload_count(&self) -> usize {
+        self.specs
+            .stream_payloads
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
+    /// Returns the number of live stream operations of this context.
+    ///
+    /// Count only — resolved through the owning `Context` tables, hence
+    /// the `&mut Context` borrow. Intended for host diagnostics and tests
+    /// (M9-D-R2 quota/payload/pending baselines).
+    #[cfg(feature = "streams-shim")]
+    pub fn stream_operation_count(&self, context: &mut Context) -> usize {
+        crate::streams::live_stream_operation_count(context)
+    }
+
+    /// Test-only explicit endpoint-drop model (M9-D-R2).
+    ///
+    /// Runs the production `deregister_*` arbitration for every still-live
+    /// stream operation of `context` (same counters, same terminal/demand
+    /// checks, same bounded record as the GC finalizer). Integration tests
+    /// always run the supported `boa_gc::force_collect()` first and call
+    /// this only to model "the last JS endpoint becomes unreachable" for
+    /// objects the engine keeps alive through `Context` roots; `poll_io`
+    /// remains the only transition site.
+    #[doc(hidden)]
+    #[allow(missing_docs)]
+    #[cfg(feature = "streams-shim")]
+    pub fn __test_drop_live_stream_endpoints(&self, context: &Context) {
+        crate::streams::__test_drop_live_stream_endpoints(context);
     }
 
     /// Creates and stores a Blob URL for a brand-validated `Blob`/`File`.
