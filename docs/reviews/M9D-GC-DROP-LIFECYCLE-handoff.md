@@ -285,8 +285,10 @@ cargo hack check --feature-powerset --depth 2
 git diff --check
 ```
 
-SHA на момент handoff: `3a7dcee4dcd88161adfe66c08fb1f4804822046f`
-(`task/m9d-gc-drop-lifecycle`, в ногу с origin; рабочих изменений поверх
-нет, кроме неотслеживаемых `tasks/*.md`, не входящих в заказ).
+SHA на момент handoff (все — ветка `task/m9d-gc-drop-lifecycle`, в ногу с
+origin; код без изменений с `1a1cd2a`): триаж CI 34714298795 добавлен в
+`3a7dcee`, sync SHA-строки — в `0ceb520`. Точный HEAD сверьте командой
+`git rev-parse HEAD` (поверх только doc-only правки этого файла).
+Неотслеживаемые `tasks/*.md` в заказ не входят и не коммитятся.
 M9-E-R1 в этой ветке не начинать. Дождаться внешнего CI, затем
 остановиться для отдельной приёмки.
