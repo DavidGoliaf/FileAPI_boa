@@ -1086,7 +1086,7 @@ backpressure за пределами terminal EOF не меняются. Нов�
 cancel-recovery); новые тесты `text_tail_eof_terminates_state_and_frees_quota`
 и `eof_late_completion_is_strict_noop_without_second_telemetry`.
 
-## ADR-0046 (M9-D-R2): GC/drop lifecycle для Streams I/O
+## ADR-0046 (M9-D-R3): GC/drop lifecycle для Streams I/O
 
 Контекст: приёмка M9A–M9E показала оставшуюся ветку M9-D §3: созданный,
 но брошенный stream (последний доступный JS endpoint недостижим, `read`/
@@ -1124,36 +1124,25 @@ cleanup boundary + exactly-once arbitration, без `unsafe` и без новы�
    `Rc`, не равные JS ownership.
 2. Finalizer-to-Boa-thread cleanup boundary (§3.2 буквально): GC
    finalizer не мутирует `Context`, не исполняет JS, не делает I/O/worker
-   join и НЕ ЖДЁТ НИКАКОГО lock — только infallible publish одного
-   verbatim intent `(context, operation, is_reader)` (полные `u64`, без
-   packing) в unbounded очередь owning context
-   (`StreamDropIntentStack`: `Mutex<VecDeque>`, push — один append под
-   коротким mutex, poison-tolerant; без `RefCell`, без `unsafe`).
-   Переполнение структурно невозможно — очереди нет предела: при любом
-   легальном `max_concurrent_reads_per_global` (верхней границы API не
-   ставит, см. `limits.rs:75`) каждый опубликованный intent гарантированно
-   ждёт своего `poll_io` (P0-1: фиксированного кольца 4096 больше нет;
-   P0-2: packing-окна `(15, 32, 16)` бит больше нет — ids едут verbatim;
-   P1-3: weak-CAS по слотам больше нет — retry-цикл не нужен вовсе;
-   P1-4: requeue идёт через ту же infallible очередь). Глобального
-   registry/orphan-очереди нет:
-   маршрутизация — клоном очереди в native data. КРИТИЧНО (P1 rework):
-   claim покрывает только ПУБЛИКАЦИЮ — снятие флага стороны происходит
-   исключительно в `poll_io` (`apply_stream_drop_intent`) с retry через
-   requeue при занятом `RefCell`, так что contention откладывает, но
-   никогда не теряет снятие (прежний дизайн терял claim: `dropped=true`
-   до `try_borrow_mut()` + пропуск при занятости = вечный phantom
-   owner). Native data не хранит `Rc<RefCell>` вообще (только
-   identity-инты + клон очереди); brand gates резолвят shared из
-   context-таблиц. `poll_io` (Boa thread, единственное место transition)
-   дренит intents до и после stream chunks: сначала применяет снятия
-   сторон (retry), затем валидирует (живой op root — ids не reused, см.
-   `IoBridge::reserve`, — не terminal, ноль сторон, пустая очередь, не
-   in-flight; demand — demand-first с табличным/bridge views как
-   defense-in-depth) и только тогда выполняет single abandoned
-   transition; плюс sweep. Stale intents — strict no-op. Поколения
-   (generation) из intent убраны осознанно: op ids не reused, живой op
-   entry сам называет свою эпоху, replay счётчика не нужен.
+   join и не ждёт никакого lock. Он выполняет только
+   `AtomicBool::store(false)` в одном из двух per-operation сигналов
+   `StreamEndpointSignals` (`stream_alive`/`reader_alive`), разделяемых
+   native data и context-owned `StreamShared` через `Arc`. В finalizer нет
+   очереди, `Mutex`, `RefCell`, аллокации, packing, identity lookup,
+   CAS-цикла или `unsafe`; поэтому нет ни переполнения, ни ограничений на
+   ширину context/operation id, ни global registry/orphan-очереди.
+   Native data не хранит `Rc<RefCell>` вообще (только identity integer и
+   clone атомарных сигналов). `poll_io` (Boa thread, единственное место
+   transition) сначала обходит живые local `PendingStreamOps` и переносит
+   опущенные сигналы в plain side flags. Если `try_borrow_mut()` временно
+   занят, атомарный сигнал остаётся `false`, поэтому следующий `poll_io`
+   повторяет синхронизацию без requeue и без потери claim. Затем sweep
+   валидирует живой op root (ids не reused, см. `IoBridge::reserve`),
+   terminal state, ноль сторон, пустую очередь и отсутствие in-flight
+   работы; demand-first с table/bridge views остаётся defense-in-depth —
+   и только тогда выполняется single abandoned transition. `releaseLock()`
+   использует тот же reader signal до снятия reader-side флага; повторный
+   вызов видит `released` и не изменяет состояние.
 3. Exactly-once arbitration и conditional release: EOF, text-tail EOF,
    error, cancel, abandoned/drop и shutdown конкурируют за одну terminal
    ownership transition (флаги `terminal`/`released` в op entry + lease).

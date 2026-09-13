@@ -1,4 +1,4 @@
-# M9-D-R2 handoff — GC/drop lifecycle для Streams I/O (M9D-GC-DROP-LIFECYCLE-REMEDIATION)
+# M9-D-R3 handoff — GC/drop lifecycle для Streams I/O (M9D-GC-DROP-LIFECYCLE-REMEDIATION)
 
 База: `task/m9e` commit `d94f80bc1f97b75cb5022d72d621c87964b48b1b`.
 Ветка: `task/m9d-gc-drop-lifecycle`.
@@ -32,18 +32,18 @@ new Blob(["second"]).stream(); // было ошибочно quota-blocked
 - Стороны вместо счётчиков: `StreamShared::stream_registered` /
   `reader_registered` (plain `bool`) + lease `StreamLease { context,
   operation, generation, terminal, released }` (только opaque ids).
-  Publish-claim живёт в native data (`StreamNative::published` /
-  `ReaderNative::published: Cell<bool>`, последний shared с
-  `releaseLock()` через `take_lease`): ровно один из путей (finalize,
-  drop, releaseLock) публикует lock-free intent своей стороны.
-  КРИТИЧНО: claim покрывает только ПУБЛИКАЦИЮ — снятие флага стороны
-  происходит исключительно в `poll_io` (`apply_stream_drop_intent` с
-  retry при занятом `RefCell`: intent requeue, никогда потеря).
+   Signal-claim живёт в native data (`StreamNative::signalled` /
+   `ReaderNative::signalled: Cell<bool>`, последний shared с
+   `releaseLock()` через `take_lease`): ровно один из путей (finalize,
+   drop, releaseLock) опускает atomic liveness signal своей стороны.
+   Снятие plain side flag происходит исключительно в `poll_io`: при
+   занятом `RefCell` опущенный atomic остаётся `false`, и следующий poll
+   повторяет синхронизацию без потери состояния.
   Повторный `releaseLock()` на том же объекте видит `released` первым
   и бросает `TypeError`, не трогая shared флаги. Drop одной стороны не
   завершает operation, пока зарегистрирована другая. Native data НЕ
-  хранит `Rc<RefCell<StreamShared>>` вообще (только identity-инты и
-  клон intent-стека): brand gates (`require_stream`/`require_reader`)
+   хранит `Rc<RefCell<StreamShared>>` вообще (только identity integer и
+   `Arc<StreamEndpointSignals>`): brand gates (`require_stream`/`require_reader`)
   резолвят shared из context-таблиц, финаčajзер не может застать
   занятый borrow. Pending read Promise — самостоятельный живой demand
   (advisory probe `IoBridge::stream_live_demand` + проверка
@@ -53,22 +53,19 @@ new Blob(["second"]).stream(); // было ошибочно quota-blocked
   перевооружает abandonment. `Rc::strong_count` не используется
   (технические `Rc` в таблицах).
 - Finalizer boundary (§3.2.1–3.2.4 буквально): GC finalizer не мутирует
-  `Context`, не исполняет JS, не делает I/O/worker join и НЕ ЖДЁТ
-  НИКАКОГО lock — только lock-free publish одного packed-`u64` intent
-  `(context:15, operation:32, generation:16, is_reader:1)` в слот-ринг
-  owning context (`StreamDropIntentStack`: 4096 `AtomicU64` слотов,
-  CAS `0 -> packed`, без `Mutex`, без аллокации, без `RefCell`, без
-  `unsafe`). Переполнение структурно невозможно (слотов >> живых
-  эпох ≤ quota; плюс sweep sideless-эпох без записи; плюс stale no-op).
-  Глобального registry/orphan-очереди нет: маршрутизация — клоном стека
-  в native data. `poll_io` (единственное место transition): сначала
-  применяет снятия сторон (retry через requeue), затем валидирует
-  (живой op root, та же generation, не terminal, ноль сторон, пустая
+  `Context`, не исполняет JS, не делает I/O/worker join и не ждёт
+  никакого lock. Единственное действие — `AtomicBool::store(false)` в
+  `StreamEndpointSignals` данной эпохи, без очереди, `Mutex`, аллокации,
+  `RefCell`, packing, lookup ids, CAS-цикла и `unsafe`. Поэтому нет cap,
+  переполнения, requeue или потери сигнала. `poll_io` (единственное место
+  transition) обходит живые local operations, переносит false signals в
+  side flags и при занятом borrow оставляет сигнал для следующего poll;
+  затем валидирует (живой op root, не terminal, ноль сторон, пустая
   очередь, не in-flight; demand — demand-first с табличным/bridge views
   как defense-in-depth) и выполняет single abandoned transition (token
   cancel, cursor clear, op root + payload removal, conditional release,
   один `stream_read` event в существующем классе `cancelled` — без JS
-  event/error, без нового класса), плюс sweep. Stale intents —
+  event/error, без нового класса), плюс sweep. Позднее завершение —
   strict no-op.
 - Exactly-once: EOF/error/cancel/abandoned/shutdown конкурируют за одну
   transition (флаги `terminal`/`released`); только победитель релизит и
@@ -150,53 +147,42 @@ count-only diagnostics (`io_active_count`, `stream_payload_count`,
 
 - `docs/spec-matrix.md`: строки `M9D-GC-01…06` с production symbols и
   точными тестами (честный GC-06 scope зафиксирован).
-- `docs/DECISIONS.md`: ADR-0046 переписан под rework (стороны/claim,
-  queue-clone без cap/registry/orphans, demand-first + sweep, честный
-  failure scope, буквальный §6-запрет).
+- `docs/DECISIONS.md`: ADR-0046 описывает atomic signals без queue/cap/
+  registry/orphans, demand-first + sweep, честный failure scope и
+  буквальный §6-запрет.
 - `docs/architecture.md`: Layer 2c переписан под rework.
 - Исторический `M9D-EOF-LIFECYCLE-handoff` не переписан.
 
-## Retrospective review (rework + P1 rework, перед commit)
+## Retrospective review (M9-D-R3, перед commit)
 
-Первый вариант (отклонён) и исправления — см. выше. Повторная приёмка
-нашла два новых P1 (CI run 34711094697), оба закрыты здесь:
+Повторная приёмка отклонила промежуточные варианты с `Mutex<VecDeque>` в
+finalizer и с фиксированным atomic ring: первый нарушал §3.2.4 ожиданием
+lock, второй имел предел, packing и CAS/requeue-поверхность. Текущий вариант
+не сохраняет ни одну из этих структур:
 
-- P1-A (Mutex в Finalize, §3.2.4): `push_stream_cleanup_record` делал
-  blocking `Mutex::lock()` прямо из `Finalize`/`Drop`. Исправлено:
-  intent-стек — 4096 `AtomicU64` слотов, publish = pack + CAS
-  `0 -> packed` (без `Mutex`, без аллокации, без `RefCell`, без
-  `unsafe`); в финализаторе нет никакого ожидания — только CAS-ретрай
-  при гонке слотов, что не является lock wait. `cargo clippy -D warnings`
-  подтверждает отсутствие `unsafe_code`; structural guard подтверждает
-  отсутствие `.lock()`/`try_lock`/`borrow` в `Finalize`/`Drop` путях.
-- P1-B (потеря claim при занятом RefCell): claim `dropped=true`
-  ставился ДО `try_borrow_mut()`, и занятый borrow навсегда оставлял
-  сторону registered (phantom owner + утечка quota). Исправлено
-  архитектурно: claim покрывает только ПУБЛИКАЦИЮ intent; снятие флага
-  стороны происходит исключительно в `poll_io`
-  (`apply_stream_drop_intent`) с retry через requeue при занятом borrow
-  — intent переживает contention и применяется позже. Native data
-  больше не хранит `Rc<RefCell>` вообще (только identity-инты + клон
-  стека), так что финаčajзер не может застать занятый borrow через
-  собственные данные; brand gates резолвят shared из context-таблиц.
-  Попутно terminal `read()`/`cancel()`/`releaseLock()` после удаления
-  op entry больше не бросают "no longer live": error replay живёт в
-  `PendingStreamErrors`, done — через общий `settle_terminal_outcome`,
-  cancel идемпотентно резолвит `undefined` (поймано упавшими
-  M3-тестами `cancel_before_first_read_resolves_done`,
-  `source_error_rejects_queued...` — все 26+28 зелёные после фикса).
+- `Finalize`/`Drop` выполняют лишь atomic store в уже выделенном per-op
+  `Arc<StreamEndpointSignals>`. В пути нет `.lock()`, `try_lock`, borrow,
+  аллокации или identity lookup.
+- Опущенный atomic одновременно является durable claim. `poll_io` читает его
+  при каждом sweep живых operations; неудачный `try_borrow_mut` не меняет
+  сигнал, поэтому contention откладывает снятие стороны, но не теряет его.
+- `releaseLock()` опускает reader signal через тот же claim до изменения
+  context state. Повторный `releaseLock()` сначала видит `released`, бросает
+  `TypeError` и не может сбросить сигнал нового reader.
+- `Trace` derive требует `#[boa_gc(unsafe_no_drop)]` для ручного `Drop`, но
+  реализация не содержит `unsafe`, raw pointers или ручного `Trace`.
 
-Плюс из первого rework (сохранено):
+Terminal `read()`/`cancel()`/`releaseLock()` после удаления op entry не
+бросают "no longer live": error replay живёт в `PendingStreamErrors`, done —
+через общий `settle_terminal_outcome`, cancel идемпотентно резолвит
+`undefined`.
 
-1. `Trace` derive генерирует собственный `Drop` — ручной `Drop` без
-   `#[boa_gc(unsafe_no_drop)]` не компилируется (E0119). Оба native
-   типа — `#[derive(Trace)] + #[boa_gc(unsafe_no_drop)]` + ручной
-   `Finalize` + ручной `Drop` с тем же publish-claim.
-2. Ручной `unsafe impl Trace` запрещён `#![deny(unsafe_code)]`:
-   только derive; intent-стек — safe `AtomicU64` + `Arc`, без
-   `unsafe impl Send/Sync`, без raw pointers.
+## Исторический внешний CI run 34714298795 (не является приёмочным)
 
-## Внешний CI run 34714298795 (не блокирует код, детализация вместо прежней записи)
+Этот run относится к прежней ветке до объединения `task/ci-green-wpt-gate`.
+Ни его красный статус, ни приведённые ниже ограничения scope не описывают
+текущую ветку: workflow/corpus fixes теперь входят в её ancestry. Итоговый
+приёмочный run должен быть создан после данного commit и оцениваться отдельно.
 
 Три красных job — все в WPT-шагах workflow, после зелёных Rust-тестов.
 Ни один не затрагивает код ветки (`git diff task/m9e...HEAD --name-only`

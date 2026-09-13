@@ -162,24 +162,20 @@ owns the host bridge; `extension.rs` owns the entry points:
   and no in-flight I/O, stream/reader `cancel()` settle queued reads done
   synchronously on the calling stack (cancel promise resolves `undefined`
   through one Boa job) and make the in-flight chunk stale;
-- GC/drop lifecycle (M9-D-R2): every stream epoch owns two explicit
+- GC/drop lifecycle (M9-D-R3): every stream epoch owns two explicit
   sides (`StreamShared::stream_registered` / `reader_registered`, plain
-  `bool`s — never counters, never `Rc::strong_count`) plus a lease
+  `bool`s — never counters, never `Rc::strong_count`) and two matching
+  `StreamEndpointSignals` atomics, plus a lease
   (`StreamLease { context, operation, generation, terminal, released }` —
-  opaque ids only, no GC pointers). Publish-claims live in the native
-  data (`StreamNative::published` / `ReaderNative::published:
-  Cell<bool>`, the latter shared with `releaseLock()` via `take_lease`);
-  `Finalize`/`Drop` only publish one verbatim intent
-  (`StreamDropIntent { context, operation, is_reader }` — full `u64`
-  ids, no packing, no generation replay) into the owning context's
-  unbounded intent queue (`StreamDropIntentStack`: `Mutex<VecDeque>`,
-  one push per publish, poison-tolerant; no `RefCell`, no `unsafe`,
-  only a constant-short mutex hold — never I/O, never a nested lock).
-  Native data holds no `Rc<RefCell>` at all — only identity integers
-  plus the queue clone. `poll_io` (the only transition site) first
-  applies the announced side clearings (with requeue-retry while the
-  shared cell is borrowed elsewhere — contention delays but never loses
-  a clearing; the requeue push is infallible), then validates (live op
+  opaque ids only, no GC pointers). Native data keeps only its operation
+  identity and an `Arc` clone of the signals; its `Finalize`/`Drop` pair
+  claims once with `Cell<bool>` and performs one `AtomicBool::store(false)`.
+  Thus finalization has no `Context`, queue, `Mutex`, `RefCell`, allocation,
+  packing, identity lookup, CAS retry, or `unsafe`. `releaseLock()` shares
+  the reader claim through `take_lease`. `poll_io` (the only transition
+  site) synchronizes false signals into side flags for every live local op;
+  a busy shared `RefCell` leaves the atomic false, so the next poll retries
+  without a requeue and cannot lose the clearing. It then validates (live op
   root — ids are never reused — not terminal, zero sides, empty queue,
   not in-flight; demand-first with the table/bridge views as
   defense-in-depth) and runs the single abandoned transition (token

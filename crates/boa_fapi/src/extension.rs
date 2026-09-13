@@ -308,29 +308,6 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) io_poll_budget: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
     /// Opaque identity of this registration's I/O context.
     pub(crate) context_id: crate::io::FileApiContextId,
-    /// Context-pinned sink for stream endpoint-drop intent notices
-    /// (M9-D-R2).
-    ///
-    /// Native `Finalize`/`Drop` impls (`StreamNative`/`ReaderNative`)
-    /// cannot touch `Context`, JS, or the shared state, so they publish
-    /// a plain-integer intent through a clone of this queue captured at
-    /// object creation time (see [`StreamDropIntents`]). The queue is
-    /// drained only by `poll_io` on the owning Boa thread, which first
-    /// applies the announced side clearings (with retry while the shared
-    /// cell is borrowed elsewhere) and then runs the single abandoned
-    /// transition for eligible operations. Holds only opaque ids — no
-    /// bytes, paths, or JS values.
-    ///
-    /// The queue is intentionally unbounded: at most a handful of intents
-    /// per live operation can exist (finalize + drop per side, each
-    /// guarded by the native-data publish claim), so its length never
-    /// exceeds a small multiple of the live stream operation count, which
-    /// is itself bounded by `max_concurrent_reads_per_global`. A fixed
-    /// extra cap would contradict that host-configured limit. Shared (not
-    /// duplicated) between specs and handle so drops observe the same
-    /// queue `poll_io` drains.
-    #[cfg(feature = "streams-shim")]
-    pub(crate) stream_drop_intents: StreamDropIntents,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
     /// Opaque identity stored at registration time: a repeat `register`
@@ -338,18 +315,6 @@ pub(crate) struct RegisteredSpecs {
     /// rejected without mutation.
     pub(crate) identity: RegistrationIdentity,
 }
-
-/// Queue of stream endpoint-drop intent notices, shared by one
-/// context (M9-D-R2 finalizer boundary).
-///
-/// Alias of the queue owned by `streams.rs`
-/// ([`crate::streams::StreamDropIntentStack`]): native `Finalize`/`Drop`
-/// impls push plain-integer intents through a clone captured at object
-/// creation — never touching `Context`, JS, or the shared state — and
-/// `poll_io` drains the same queue on the owning Boa thread. See the
-/// queue docs for the bounded-wait argument and the memory bound.
-#[cfg(feature = "streams-shim")]
-pub(crate) type StreamDropIntents = std::sync::Arc<crate::streams::StreamDropIntentStack>;
 
 impl RegisteredSpecs {
     /// Returns the Blob interface prototype.
@@ -534,34 +499,6 @@ impl RegisteredSpecs {
     pub(crate) fn drop_stream_payload(&self, operation: u64) {
         if let Ok(mut map) = self.stream_payloads.lock() {
             map.remove(&operation);
-        }
-    }
-
-    /// Swaps out every queued stream endpoint-drop intent for this
-    /// context (M9-D-R2).
-    ///
-    /// Queue swap; owns every intent exclusively afterwards. Called
-    /// only from `poll_io` on the owning Boa thread; every intent is
-    /// validated by the caller before acting.
-    #[cfg(feature = "streams-shim")]
-    pub(crate) fn take_stream_drop_intents(&self) -> Vec<crate::streams::StreamDropIntent> {
-        self.stream_drop_intents.take_all()
-    }
-
-    /// Requeues intents whose side clearing hit a contended shared-cell
-    /// borrow (M9-D-R2 retry).
-    ///
-    /// Boa thread only (`poll_io`). Pushing back through the same
-    /// unbounded queue preserves every notice until it is applied — a
-    /// contended borrow delays, never loses, the side clearing (the
-    /// queue push itself is infallible, so retry cannot drop either).
-    #[cfg(feature = "streams-shim")]
-    pub(crate) fn requeue_stream_drop_intents(
-        &self,
-        intents: Vec<crate::streams::StreamDropIntent>,
-    ) {
-        for intent in intents {
-            self.stream_drop_intents.push(intent);
         }
     }
 
@@ -1043,20 +980,6 @@ impl FileApiExtension {
             let bridge = Arc::clone(&bridge);
             shutdown.track(move || bridge.shutdown());
         }
-        #[cfg(feature = "streams-shim")]
-        let stream_drop_intents: StreamDropIntents =
-            std::sync::Arc::new(crate::streams::StreamDropIntentStack::new());
-        #[cfg(feature = "streams-shim")]
-        {
-            let intents = Arc::clone(&stream_drop_intents);
-            shutdown.track(move || {
-                // Shutdown drops pending drop intents: every live
-                // operation releases through the shutdown path instead.
-                // `take_all` also frees every leaked intent node, so no
-                // allocation outlives the context.
-                let _ = intents.take_all();
-            });
-        }
         let specs = RegisteredSpecs {
             blob: blob_spec,
             file: file_spec,
@@ -1082,8 +1005,6 @@ impl FileApiExtension {
             stream_payloads: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            #[cfg(feature = "streams-shim")]
-            stream_drop_intents: Arc::clone(&stream_drop_intents),
             #[cfg(feature = "dom-shim")]
             io_poll_budget: std::sync::Arc::new(std::sync::Mutex::new(None)),
             context_id,
