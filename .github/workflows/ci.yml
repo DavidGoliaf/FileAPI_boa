@@ -102,33 +102,30 @@ jobs:
           git -C target/pinned-wpt fetch --quiet --depth 1 origin 0968c868d8095217d18d86b34c7f21dccae58768
           git -C target/pinned-wpt checkout --quiet FETCH_HEAD -- FileAPI/
 
-      - name: WPT strict run (pinned upstream gate)
-        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict --json target/wpt-report.json --junit target/wpt-report.xml
+      # Observation only: reproduces the audited expectations artifact. It is
+      # NOT a release verdict and never claims conformance. The required
+      # release status lives in the separate `m9e-release-conformance` job.
+      - name: WPT observation run (--check-expectations)
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --check-expectations --json target/wpt-observation.json --junit target/wpt-observation.xml
 
-      - name: WPT strict run (threads 2, ordered output)
-        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict --threads 2 --json target/wpt-report-t2.json
+      - name: WPT observation run (threads 2, ordered output)
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --check-expectations --threads 2 --json target/wpt-observation-t2.json
 
-      - name: WPT report check (strict gate + determinism)
+      - name: WPT observation check (expectations match, release verdict consistent, determinism)
         shell: pwsh
         run: >
-          $json = Get-Content target/wpt-report.json -Raw | ConvertFrom-Json;
-          if ($json.mode -ne 'WPT_STRICT') { throw "expected WPT_STRICT mode, got $($json.mode)" };
-          if ($json.strict_pass -ne $true) { throw "strict_pass must be true (open defects are recorded FAIL, never unexpected)" };
-          if ($json.summary.unexpected -ne 0) { throw "unexpected rows must be 0, got $($json.summary.unexpected)" };
-          if ($json.summary.defects -ne 5) { throw "expected 5 recorded open defects, got $($json.summary.defects)" };
-          $sha1 = (Get-FileHash target/wpt-report.json -Algorithm SHA256).Hash;
-          $sha2 = (Get-FileHash target/wpt-report-t2.json -Algorithm SHA256).Hash;
+          $json = Get-Content target/wpt-observation.json -Raw | ConvertFrom-Json;
+          if ($json.mode -ne 'WPT_CHECK_EXPECTATIONS') { throw "expected WPT_CHECK_EXPECTATIONS, got $($json.mode)" };
+          if ($json.expectations_match -ne $true) { throw "expectations_match must be true" };
+          if ($json.inventory.total -ne 115) { throw "inventory.total must be 115, got $($json.inventory.total)" };
+          if ($json.inventory.unaccounted -ne 0) { throw "inventory.unaccounted must be 0, got $($json.inventory.unaccounted)" };
+          if ($json.results.total -ne $json.results.unique) { throw "results.total must equal results.unique" };
+          if ($json.results.unexpected -ne 0) { throw "unexpected rows must be 0, got $($json.results.unexpected)" };
+          if ($json.release_blockers.defects -gt 0 -and $json.release_green -ne $false) { throw "release_green must be false while defects remain" };
+          if ($json.release_blockers.defects -eq 0 -and $json.release_green -ne $true) { throw "release_green must be true once every release blocker is gone" };
+          $sha1 = (Get-FileHash target/wpt-observation.json -Algorithm SHA256).Hash;
+          $sha2 = (Get-FileHash target/wpt-observation-t2.json -Algorithm SHA256).Hash;
           if ($sha1 -ne $sha2) { throw "threads 1/2 JSON must be byte-identical: $sha1 vs $sha2" }
-
-      - name: WPT negative control (mutated upstream must fail)
-        shell: pwsh
-        run: >
-          Copy-Item -Recurse target/pinned-wpt target/mutated-wpt;
-          Add-Content -Path target/mutated-wpt/FileAPI/blob/Blob-slice.any.js -Value "// M9-E negative control: mutated upstream byte";
-          cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/mutated-wpt --strict --json target/wpt-mutated.json;
-          $mutatedExit = $LASTEXITCODE;
-          if ($mutatedExit -eq 0) { throw "mutated upstream run must exit non-zero" };
-          exit 0
 
       - name: Upload WPT reports
         uses: actions/upload-artifact@v4
@@ -136,9 +133,9 @@ jobs:
           name: wpt-reports-${{ matrix.os }}
           path: |
             target/wpt-smoke.json
-            target/wpt-report.json
-            target/wpt-report.xml
-            target/wpt-report-t2.json
+            target/wpt-observation.json
+            target/wpt-observation.xml
+            target/wpt-observation-t2.json
 
       - name: SBOM (cargo tree)
         run: cargo tree --workspace --all-features --prefix none > target/sbom.txt
@@ -212,3 +209,55 @@ jobs:
 
       - name: git diff --check
         run: git diff --check
+
+  # Required release status (M9E-R1 §6): `--strict` with no exit-code
+  # inversion, no `continue-on-error` and no masking. While the recorded
+  # product/harness defects remain, this job is honestly red; once they are
+  # fixed it turns green without any workflow change.
+  m9e-release-conformance:
+    name: M9E release conformance (strict gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: WPT upstream checkout (pinned commit, FileAPI scope)
+        run: |
+          git init --quiet target/pinned-wpt
+          git -C target/pinned-wpt config core.autocrlf false
+          git -C target/pinned-wpt config core.eol lf
+          git -C target/pinned-wpt remote add origin https://github.com/web-platform-tests/wpt
+          git -C target/pinned-wpt fetch --quiet --depth 1 origin 0968c868d8095217d18d86b34c7f21dccae58768
+          git -C target/pinned-wpt checkout --quiet FETCH_HEAD -- FileAPI/
+
+      - name: WPT release gate (--strict; non-zero exit is the honest blocker status)
+        run: cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict --json target/wpt-release.json --junit target/wpt-release.xml
+
+      - name: Upload release reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-release-reports
+          path: |
+            target/wpt-release.json
+            target/wpt-release.xml
+
+  # Mechanical negative controls (M9E-R1 §6.4/§7): mutated upstream,
+  # inventory, expectation and result sets must each make the gate non-zero.
+  m9e-gate-negative-controls:
+    name: M9E gate negative controls (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: M9E-R1 mutation fixtures (must be non-zero)
+        run: cargo test --package boa_fapi_wpt --test gate_remediation -- --test-threads=1

@@ -37,7 +37,7 @@ this file is normative for the M9-E gate.
   missing: those rows are exact `NOTRUN` exclusions (see below), never
   `PASS`.
 
-## Two modes, different claims
+## Three modes, three claims
 
 Fast offline smoke for development (adapter/harness check only):
 
@@ -46,9 +46,11 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --smoke
 ```
 
 It runs the same corpus but the summary and reports are always labelled
-`ADAPTED_SMOKE`, never `WPT conformance`.
+`ADAPTED_SMOKE`, never `WPT conformance`; smoke consumes no inventory or
+expectations and its report always carries `release_green: false`
+(`not_a_release_mode`).
 
-Normative gate:
+Normative release gate (M9E-R1):
 
 ```powershell
 cargo run --package boa_fapi_wpt -- `
@@ -58,15 +60,52 @@ cargo run --package boa_fapi_wpt -- `
   --strict
 ```
 
-`--strict` exits non-zero on hash/inventory/adaptation drift, missing or
-duplicate result, unexpected PASS/FAIL/TIMEOUT/NOTRUN, expired exclusion,
-or a supported capability wrongly marked NOTRUN. A recorded open defect
-(expected FAIL, actual FAIL) satisfies the strict comparison (exit 0,
-`strict_pass: true`) and keeps only the release gate red (stderr note,
-`release_green: false`). The summary always shows
-upstream PASS, adapted smoke PASS, open defects, and exclusions
-separately. `--strict` requires `--expectations` plus `--upstream-root`;
-`--smoke` takes neither; the two modes are exclusive.
+`--strict` returns `0` **only** when `release_green == true`. Every
+recorded open defect (expected `FAIL`, actual `FAIL`) keeps the release
+gate red and the process non-zero. Hash/inventory/adaptation drift,
+missing or duplicate result rows, unexpected PASS/FAIL/TIMEOUT/NOTRUN,
+expired exclusions and supported capabilities wrongly marked NOTRUN are
+launch errors, never `NOTRUN`.
+
+Diagnostic observation (M9E-R1 §3.2):
+
+```powershell
+cargo run --package boa_fapi_wpt -- `
+  --manifest wpt-manifest.json `
+  --expectations expectations.json `
+  --upstream-root <PINNED_WPT_CHECKOUT> `
+  --check-expectations
+```
+
+`--check-expectations` returns `0` when `expectations_match == true`
+(actual statuses and identities reproduce the audited expectations), but its
+console/JSON always report `release_green: false` and it is never called a
+conformance/release pass. The three modes are mutually exclusive;
+`--strict`/`--check-expectations` require `--expectations` plus
+`--upstream-root`, `--smoke` takes neither.
+
+### Observation vs release verdict
+
+Two unambiguous results are kept apart (M9E-R1 §3.1):
+
+- `expectations_match` — actual statuses and identity fully match the
+  audited expectations, with no missing/duplicate/unexpected/drift.
+- `release_green` — `expectations_match == true` **and** no release
+  blocker (recorded defect, timeout, harness gap, supported NOTRUN, expired
+  exclusion).
+
+`strict_pass` is removed in report schema 2; the only release verdict is
+`release_green`.
+
+### Exit reason classes
+
+The process may use one non-zero code, but the JSON `exit_reason` is
+distinct (M9E-R1 §3.2): `ok`, `integrity` (bad input / hash / inventory /
+adaptation drift), `expectation_drift` (duplicate, missing, extra, status
+mismatch), `execution_failure` (timeout/crash), `release_defects`
+(recorded open defects). `--strict` exits `1` for `release_defects`, `2`
+for input/integrity/drift/execution failures; `--check-expectations` exits
+`0` only on `expectations_match`.
 
 ## Manifest schema (`schema_version: 2`)
 
@@ -121,6 +160,7 @@ UTF-8 validation.
 ```text
 cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --smoke
 cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root <PINNED_WPT> --strict
+cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root <PINNED_WPT> --check-expectations
   [--threads N] [--filter <exact-or-prefix>] [--json <path>] [--junit <path>]
   [--timeout-ms <N>]
 ```
@@ -132,16 +172,39 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations 
   `--threads 2` JSON is byte-identical to `--threads 1` for the same
   manifest (verified by SHA-256 in validation). No `Context`/`JsObject`
   crosses workers; one file's failure never drops another file's row.
-- `--filter`: diagnostic subset without changing strict-gate semantics
-  (empty match is a launch error). `--strict` + `--filter` and `--smoke`
-  + `--filter` are launch errors: the full run without filter is the only
-  gate.
+- `--filter`: diagnostic subset without changing gate semantics
+  (empty match is a launch error). `--filter` is rejected together with
+  `--strict`, `--check-expectations` and `--smoke`: the full run without
+  filter is the only gate.
 - `--timeout-ms`: overrides per-subtest pump budget, range 1..=300000
   (manifest `timeout_ms` and `default_timeout_ms` share the range);
   each file additionally runs under the wall deadline in its worker.
 - Missing manifest, bad schema version, hash mismatch, inventory drift,
   unknown status, incomplete expectation, or manifest/expectations drift
-  → launch error (exit 2), never `NOTRUN`.
+  → launch error with a distinct JSON `exit_reason` (`integrity` /
+  `expectation_drift`), never `NOTRUN`.
+
+## Inventory dispositions (M9E-R1 §4.1)
+
+Every pinned `FileAPI/**` path has exactly one primary disposition,
+validated as a bijection before any verdict:
+
+- `executed-direct` — a `direct` manifest file claims the path;
+- `executed-adapted` — an `adapted` manifest file that preserves upstream
+  assertions claims the path (a pure `project-acceptance` smoke does
+  **not** claim it);
+- `excluded-capability` — a file-level exclusion row names the path with a
+  closed-list capability, owner, reason, issue and review date;
+- `unsupported-artifact` — metadata/non-test artifact from a closed
+  allow-list.
+
+Missing, extra, duplicate or contradictory claims (a path both executed
+and excluded) are launch errors. The canonical JSON reports
+`inventory: {total, executed_direct, executed_adapted, excluded,
+unaccounted}`; `unaccounted` must be `0`. On the audited inputs:
+`115/115` (36 direct, 0 adapted, 79 excluded, 0 unaccounted). The 79
+file-level exclusion rows are visible as a top-level `exclusions` array
+and as a synthetic JUnit suite.
 
 ## Status model
 
@@ -162,10 +225,13 @@ detail-prefix-matched):
   evaluated cleanly, with detail `notrun: <manifest reason>` (a
   top-level throw turns the row into `FAIL` instead).
 
-Strict gate (`--strict`, non-zero on): `PASS` expects only actual `PASS`;
-`FAIL` expects only actual `FAIL`; `NOTRUN` expects only actual `NOTRUN`;
-anything else breaks strict. New tests, subtests, unexpected PASS, or
-unexpected FAIL/TIMEOUT break the gate.
+Gate comparison (`--strict`/`--check-expectations`, identity + status):
+`PASS` expects only actual `PASS`; `FAIL` expects only actual `FAIL`;
+`NOTRUN` expects only actual `NOTRUN`; anything else is unexpected and
+breaks `expectations_match`. New tests, subtests, unexpected PASS, or
+unexpected FAIL/TIMEOUT break the gate. A matching expected `FAIL` keeps
+`expectations_match` true but is a release blocker (`release_green`
+false).
 
 Timeout is enforced by the CLI process boundary: each file runs in an
 isolated child process of the same executable, killed at the wall
@@ -308,20 +374,39 @@ exists — never presented as WPT.
 | `M9E-WPT-04` | real FileList host fixture |
 | `M9E-WPT-05` | async host poll integration in runner |
 | `M9E-WPT-06` | deterministic JSON/JUnit summary separating WPT and smoke |
+| `M9E-R1-01` | expected FAIL blocks release; `expectations_match` vs `release_green` |
+| `M9E-R1-02` | duplicate/missing/extra result identity drift |
+| `M9E-R1-03` | `DYNAMIC:` not double-counted; threads 1/2 identical |
+| `M9E-R1-04` | inventory ↔ disposition bijection |
+| `M9E-R1-05` | canonical reporting covers every inventory/expectation id once |
+| `M9E-R1-06` | exit code and verdict consistency |
+| `M9E-R1-07` | integrity regressions remain launch errors |
 
-## Reports
+## Reports (schema 2, canonical model)
 
-- JSON (`--json`, else stdout): `schema_version`, `mode`
-  (`ADAPTED_SMOKE`/`WPT_STRICT`), `source`, `summary` (`upstream_pass`,
-  `smoke_pass`, `defects`, `exclusions`, `unexpected`), `strict_pass`,
-  `files[]` in manifest order with per-subtest
-  `test`/`subtest`/`actual`/`expected`/`trace`/`detail`. Keys fixed
-  order; no timestamps, random IDs or absolute paths in the compared
-  section (`elapsed_ms` is intentionally omitted from reports).
-- JUnit (`--junit`): `<testsuites>` with per-file `<testsuite>`
-  (`failures` counts only `FAIL`/`TIMEOUT`, plus a `skipped` count) and
-  per-subtest `<testcase>`; `NOTRUN` rows carry `<skipped>` without
-  `<failure>`, `FAIL`/`TIMEOUT` rows carry `<failure>`.
+One validated `CanonicalRun` is the single source for console, JSON, JUnit
+and the exit code; no serializer recomputes totals (M9E-R1 §5).
+
+- JSON (`--json`, else stdout): `schema_version` (2), `mode`
+  (`ADAPTED_SMOKE`/`WPT_STRICT`/`WPT_CHECK_EXPECTATIONS`), `source`,
+  `expectations_match`, `release_green`, `release_blockers`
+  (`defects`/`timeouts`/`unexpected`/`expectation_drift`/
+  `not_a_release_mode`), `exit_reason`, `inventory` (`total`,
+  `executed_direct`, `executed_adapted`, `excluded`, `unaccounted`),
+  `results` (`total`, `unique`, `upstream_pass`, `smoke_pass`, `defects`,
+  `notrun`, `unexpected`), `files[]` in manifest order and `exclusions[]`
+  (path, test, capability, reason, owner, issue, review date, trace).
+  Keys fixed order; no timestamps, random IDs or absolute paths in the
+  compared section (`elapsed_ms` is intentionally omitted from reports).
+  Arithmetic invariants: `inventory.total == sum(primary dispositions)`,
+  `results.total == results.unique`, every expectation id once,
+  `release_green == false` whenever `defects > 0`.
+- JUnit (`--junit`): `<testsuites>` carries aggregate
+  `tests`/`failures`/`skipped` equal to the canonical results; per-file
+  `<testsuite>` (`failures` counts only `FAIL`/`TIMEOUT`, plus a `skipped`
+  count) and per-subtest `<testcase>`; `NOTRUN` rows carry `<skipped>`
+  without `<failure>`, `FAIL`/`TIMEOUT` rows carry `<failure>`; the 79
+  file-level exclusions are a synthetic `file-level-exclusions` suite.
 - Detail scrubber: every `blob:` occurrence (prefix- or
   punctuation-adjacent, trailing `)`/`,`/`;` preserved) → `blob:<redacted>`;
   `file://` → `file:<redacted>`; HTTP(S) → scheme+host plus
@@ -330,21 +415,22 @@ exists — never presented as WPT.
   scalars / 48 tokens on char boundaries; unclassifiable input →
   `<redacted-error>`. XML escape additionally drops XML 1.0 illegal chars.
 
-Example (truncated):
+Example (truncated; canonical schema 2):
 
 ```json
-{"schema_version":1,"mode":"WPT_STRICT","source":{"repository":"https://github.com/web-platform-tests/wpt","commit":"0968c868…","license":"BSD-3-Clause"},"summary":{"upstream_pass":374,"smoke_pass":6,"defects":5,"exclusions":35,"unexpected":0},"strict_pass":true,"files":[{"path":"corpus/blob-slice.js","upstream_path":"FileAPI/blob/Blob-slice.any.js","group":"FileAPI/blob","subtests":[{"test":"Blob-slice.any.js","subtest":"no-argument Blob slice","actual":"PASS","expected":"PASS","trace":"M9E-WPT-02","detail":""}]}]}
+{"schema_version":2,"mode":"WPT_STRICT","source":{"repository":"https://github.com/web-platform-tests/wpt","commit":"0968c868…","license":"BSD-3-Clause"},"expectations_match":true,"release_green":false,"release_blockers":{"defects":5,"timeouts":0,"unexpected":0,"expectation_drift":0,"not_a_release_mode":0},"exit_reason":"release_defects","inventory":{"total":115,"executed_direct":36,"executed_adapted":0,"excluded":79,"unaccounted":0},"results":{"total":496,"unique":496,"upstream_pass":374,"smoke_pass":6,"defects":5,"notrun":111,"unexpected":0},"files":[{"path":"corpus/blob-slice.js","upstream_path":"FileAPI/blob/Blob-slice.any.js","group":"FileAPI/blob","subtests":[{"test":"Blob-slice.any.js","subtest":"no-argument Blob slice","actual":"PASS","expected":"PASS","trace":"M9E-WPT-02","detail":""}]}],"exclusions":[{"path":"FileAPI/Blob-methods-from-detached-frame.html","test":"Blob-methods-from-detached-frame.html","capability":"navigation","reason":"requires navigation; no JS-only subtest surface in this harness","owner":"m9e","issue":"QUESTIONS.md Q1-Q3","review_by":"2027-09-08","trace":"M9E-WPT-03"}]}
 ```
 
 ## Limitations
 
 - Conformance is claimed for the 36 directly executed upstream `.any.js`
   files (417 executable subtests: 374 upstream PASS, 5 recorded open
-  defects, 32 exclusions) plus 3 `DYNAMIC:` tracker rows, plus 79
-  file-level inventory exclusions (exact `NOTRUN` rows in
-  `expectations.json`, never executed); the rest of `FileAPI/**` needs
-  browser capabilities out of scope (Fetch, navigation incl. WHATWG URL
-  parsing, workers, WPT server).
+  defects, 32 executed NOTRUN) plus 79 file-level inventory exclusions
+  (exact `NOTRUN` rows in `expectations.json`, visible in the canonical
+  report); the rest of `FileAPI/**` needs browser capabilities out of
+  scope (Fetch, navigation incl. WHATWG URL parsing, workers, WPT server).
+  Canonical totals: `496/496` rows (`374` upstream PASS, `6` smoke PASS,
+  `5` defects, `111` NOTRUN, `0` unexpected).
 - Every CLI file execution is an isolated worker with a wall deadline and
   kill boundary. `N = 1` runs workers sequentially; `N > 1` schedules them
   concurrently, with manifest-order output (byte-identical JSON for the
@@ -354,5 +440,8 @@ Example (truncated):
 - Known open defects (5, release-red): the `filereader_abort` phantom
   second pair, the `fileReader.any.js` sync-abort delivery turn, the two
   empty-type `readAsDataURL` rows, and the `File` slash row (see
-  Expectations above and `docs/spec-delta.md`). The strict gate accepts
-  the recorded FAILs; the release gate stays red.
+  Expectations above and `docs/spec-delta.md`). `expectations_match`
+  accepts the recorded FAILs; `release_green` stays red and `--strict`
+  exits non-zero until they are fixed. The CI release job
+  (`m9e-release-conformance`) is correspondingly red without any workflow
+  change, and turns green automatically once all five are fixed.

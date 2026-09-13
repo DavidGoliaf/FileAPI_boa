@@ -1202,3 +1202,57 @@ host `poll_io` loop; `poll_io` — единственное место transitio
 M9D handoff дополняется новым rework-handoff (исторический
 M9D-EOF-LIFECYCLE-handoff не переписывается); `docs/architecture.md`
 §Layer 2c дополняется GC/drop абзацем.
+
+## ADR-0047 (M9-E-R1): canonical run model, expectations-match vs release-green
+
+Контекст: приёмка M9-E показала, что strict-прогон одновременно назывался
+«release red» и завершался `exit 0`; JSON содержал `strict_pass: true` и не
+содержал `release_green`; три `DYNAMIC:` строки, уже присутствовавшие в
+manifest, добавлялись повторно (420 строк при 417 уникальных); 79
+file-level exclusions не входили в totals; CI считал `defects == 5`
+успешным release condition. Один и тот же raw result нельзя одновременно
+считать release red и успешным status (M9E-R1 §1/§3).
+
+Решение: ввести один validated `CanonicalRun` (`accounting.rs`) —
+единственный источник для console, JSON (schema 2), JUnit и exit code;
+никакой serializer не пересчитывает totals независимо (M9E-R1 §5).
+Два недвусмысленных результата разделены:
+
+1. `expectations_match` — фактические статусы и identity полностью
+   совпали с audited expectations: без duplicate/missing/unexpected/extra
+   и status-drift. Exact identity сравнивается ordinal/case-sensitive по
+   `(upstream_path, test, subtest)`; `DYNAMIC:` не является особым
+   разрешением на дубликат — `tracker_subtests` пропускает id, уже
+   присутствующий в manifest/результате.
+2. `release_green` = `expectations_match && defects == 0 && timeouts == 0`
+   (harness-gap/supported-NOTRUN/expired остаются load-ошибками).
+   `strict_pass` удалён в schema 2; сохранять `true` при
+   `release_green == false` больше нельзя.
+
+Инвентарь: каждый из 115 pinned `FileAPI/**` путей получает ровно одну
+primary disposition (`executed-direct`, `executed-adapted`,
+`excluded-capability`, `unsupported-artifact`), валидируемую как
+bijection до вердикта: executed claims берутся из manifest provenance,
+исключения — из точных file-level exclusion rows. Pure
+`project-acceptance` adapted smoke не претендует на upstream path, поэтому
+FileList host smoke остаётся отдельным `smoke_pass`, а `filelist.html`
+остаётся `excluded-capability`. Missing/extra/duplicate/contradictory
+claims — launch error. 79 exclusions представлены top-level массивом и
+synthetic JUnit suite, входят в totals и несут
+path/capability/reason/owner/issue/review date.
+
+CLI: `--strict` возвращает `0` только при `release_green == true`;
+`--check-expectations` возвращает `0` при `expectations_match == true`, но
+в console/JSON всегда `release_green: false` и не называется
+conformance/release pass. Exit reason классы различаются в JSON:
+`integrity`, `expectation_drift`, `execution_failure`, `release_defects`
+(CLI может использовать один non-zero code). `--smoke` остаётся
+`ADAPTED_SMOKE`, без release terminology и без inventory/expectations.
+
+Последствия: trace rows `M9E-R1-01…07` в `docs/spec-matrix.md`;
+`docs/wpt.md` и `crates/boa_fapi_wpt/README.md` описывают режимы, schema 2,
+inventory disposition и exit semantics; CI получает required
+`m9e-release-conformance` job (без inversion/`continue-on-error`; красный,
+пока пять дефектов не исправлены, и автоматически зелёный после) и
+отдельный `m9e-gate-negative-controls` job с mutation fixtures. Новых
+зависимостей нет; пять product/harness дефектов не менялись.

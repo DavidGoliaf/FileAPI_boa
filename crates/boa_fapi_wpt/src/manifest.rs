@@ -240,7 +240,7 @@ pub struct ManifestSource {
 /// Loaded manifest: source, files keyed by path (sorted), default timeout.
 #[derive(Debug, Clone)]
 pub struct Manifest {
-    schema_version: u32,
+    pub(crate) schema_version: u32,
     /// Pinned upstream source.
     pub source: ManifestSource,
     /// Corpus root relative to the manifest directory.
@@ -325,6 +325,10 @@ pub enum ManifestError {
     /// Duplicate test/subtest entry.
     #[error("duplicate expectation `{0} :: {1}`")]
     Duplicate(String, String),
+    /// Two manifest files claim the same `upstream_path` (a path has
+    /// exactly one primary disposition; the mapping must be a bijection).
+    #[error("duplicate upstream_path `{0}`")]
+    DuplicateUpstreamPath(String),
     /// Duplicate JSON object key (recursive: root, source, files, subtests).
     /// Only the key name is revealed, never the value or a path.
     #[error("duplicate JSON key `{0}`")]
@@ -691,7 +695,7 @@ impl<'a> JsonParser<'a> {
 }
 
 /// Returns `true` for lowercase hex strings of `len` bytes length.
-fn is_hex(text: &str, len: usize) -> bool {
+pub(crate) fn is_hex(text: &str, len: usize) -> bool {
     text.len() == len * 2
         && text
             .bytes()
@@ -1389,6 +1393,11 @@ pub fn resolve_expectations(
 /// the parent report here so totals cover every gate id. Only rows whose
 /// `upstream_path` matches the file and whose subtest starts with
 /// `DYNAMIC:` attach; file-level exclusions attach to no file.
+///
+/// M9E-R1: a `DYNAMIC:` row already present in the manifest (and therefore
+/// already in the execution result) is NOT synthesized again — that
+/// double-counted three audited rows in M9-E. The tracker path exists only
+/// for dynamic-title matrices that have no manifest subtest yet.
 #[must_use]
 pub fn tracker_subtests(
     file: &ManifestFile,
@@ -1400,6 +1409,13 @@ pub fn tracker_subtests(
             continue;
         }
         if !row.subtest.starts_with("DYNAMIC:") {
+            continue;
+        }
+        let already_in_manifest = file
+            .subtests
+            .iter()
+            .any(|s| s.test == row.test && s.subtest == row.subtest);
+        if already_in_manifest {
             continue;
         }
         out.push(crate::runner::SubtestResult {
@@ -1540,6 +1556,10 @@ fn load_manifest_inner(
     let mut files = Vec::new();
     let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
     let mut seen_paths: BTreeMap<String, ()> = BTreeMap::new();
+    // M9E-R1: one primary disposition per upstream path; two manifest files
+    // must never claim the same upstream file (bijection inventory ↔
+    // disposition). Cross-checked against expectations in `accounting`.
+    let mut seen_upstream: BTreeMap<String, ()> = BTreeMap::new();
     for file_json in files_json {
         let path = file_json
             .need("path")?
@@ -1663,6 +1683,9 @@ fn load_manifest_inner(
         }
         if seen_paths.insert(path.clone(), ()).is_some() {
             return Err(ManifestError::Duplicate(path.clone(), String::new()));
+        }
+        if seen_upstream.insert(upstream_path.clone(), ()).is_some() {
+            return Err(ManifestError::DuplicateUpstreamPath(upstream_path.clone()));
         }
         if !is_hex(&upstream_blob_sha, 20) {
             return Err(ManifestError::BadHex(

@@ -1,5 +1,13 @@
 # M9-E handoff — upstream-backed WPT conformance gate (M9-E-WPT-CONFORMANCE)
 
+> **SUPERSEDED (M9E-R1).** The strict-exit-0-with-recorded-FAIL reading
+> described below is superseded by
+> `docs/reviews/M9E-GATE-ACCOUNTING-REPORTING-handoff.md` (order
+> `M9E-GATE-ACCOUNTING-REPORTING-REMEDIATION`). `strict_pass` is removed,
+> `--strict` is non-zero while any release blocker remains, and the
+> duplicated `DYNAMIC:` rows plus the missing 79 file-level exclusions in
+> totals were remediated. This file stays historical.
+
 База: принятый M9-D head (`18ba66f`). Ветка: `task/m9e`.
 Upstream: `web-platform-tests/wpt` commit `0968c868d8095217d18d86b34c7f21dccae58768`.
 

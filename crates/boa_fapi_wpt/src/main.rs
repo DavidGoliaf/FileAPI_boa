@@ -15,7 +15,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use boa_fapi_wpt::manifest::{Manifest, ManifestError, load_manifest_for_mode};
+use boa_fapi_wpt::accounting::{self, AccountingError, ExitReason, RunMode};
+use boa_fapi_wpt::hash::sha256_hex;
+use boa_fapi_wpt::inventory::{Inventory, load_inventory};
+use boa_fapi_wpt::manifest::{Manifest, ManifestError, ManifestSource, load_manifest_for_mode};
 use boa_fapi_wpt::report;
 use boa_fapi_wpt::runner::{
     ActualStatus, FileResult, RunError, RunOptions, SubtestResult, run_file, scrub_detail,
@@ -28,6 +31,7 @@ struct Args {
     manifest: String,
     strict: bool,
     smoke: bool,
+    check_expectations: bool,
     expectations: Option<String>,
     upstream_root: Option<String>,
     threads: usize,
@@ -43,6 +47,7 @@ impl Args {
             manifest: String::new(),
             strict: false,
             smoke: false,
+            check_expectations: false,
             expectations: None,
             upstream_root: None,
             threads: 1,
@@ -60,6 +65,7 @@ impl Args {
                 }
                 "--strict" => args.strict = true,
                 "--smoke" => args.smoke = true,
+                "--check-expectations" => args.check_expectations = true,
                 "--expectations" => {
                     index += 1;
                     args.expectations = Some(
@@ -119,113 +125,48 @@ impl Args {
         if args.manifest.is_empty() {
             return Err("--manifest <path> is required".to_owned());
         }
-        // Mode rules (M9-E §2): `--smoke` is the offline developer path
-        // (schema 1 accepted, reported as ADAPTED_SMOKE); `--strict` is
-        // the normative gate and requires `--expectations` plus
-        // `--upstream-root`. The two modes are exclusive.
-        if args.smoke && args.strict {
-            return Err("--smoke cannot be combined with --strict".to_owned());
+        // Mode rules (M9-E §2, M9E-R1 §3.2): `--smoke` is the offline
+        // developer path (schema 1 accepted, reported as ADAPTED_SMOKE, no
+        // release terminology); `--strict` is the release gate and
+        // `--check-expectations` is the diagnostic observation mode. All
+        // three are mutually exclusive, and the two gate modes require
+        // `--expectations` plus `--upstream-root`.
+        let modes = [args.smoke, args.strict, args.check_expectations]
+            .into_iter()
+            .filter(|set| *set)
+            .count();
+        if modes > 1 {
+            return Err(
+                "--smoke, --strict and --check-expectations are mutually exclusive".to_owned(),
+            );
         }
-        if args.strict {
-            if args.expectations.is_none() {
-                return Err("--strict needs --expectations <path>".to_owned());
-            }
-            if args.upstream_root.is_none() {
-                return Err("--strict needs --upstream-root <dir>".to_owned());
-            }
+        if (args.strict || args.check_expectations) && args.expectations.is_none() {
+            return Err("--strict/--check-expectations need --expectations <path>".to_owned());
+        }
+        if (args.strict || args.check_expectations) && args.upstream_root.is_none() {
+            return Err("--strict/--check-expectations need --upstream-root <dir>".to_owned());
         }
         if args.smoke && (args.expectations.is_some() || args.upstream_root.is_some()) {
             return Err("--smoke takes no --expectations/--upstream-root".to_owned());
         }
         Ok(args)
     }
+
+    /// Gate mode token for this invocation (smoke otherwise).
+    fn mode(&self) -> RunMode {
+        if self.smoke {
+            RunMode::Smoke
+        } else if self.check_expectations {
+            RunMode::CheckExpectations
+        } else {
+            RunMode::Strict
+        }
+    }
 }
 
 /// Reads a file to string (checked-in manifest/corpus only).
 fn read_text(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|_| format!("cannot read `{path}`"))
-}
-
-/// Computes lowercase hex SHA-256 with a self-contained implementation
-/// (no new dependency: FIPS 180-4, single 512-bit block path + padding).
-fn sha256_hex(bytes: &[u8]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let bit_len = (bytes.len() as u64).wrapping_mul(8);
-    let mut padded = bytes.to_vec();
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-    for block in padded.chunks_exact(64) {
-        let mut w = [0_u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[4 * i],
-                block[4 * i + 1],
-                block[4 * i + 2],
-                block[4 * i + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-    let mut out = String::with_capacity(64);
-    for word in h {
-        out.push_str(&format!("{word:08x}"));
-    }
-    out
 }
 
 /// UTC date `YYYY-MM-DD` of today (review clock for `review_by`).
@@ -378,14 +319,7 @@ fn worker_main(argv: &[String]) -> i32 {
     match run_file(file, text, &options) {
         Ok(row) => {
             // Single-line worker report: compact JSON of the one FileResult.
-            let rows = std::slice::from_ref(&row);
-            let summary = report::summarize(
-                report::RunMode::Smoke,
-                rows,
-                &|_| file.provenance.token().to_owned(),
-                &|_, _| false,
-            );
-            let json = report::to_json(&manifest, rows, true, report::RunMode::Smoke, &summary);
+            let json = report::worker_json(&row);
             // Bound stdout: one line, corpus-capped length.
             let mut line = json;
             line.retain(|c| c != '\n' && c != '\r');
@@ -981,8 +915,7 @@ fn verify_upstream_tree_impl(
     manifest: &Manifest,
     upstream_root: &str,
     manifest_path: Option<&str>,
-) -> Result<(), String> {
-    use std::collections::{BTreeMap, BTreeSet};
+) -> Result<Inventory, String> {
     use std::path::Path;
     let root = Path::new(upstream_root);
     let canonical_root = root
@@ -1001,57 +934,21 @@ fn verify_upstream_tree_impl(
         None => std::fs::read_to_string("wpt-inventory.json")
             .map_err(|_| "cannot read wpt-inventory.json".to_owned())?,
     };
-    verify_upstream_tree_with_inventory(manifest, &canonical_root, &inventory_text)?;
-    let _ = (BTreeMap::<String, String>::new(), BTreeSet::<String>::new());
-    Ok(())
+    let inventory = load_inventory(&inventory_text, &manifest.source)
+        .map_err(|e| format!("inventory error: {e}"))?;
+    verify_upstream_tree_with_inventory(manifest, &canonical_root, &inventory)?;
+    Ok(inventory)
 }
 
-/// Pure inventory/tree comparison: parses `wpt-inventory.json`, checks the
-/// pinned source, enumerates `FileAPI/**` under the canonical root and
-/// compares hashes for every manifest `upstream_path`.
+/// Pure inventory/tree comparison: enumerates `FileAPI/**` under the
+/// canonical root and compares the set plus raw-content hashes against the
+/// parsed [`Inventory`].
 fn verify_upstream_tree_with_inventory(
     manifest: &Manifest,
     canonical_root: &std::path::Path,
-    inventory_text: &str,
+    inventory: &Inventory,
 ) -> Result<(), String> {
-    use boa_fapi_wpt::manifest::{Json, parse_json};
     use std::collections::{BTreeMap, BTreeSet};
-    let root = parse_json(inventory_text).map_err(|_| "bad wpt-inventory.json".to_owned())?;
-    let repository = root
-        .field("repository")
-        .and_then(Json::as_str)
-        .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
-    let commit = root
-        .field("commit")
-        .and_then(Json::as_str)
-        .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
-    if repository != manifest.source.repository || commit != manifest.source.commit {
-        return Err("inventory source mismatch".to_owned());
-    }
-    let entries = root
-        .field("files")
-        .and_then(Json::as_arr)
-        .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
-    let mut inventory: BTreeMap<String, String> = BTreeMap::new();
-    for entry in entries {
-        let path = entry
-            .field("path")
-            .and_then(Json::as_str)
-            .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
-        let sha256 = entry
-            .field("sha256")
-            .and_then(Json::as_str)
-            .ok_or_else(|| "bad wpt-inventory.json".to_owned())?;
-        if !path.starts_with("FileAPI/") || path.contains('\\') || sha256.len() != 64 {
-            return Err(format!("bad inventory entry `{path}`"));
-        }
-        if inventory
-            .insert(path.to_owned(), sha256.to_owned())
-            .is_some()
-        {
-            return Err(format!("duplicate inventory entry `{path}`"));
-        }
-    }
     // Case-collision guard: two inventory paths must not canonicalize to
     // one filesystem path (checked after enumeration below per actual
     // on-disk resolution).
@@ -1103,7 +1000,7 @@ fn verify_upstream_tree_with_inventory(
         }
     }
     let disk_set: BTreeSet<String> = on_disk.keys().cloned().collect();
-    let inv_set: BTreeSet<String> = inventory.keys().cloned().collect();
+    let inv_set: BTreeSet<String> = inventory.entries.iter().map(|e| e.path.clone()).collect();
     if disk_set != inv_set {
         let missing: Vec<&String> = inv_set.difference(&disk_set).collect();
         let extra: Vec<&String> = disk_set.difference(&inv_set).collect();
@@ -1117,10 +1014,10 @@ fn verify_upstream_tree_with_inventory(
     }
     // Raw-content evidence for every manifest upstream file.
     for file in &manifest.files {
-        let Some(expected) = inventory.get(&file.upstream_path) else {
+        let Some(entry) = inventory.get(&file.upstream_path) else {
             return Err(format!("upstream file missing `{}`", file.upstream_path));
         };
-        if expected != &file.upstream_sha256 {
+        if entry.sha256 != file.upstream_sha256 {
             return Err(format!("upstream hash drift for `{}`", file.upstream_path));
         }
         let candidate = canonical_root.join(&file.upstream_path);
@@ -1137,29 +1034,108 @@ fn verify_upstream_tree_with_inventory(
     Ok(())
 }
 
-/// Runs the strict gate and optionally writes reports.
+/// Gate inputs verified before any file executes.
+struct GateInputs {
+    inventory: Inventory,
+    expectations: Vec<boa_fapi_wpt::manifest::ExpectationRow>,
+}
+
+/// A CLI failure with its distinct JSON exit reason (M9E-R1 §3.2).
+struct CliFailure {
+    reason: ExitReason,
+    message: String,
+}
+
+impl CliFailure {
+    fn new(reason: ExitReason, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<AccountingError> for CliFailure {
+    fn from(error: AccountingError) -> Self {
+        Self {
+            reason: error.reason(),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Emits a minimal failure JSON (when `--json` was requested) plus the
+/// stderr message; the JSON keeps the distinct `exit_reason` class.
+fn emit_failure(args: &Args, mode: RunMode, failure: &CliFailure, source: Option<&ManifestSource>) {
+    if let Some(path) = args.json.as_ref() {
+        let json = report::failure_json(mode, failure.reason, source, &failure.message);
+        let _ = std::fs::write(path, json);
+    }
+    eprintln!("boa_fapi_wpt: {}", failure.message);
+}
+
+/// Verifies gate inputs (inventory + expectations) before execution.
+fn prepare_gate_inputs(
+    args: &Args,
+    manifest: &Manifest,
+    today: &str,
+) -> Result<GateInputs, CliFailure> {
+    let upstream_root = args.upstream_root.as_deref().ok_or_else(|| {
+        CliFailure::new(ExitReason::Integrity, "--upstream-root <dir> is required")
+    })?;
+    let expectations_path = args.expectations.as_deref().ok_or_else(|| {
+        CliFailure::new(ExitReason::Integrity, "--expectations <path> is required")
+    })?;
+    let inventory =
+        verify_upstream_tree_impl(manifest, upstream_root, Some(args.manifest.as_str()))
+            .map_err(|message| CliFailure::new(ExitReason::Integrity, message))?;
+    let expectations_text = read_text(expectations_path)
+        .map_err(|message| CliFailure::new(ExitReason::Integrity, message))?;
+    let rows =
+        boa_fapi_wpt::manifest::load_expectations(&expectations_text, today, &manifest.source)
+            .map_err(|error| {
+                CliFailure::new(
+                    ExitReason::ExpectationDrift,
+                    format!("expectations error: {error}"),
+                )
+            })?;
+    boa_fapi_wpt::manifest::resolve_expectations(manifest, &rows).map_err(|error| {
+        CliFailure::new(
+            ExitReason::ExpectationDrift,
+            format!("expectations error: {error}"),
+        )
+    })?;
+    Ok(GateInputs {
+        inventory,
+        expectations: rows,
+    })
+}
+
+/// Runs the requested mode and optionally writes reports.
 fn run(argv: &[String]) -> Result<i32, String> {
     let args = Args::parse(argv)?;
-    // Filter is diagnostic-only: combining it with --strict would let the
+    let mode = args.mode();
+    let strict_effective = args.strict || args.check_expectations;
+    // Filter is diagnostic-only: combining it with a gate would let the
     // gate pass on a subset while excluded files fail. Reject upfront.
-    if args.strict && args.filter.is_some() {
-        return Err("--filter cannot be combined with --strict".to_owned());
+    if strict_effective && args.filter.is_some() {
+        return Err("--filter cannot be combined with --strict/--check-expectations".to_owned());
     }
     if args.smoke && args.filter.is_some() {
         return Err("--filter cannot be combined with --smoke".to_owned());
     }
     let manifest_text = read_text(&args.manifest)?;
     let today = today_utc();
-    let manifest = load_manifest_for_mode(&manifest_text, &today, args.strict)
+    let manifest = load_manifest_for_mode(&manifest_text, &today, strict_effective)
         .map_err(|e| format_manifest_error(&e))?;
     // Mode/schema agreement (M9-E §2): smoke accepts schema 1 (legacy
     // adapted manifest) or schema 2 (runs the same corpus, still labelled
-    // ADAPTED_SMOKE); strict requires schema 2 plus inventory and
+    // ADAPTED_SMOKE); a gate mode requires schema 2 plus inventory and
     // expectations.
     if args.smoke && manifest.schema_version() < boa_fapi_wpt::manifest::MIN_SMOKE_SCHEMA_VERSION {
         return Err("smoke needs manifest schema >= 1".to_owned());
     }
-    if args.strict && manifest.schema_version() != boa_fapi_wpt::manifest::SCHEMA_VERSION {
+    if strict_effective && manifest.schema_version() != boa_fapi_wpt::manifest::SCHEMA_VERSION {
         return Err("strict needs manifest schema_version 2".to_owned());
     }
     if args.threads == 0 {
@@ -1174,23 +1150,16 @@ fn run(argv: &[String]) -> Result<i32, String> {
     // Hash/path validation first: every CLI path (sequential and
     // parallel) reuses the same validated texts.
     let texts = verify_hashes(&args.manifest, &manifest)?;
-    // Strict-only gate inputs (M9-E §3/§4): inventory + expectations are
-    // verified before any file executes.
-    let expectations = if args.strict {
-        let Some(upstream_root) = args.upstream_root.clone() else {
-            return Err("--strict needs --upstream-root <dir>".to_owned());
-        };
-        let Some(expectations_path) = args.expectations.clone() else {
-            return Err("--strict needs --expectations <path>".to_owned());
-        };
-        verify_upstream_tree_impl(&manifest, &upstream_root, Some(args.manifest.as_str()))?;
-        let expectations_text = read_text(&expectations_path)?;
-        let rows =
-            boa_fapi_wpt::manifest::load_expectations(&expectations_text, &today, &manifest.source)
-                .map_err(|e| format!("expectations error: {e}"))?;
-        boa_fapi_wpt::manifest::resolve_expectations(&manifest, &rows)
-            .map_err(|e| format!("expectations error: {e}"))?;
-        Some(rows)
+    // Gate inputs (M9-E §3/§4): inventory + expectations are verified
+    // before any file executes. Failures keep a distinct JSON reason.
+    let gate = if strict_effective {
+        match prepare_gate_inputs(&args, &manifest, &today) {
+            Ok(gate) => Some(gate),
+            Err(failure) => {
+                emit_failure(&args, mode, &failure, Some(&manifest.source));
+                return Ok(failure.reason.exit_code());
+            }
+        }
     } else {
         None
     };
@@ -1205,18 +1174,12 @@ fn run(argv: &[String]) -> Result<i32, String> {
     if files.is_empty() {
         return Err("filter matched no manifest files".to_owned());
     }
-    // Tracker rows (`DYNAMIC: ...` NOTRUN exclusions) attach to their
-    // manifest file here so reports and totals cover every gate id. The
-    // worker never executes them; smoke mode (no expectations file) skips
-    // this step and reports executable rows only.
-    //
-    // File-level exclusion rows (non-`.any.js` inventory files, no manifest
-    // entry by design) are NOT attached per file: they have no executing
-    // file to belong to. They are reported as a synthetic summary section
-    // below (`exclusions` already counts only executed NOTRUN rows; the
-    // JSON `files` array keeps exactly the manifest files in order, so
-    // threads 1/2 stay byte-identical).
-    if let Some(rows) = expectations.as_ref() {
+    if let Some(gate) = gate.as_ref() {
+        // Tracker rows (`DYNAMIC: ...` NOTRUN exclusions) attach to their
+        // manifest file here so totals cover every gate id. A tracker id
+        // already present in the manifest/result is never synthesized
+        // twice (M9E-R1 §4.2.3). File-level exclusion rows are represented
+        // separately by the canonical model, not per file.
         for file in files.iter_mut() {
             let Some(manifest_file) = manifest.files.iter().find(|f| f.path == file.path) else {
                 continue;
@@ -1224,38 +1187,38 @@ fn run(argv: &[String]) -> Result<i32, String> {
             file.subtests
                 .extend(boa_fapi_wpt::manifest::tracker_subtests(
                     manifest_file,
-                    rows,
+                    &gate.expectations,
                 ));
         }
     }
-    let mode = if args.smoke {
-        report::RunMode::Smoke
-    } else {
-        report::RunMode::Strict
+    // One canonical model is the single source for JSON, JUnit, console and
+    // the exit code (M9E-R1 §5).
+    let run = match gate {
+        Some(gate) => match accounting::build_gate_run(
+            mode,
+            &manifest,
+            &gate.inventory,
+            &gate.expectations,
+            files,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                let failure = CliFailure::from(error);
+                emit_failure(&args, mode, &failure, Some(&manifest.source));
+                return Ok(failure.reason.exit_code());
+            }
+        },
+        None => match accounting::build_smoke_run(&manifest, files) {
+            Ok(run) => run,
+            Err(error) => {
+                let failure = CliFailure::from(error);
+                emit_failure(&args, mode, &failure, Some(&manifest.source));
+                return Ok(failure.reason.exit_code());
+            }
+        },
     };
-    let provenance_of = |path: &str| -> String {
-        manifest
-            .files
-            .iter()
-            .find(|f| f.path == path)
-            .map(|f| f.provenance.token().to_owned())
-            .unwrap_or_else(|| "adapted".to_owned())
-    };
-    let acceptance = |test: &str, subtest: &str| {
-        manifest
-            .files
-            .iter()
-            .flat_map(|f| &f.subtests)
-            .find(|s| s.test == test && s.subtest == subtest)
-            .is_some_and(|s| {
-                s.classification == boa_fapi_wpt::manifest::Classification::ProjectAcceptance
-            })
-    };
-    let summary = report::summarize(mode, &files, &provenance_of, &acceptance);
-    let strict_ok = report::strict_pass(&files);
-    let release_ok = report::release_green(&files);
-    let json = report::to_json(&manifest, &files, strict_ok, mode, &summary);
-    let junit = report::to_junit(&manifest, &files);
+    let json = report::to_json(&run);
+    let junit = report::to_junit(&run);
     if let Some(path) = args.json.as_ref() {
         std::fs::write(path, json).map_err(|_| format!("cannot write `{path}`"))?;
     } else {
@@ -1264,45 +1227,28 @@ fn run(argv: &[String]) -> Result<i32, String> {
     if let Some(path) = args.junit.as_ref() {
         std::fs::write(path, junit).map_err(|_| format!("cannot write `{path}`"))?;
     }
-    print_summary(mode, &summary, files.len());
-    if args.strict && !strict_ok {
-        return Err("strict gate failed".to_owned());
-    }
-    if args.strict && !release_ok {
-        // Recorded open defects satisfy the strict comparison
-        // (`strict_pass: true`, exit 0 — the gate DID verify every row)
-        // but keep the release gate red: M9-F must not ship with known
-        // FAIL. Stderr note, never stdout (reports stay deterministic).
+    println!("{}", report::summary_line(&run));
+    if mode == RunMode::Strict && !run.release_green {
+        // Recorded open defects satisfy `expectations_match` but keep the
+        // release gate red: M9-F must not ship with known FAIL. Stderr
+        // note only — reports stay deterministic.
         eprintln!(
-            "boa_fapi_wpt: note: {} open defect(s) recorded (expected FAIL); release gate stays red",
-            summary.defects
+            "boa_fapi_wpt: note: release gate red: {} defect(s), {} timeout(s), {} unexpected, {} drift",
+            run.release_blockers.defects,
+            run.release_blockers.timeouts,
+            run.release_blockers.unexpected,
+            run.release_blockers.expectation_drift
         );
     }
-    let _ = expectations;
-    Ok(0)
+    if run.success() {
+        Ok(0)
+    } else {
+        Ok(run.exit_reason.exit_code())
+    }
 }
 
 fn format_manifest_error(error: &ManifestError) -> String {
     format!("manifest error: {error}")
-}
-
-/// Prints the stable human summary (counts only, no secrets/paths detail).
-///
-/// Smoke mode prints the `ADAPTED_SMOKE` label; strict mode prints the
-/// `WPT_STRICT` label with the upstream/smoke/defects/exclusions split
-/// (M9-E §2): adapted smoke PASS is never reported as WPT conformance,
-/// and open defects (expected FAIL) are never merged into PASS.
-fn print_summary(mode: report::RunMode, summary: &report::Summary, files: usize) {
-    println!(
-        "{}: {} upstream passed, {} smoke passed, {} defects, {} exclusions, {} unexpected ({} files)",
-        mode.token(),
-        summary.upstream_pass,
-        summary.smoke_pass,
-        summary.defects,
-        summary.exclusions,
-        summary.unexpected,
-        files
-    );
 }
 
 fn main() {
@@ -1352,7 +1298,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, read_pipe, sha256_hex};
+    use super::{Args, read_pipe};
     use std::io::Cursor;
 
     #[test]
@@ -1438,6 +1384,27 @@ mod tests {
             "--strict".to_owned(),
         ];
         assert!(Args::parse(&strict_only).is_err());
+        // Check-expectations without gate inputs is rejected.
+        let check_only = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--check-expectations".to_owned(),
+        ];
+        assert!(Args::parse(&check_only).is_err());
+        // Strict + check-expectations are exclusive.
+        let strict_check = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+            "--strict".to_owned(),
+            "--check-expectations".to_owned(),
+            "--expectations".to_owned(),
+            "expectations.json".to_owned(),
+            "--upstream-root".to_owned(),
+            "wpt-checkout".to_owned(),
+        ];
+        assert!(Args::parse(&strict_check).is_err());
         // Smoke with gate inputs is rejected.
         let smoke_gate = vec![
             "boa_fapi_wpt".to_owned(),
@@ -1448,6 +1415,30 @@ mod tests {
             "expectations.json".to_owned(),
         ];
         assert!(Args::parse(&smoke_gate).is_err());
+    }
+
+    #[test]
+    fn cli_parser_accepts_check_expectations_mode() {
+        let argv = [
+            "boa_fapi_wpt",
+            "--manifest",
+            "wpt-manifest.json",
+            "--expectations",
+            "expectations.json",
+            "--upstream-root",
+            "wpt-checkout",
+            "--check-expectations",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let parsed = Args::parse(&argv);
+        assert!(parsed.is_ok());
+        if let Ok(parsed) = parsed {
+            assert!(parsed.check_expectations);
+            assert!(!parsed.strict);
+            assert_eq!(parsed.mode().token(), "WPT_CHECK_EXPECTATIONS");
+        }
     }
 
     #[test]
@@ -1469,17 +1460,5 @@ mod tests {
             "--unknown".to_owned(),
         ];
         assert!(Args::parse(&unknown_flag).is_err());
-    }
-
-    #[test]
-    fn sha256_helper_matches_standard_vectors() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 }
