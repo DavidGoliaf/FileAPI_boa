@@ -137,19 +137,18 @@ JSON byte-identical (`target/wpt-observation.json` ==
    review date). Число `excluded = 79` согласовано с §5 заказа;
    metadata-only путь без exclusion сейчас отсутствует, поэтому
    `unsupported-artifact == 0`.
-3. Внешние CI jobs прогнаны на ветке. Run
-   `https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34756831855`
-   (commit `1d225b7`): `M8 validation (ubuntu-latest|windows-latest|
+3. Внешние CI jobs прогнаны на ветке. Итоговый run
+   `https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34760217649`
+   (commit `d6591e5`): `M8 validation (ubuntu-latest|windows-latest|
    macos-14)` — success, `M9E gate negative controls (ubuntu-latest|
    windows-latest)` — success, `M9E release conformance (strict gate)` —
    failure по `exit_reason=release_defects` (5 defects, 0 unexpected,
    0 timeout, 0 drift; полный summary в логе шага). Это ожидаемое
    состояние §6.6: mechanics/tests/negative controls зелёные, release job
    честно красный ровно из-за перечисленных пяти product/harness дефектов.
-   Первый прогон на `905eee4` дал единственный flake —
-   `gate_remediation::r1_03` (threads-2 worker wall deadline 5s на
-   загруженном macOS runner); исправлено `1d225b7` (fixture default
-   timeout 60s), повторный прогон полностью зелёный кроме release job.
+   Предыдущий run `34756831855` (`1d225b7`) отличался только macOS flake
+   `gate_remediation::r1_03` (threads-2 worker wall deadline 5s), он
+   исправлен (`1d225b7`: fixture default timeout 60s).
 
 ## 6. DECISIONS
 
