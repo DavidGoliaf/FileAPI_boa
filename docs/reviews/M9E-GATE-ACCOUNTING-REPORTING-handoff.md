@@ -149,6 +149,15 @@ JSON byte-identical (`target/wpt-observation.json` ==
    Предыдущий run `34756831855` (`1d225b7`) отличался только macOS flake
    `gate_remediation::r1_03` (threads-2 worker wall deadline 5s), он
    исправлен (`1d225b7`: fixture default timeout 60s).
+4. Осознанно НЕ сделано (обсуждено, решение за ревьюером): вынос release
+   gate в отдельный workflow, чтобы основной `CI`-workflow был полностью
+   зелёным, а release-статус оставался отдельным красным сигналом.
+   Текущая реализация оставлена буквально по §6.3/§6.6: required
+   release job обязан быть красным, пока открыты пять product/harness
+   дефектов; маскировка (`continue-on-error`/инверсия exit code)
+   запрещена и не применялась. Полностью зелёный pipeline возможен только
+   после устранения пяти дефектов отдельными заказами (в этом заказе §8
+   их правка запрещена).
 
 ## 6. DECISIONS
 
