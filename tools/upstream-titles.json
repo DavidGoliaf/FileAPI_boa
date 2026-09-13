@@ -2264,16 +2264,13 @@
      "subtest": "no-argument FileReader constructor",
      "trace": "M9E-WPT-02"
     },
-    {
-     "capability": "filereader",
-     "classification": "supported",
-     "issue": "docs/reviews/M9E-handoff.md",
-     "reason": "hand-audited: upstream requires sync abort dispatch (handler runs before abort() returns) but the M9-C executor protocol queues the abort terminal through poll_io/run_jobs; product settles to the same DONE state asynchronously",
-     "spec_section": "FileAPI WD FileReader",
-     "status": "FAIL",
-     "subtest": "FileReader States -- abort",
-     "trace": "M9E-WPT-02"
-    },
+     {
+      "capability": "filereader",
+      "classification": "supported",
+      "spec_section": "FileAPI WD FileReader",
+      "subtest": "FileReader States -- abort",
+      "trace": "M9E-WPT-02"
+     },
     {
      "classification": "supported",
      "spec_section": "FileAPI WD FileReader",
@@ -2443,18 +2440,13 @@
      "subtest": "Aborting before read",
      "trace": "M9E-WPT-02"
     },
-    {
-     "capability": "filereader",
-     "classification": "supported",
-     "issue": "docs/reviews/M9E-handoff.md §3 (sync-abort double-pair: test's own .then() re-arms wait_for + re-aborts; needs upstream EventWatcher queue semantics, product dispatches exactly one pair per TZ §7.3)",
-     "owner": "m9e",
-     "reason": "open defect: second abort() inside the test's own .then() continuation dispatches a phantom second abort/loadend pair (2 events observed, 1 expected); product emits exactly one pair per abort() per TZ §7.3",
-     "review_by": "2027-09-08",
-     "spec_section": "FileAPI WD FileReader",
-     "status": "FAIL",
-     "subtest": "Aborting after read",
-     "trace": "M9E-WPT-02"
-    },
+     {
+      "capability": "filereader",
+      "classification": "supported",
+      "spec_section": "FileAPI WD FileReader",
+      "subtest": "Aborting after read",
+      "trace": "M9E-WPT-02"
+     },
     {
      "classification": "supported",
      "spec_section": "FileAPI WD FileReader",
@@ -2528,26 +2520,20 @@
      "subtest": "readAsDataURL result for Blob with specified MIME type",
      "trace": "M9E-WPT-02"
     },
-    {
-     "capability": "filereader",
-     "classification": "supported",
-     "issue": "docs/reviews/M9E-handoff.md",
-     "reason": "hand-audited: upstream expects data:application/octet-stream;base64,... for empty-type Blobs but the crate contract (M4, pinned by m4_filereader_async/m4_filereader_sync suites) emits data:;base64,... verbatim",
-     "spec_section": "FileAPI WD reading",
-     "status": "FAIL",
-     "subtest": "readAsDataURL result for Blob with unspecified MIME type",
-     "trace": "M9E-WPT-02"
-    },
-    {
-     "capability": "filereader",
-     "classification": "supported",
-     "issue": "docs/reviews/M9E-handoff.md",
-     "reason": "hand-audited: same empty-type data-URL contract as above (empty Blob reads data:;base64,)",
-     "spec_section": "FileAPI WD reading",
-     "status": "FAIL",
-     "subtest": "readAsDataURL result for empty Blob",
-     "trace": "M9E-WPT-02"
-    }
+     {
+      "capability": "filereader",
+      "classification": "supported",
+      "spec_section": "FileAPI WD reading",
+      "subtest": "readAsDataURL result for Blob with unspecified MIME type",
+      "trace": "M9E-WPT-02"
+     },
+     {
+      "capability": "filereader",
+      "classification": "supported",
+      "spec_section": "FileAPI WD reading",
+      "subtest": "readAsDataURL result for empty Blob",
+      "trace": "M9E-WPT-02"
+     }
    ]
   },
  "FileAPI/reading-data-section/filereader_readAsText.any.js": {

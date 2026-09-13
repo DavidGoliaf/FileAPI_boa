@@ -244,7 +244,7 @@ errors or documented FAIL rows.
 ## Expectations and capability accounting (`expectations.json`)
 
 496 exact rows (schema 1, same pinned repository/commit as the manifest):
-374 `PASS`/`supported`, 5 `FAIL`/`supported` (open defects, see below), 6
+379 `PASS`/`supported`, 0 `FAIL` (no open defects), 6
 `PASS`/`project-acceptance` (FileList fixture, never WPT), 111
 `NOTRUN`/`unsupported-host-capability`. Every relevant upstream
 test/subtest has one row with `upstream_path`, test/subtest id, expected
@@ -263,35 +263,13 @@ Capability allow-list (never `browser-only`):
 capabilities (`blob-constructor`, `blob-slice`, `promise-reads`,
 `file-constructor`, `filereader`, `filelist`, `blob-url`).
 
-Open defects (5, all `supported`/`FAIL`, release-red):
-
-1. `filereader_abort.any.js :: Aborting after read` (capability
-   `filereader`, issue `docs/reviews/M9E-handoff.md §3`): the test's own
-   `.then()` continuation re-arms `wait_for(['abort','loadend'])` and
-   calls `abort()` a second time after the sync dispatch already
-   delivered the pair; the harness observes a phantom second pair
-   (`2 !== 1`). The product dispatches exactly one `abort`+`loadend`
-   pair per `abort()` (TZ §7.3); fixing the double-delivery observation
-   needs upstream EventWatcher queue semantics.
-2. `fileReader.any.js :: FileReader States -- abort`: upstream requires
-   the `abort` handler to run before `abort()` returns (sync dispatch),
-   but the M9-C executor protocol queues the abort terminal through
-   `poll_io`/`run_jobs`, so the `unreached_func` reassignment lands
-   first. Same terminal state, different delivery turn; no product
-   change in M9-E.
-3. `filereader_readAsDataURL.any.js :: readAsDataURL result for Blob
-   with unspecified MIME type` and `:: readAsDataURL result for empty
-   Blob`: upstream expects `data:application/octet-stream;base64,...`
-   for empty-type Blobs, but the crate contract (M4, pinned by the
-   `m4_filereader_async`/`m4_filereader_sync` data-URL suites) emits the
-   type verbatim (`data:;base64,...`).
-4. `File-constructor.any.js :: No replacement when using special
-   character in fileName`: upstream expects `dummy/foo` verbatim, but
-   the normative File API replaces every `/` with `:` and the crate
-   (M2 `normalize_file_name`) emits `dummy:foo`.
-
-Recorded as open defects — strict comparison accepts the actual FAILs,
-the release gate stays red.
+Open defects: 0. The five M9-E defects were remediated by the M9-R1
+defect orders (see `docs/reviews/M9F-WPT-DEFECT-REMEDIATION-handoff.md`):
+sync `abort()` dispatch (WD §6.2.3.5), a runner task/microtask boundary
+after `loadstart` (`filereader_abort` "Aborting after read"),
+`application/octet-stream` for empty-type `readAsDataURL`, and verbatim
+`File.name` (WD §4.1 step 4.4). The release gate is green
+(`defects == 0`, `upstream_pass == 379`).
 
 ## Adaptation fidelity (`.any.js` direct)
 
@@ -418,30 +396,26 @@ and the exit code; no serializer recomputes totals (M9E-R1 §5).
 Example (truncated; canonical schema 2):
 
 ```json
-{"schema_version":2,"mode":"WPT_STRICT","source":{"repository":"https://github.com/web-platform-tests/wpt","commit":"0968c868…","license":"BSD-3-Clause"},"expectations_match":true,"release_green":false,"release_blockers":{"defects":5,"timeouts":0,"unexpected":0,"expectation_drift":0,"not_a_release_mode":0},"exit_reason":"release_defects","inventory":{"total":115,"executed_direct":36,"executed_adapted":0,"excluded":79,"unaccounted":0},"results":{"total":496,"unique":496,"upstream_pass":374,"smoke_pass":6,"defects":5,"notrun":111,"unexpected":0},"files":[{"path":"corpus/blob-slice.js","upstream_path":"FileAPI/blob/Blob-slice.any.js","group":"FileAPI/blob","subtests":[{"test":"Blob-slice.any.js","subtest":"no-argument Blob slice","actual":"PASS","expected":"PASS","trace":"M9E-WPT-02","detail":""}]}],"exclusions":[{"path":"FileAPI/Blob-methods-from-detached-frame.html","test":"Blob-methods-from-detached-frame.html","capability":"navigation","reason":"requires navigation; no JS-only subtest surface in this harness","owner":"m9e","issue":"QUESTIONS.md Q1-Q3","review_by":"2027-09-08","trace":"M9E-WPT-03"}]}
+{"schema_version":2,"mode":"WPT_STRICT","source":{"repository":"https://github.com/web-platform-tests/wpt","commit":"0968c868…","license":"BSD-3-Clause"},"expectations_match":true,"release_green":true,"release_blockers":{"defects":0,"timeouts":0,"unexpected":0,"expectation_drift":0,"not_a_release_mode":0},"exit_reason":"ok","inventory":{"total":115,"executed_direct":36,"executed_adapted":0,"excluded":79,"unaccounted":0},"results":{"total":496,"unique":496,"upstream_pass":379,"smoke_pass":6,"defects":0,"notrun":111,"unexpected":0},"files":[{"path":"corpus/blob-slice.js","upstream_path":"FileAPI/blob/Blob-slice.any.js","group":"FileAPI/blob","subtests":[{"test":"Blob-slice.any.js","subtest":"no-argument Blob slice","actual":"PASS","expected":"PASS","trace":"M9E-WPT-02","detail":""}]}],"exclusions":[{"path":"FileAPI/Blob-methods-from-detached-frame.html","test":"Blob-methods-from-detached-frame.html","capability":"navigation","reason":"requires navigation; no JS-only subtest surface in this harness","owner":"m9e","issue":"QUESTIONS.md Q1-Q3","review_by":"2027-09-08","trace":"M9E-WPT-03"}]}
 ```
 
 ## Limitations
 
 - Conformance is claimed for the 36 directly executed upstream `.any.js`
-  files (417 executable subtests: 374 upstream PASS, 5 recorded open
-  defects, 32 executed NOTRUN) plus 79 file-level inventory exclusions
-  (exact `NOTRUN` rows in `expectations.json`, visible in the canonical
-  report); the rest of `FileAPI/**` needs browser capabilities out of
-  scope (Fetch, navigation incl. WHATWG URL parsing, workers, WPT server).
-  Canonical totals: `496/496` rows (`374` upstream PASS, `6` smoke PASS,
-  `5` defects, `111` NOTRUN, `0` unexpected).
+  files (417 executable subtests: 379 upstream PASS, 0 open defects, 32
+  executed NOTRUN) plus 79 file-level inventory exclusions (exact `NOTRUN`
+  rows in `expectations.json`, visible in the canonical report); the rest
+  of `FileAPI/**` needs browser capabilities out of scope (Fetch,
+  navigation incl. WHATWG URL parsing, workers, WPT server).
+  Canonical totals: `496/496` rows (`379` upstream PASS, `6` smoke PASS,
+  `0` defects, `111` NOTRUN, `0` unexpected).
 - Every CLI file execution is an isolated worker with a wall deadline and
   kill boundary. `N = 1` runs workers sequentially; `N > 1` schedules them
   concurrently, with manifest-order output (byte-identical JSON for the
   same manifest).
 - Wall-clock appears only as the CLI process-boundary deadline and the
   internal pump guard; reports carry no timing comparisons.
-- Known open defects (5, release-red): the `filereader_abort` phantom
-  second pair, the `fileReader.any.js` sync-abort delivery turn, the two
-  empty-type `readAsDataURL` rows, and the `File` slash row (see
-  Expectations above and `docs/spec-delta.md`). `expectations_match`
-  accepts the recorded FAILs; `release_green` stays red and `--strict`
-  exits non-zero until they are fixed. The CI release job
-  (`m9e-release-conformance`) is correspondingly red without any workflow
-  change, and turns green automatically once all five are fixed.
+- Open defects: 0. `expectations_match == release_green == true` and
+  `--strict` exits `0`; the CI release job (`m9e-release-conformance`) is
+  green. See `docs/spec-delta.md` and
+  `docs/reviews/M9F-WPT-DEFECT-REMEDIATION-handoff.md`.

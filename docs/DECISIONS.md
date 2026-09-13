@@ -1256,3 +1256,66 @@ inventory disposition и exit semantics; CI получает required
 пока пять дефектов не исправлены, и автоматически зелёный после) и
 отдельный `m9e-gate-negative-controls` job с mutation fixtures. Новых
 зависимостей нет; пять product/harness дефектов не менялись.
+
+## ADR-0048 (M9-R1 defect order): File.name сохраняется verbatim
+
+Контекст: pinned `File-constructor.any.js` ("No replacement when using
+special character in fileName") ожидает `new File([], 'dummy/foo').name
+=== 'dummy/foo'`, а WD §4.1 шаг 4.4 устанавливает `F.name = n` без
+нормализации. Старый `normalize_file_name` заменял `/` на `:` (устаревшее
+требование), из-за чего crate расходился и со спекой, и с upstream.
+
+Решение: `normalize_file_name` — identity (только USVString-семантика
+вызова); JS-конструктор и host-импорт хранят имя verbatim. M2/M5/M6/
+appendix-A ожидания обновлены (`a/b`, `/leading`, `host/path.txt`).
+Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
+
+## ADR-0049 (M9-R1 defect order): синхронный FileReader.abort()
+
+Контекст: WD §6.2.3.5 шаги 5–6 предписывают `abort()` синхронно
+диспатчить `abort` (и условный `loadend`) до возврата; pinned
+`fileReader.any.js` ("FileReader States -- abort") проверяет, что handler
+успевает выполниться до переназначения `onabort`. Продукт ставил
+терминал в очередь через `poll_io`/`run_jobs`, поэтому событие приходило
+позже.
+
+Решение: `abort()` вызывает `dispatch_terminal_now` — синхронный
+диспатч `abort`+`loadend` на вызывающем стеке; условный `loadend`
+подавляется при reentrant-замене generation. Асинхронный pump-путь
+`load`/`error` по-прежнему использует `run_dispatch`; вариант
+`TerminalKind::Abort` удалён. M4-pure-model, M9-C abort-тесты и
+M8-observability лог обновлены под новый порядок.
+Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
+
+## ADR-0050 (M9-R1 defect order): task/microtask boundary после loadstart
+
+Контекст: `filereader_abort.any.js` "Aborting after read" в
+`.then()`-продолжении после `wait_for('loadstart')` читает
+`readyState === LOADING`; раннер завершал весь read (включая `load`/
+`loadend`) в том же job, где диспатчился `loadstart`, поэтому continuation
+видел `DONE`.
+
+Решение: `run_pump` после первого `loadstart` переоткладывает уже
+дренированный chunk в следующий job (`JobStep::PumpChunk`) и
+возвращается; promise-реакции, поставленные в очередь во время
+`loadstart`, выполняются раньше применения чанка — браузерная граница
+task/microtask. Порядок событий `loadstart|progress|load|loadend`
+сохраняется; продукт по-прежнему отдаёт ровно одну пару `abort`+`loadend`
+на `abort()`.
+Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
+
+## ADR-0051 (M9-R1 defect order): readAsDataURL пустого типа → octet-stream
+
+Контекст: pinned `filereader_readAsDataURL.any.js` ожидает
+`data:application/octet-stream;base64,...` для Blob с пустым type (две
+строки); crate паковал `data:;base64,...`. WD §6.3 текст
+(«otherwise return a Data URL without a media-type») неоднозначен
+(issue #104); upstream WPT — конформанс-цель гейта, и браузеры отдают
+`application/octet-stream`.
+
+Решение (change-control): `package_data_url`/`data_url_len` рендерят
+пустой media type как `application/octet-stream`; M4 async/sync
+packaging-тесты обновлены. Это осознанное следование pinned upstream
+поверх нечёткого текста WD.
+Последствия: trace `M9E-WPT-02`; два дефекта закрыты, `upstream_pass` +2;
+`release_green` становится `true` (0 defects).

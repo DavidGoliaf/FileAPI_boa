@@ -85,46 +85,36 @@ differences. No new normative requirement is introduced by M7.
 
 ## M9-E direct-run findings (36 upstream files, 417 executable subtests)
 
+All five M9-E open defects were remediated by the M9-R1 defect orders, so
+the direct-run set is now green: `release_green == true`, `defects == 0`,
+`upstream_pass == 379` (canonical `results.total == 496`, inventory
+`115/115`).
+
 - Sync `abort()` dispatches `abort`+`loadend` back-to-back on the calling
-  stack (TZ §7.3). Pinned `fileReader.any.js` ("FileReader States --
-  abort") asserts exactly this (handler runs before `abort()` returns);
-  the pre-existing M4/M9-C suites pin it
-  (`abort_before_first_job_emits_only_abort_loadend`,
-  `loadstart_abort_then_restart_emits_only_new_operation`). The M9-E gate
-  does NOT re-verify this path through `fileReader.any.js`: that upstream
-  row is a recorded open defect (see below) because the M9-C executor
-  protocol queues the abort terminal through `poll_io`/`run_jobs` and the
-  `unreached_func` reassignment lands first. No product change in M9-E;
-  the defect is harness-observable only.
+  stack (WD §6.2.3.5 steps 5–6). Pinned `fileReader.any.js` ("FileReader
+  States -- abort") asserts exactly this (handler runs before `abort()`
+  returns); the product now dispatches synchronously in `abort()`
+  (`dispatch_terminal_now`) instead of queueing the terminal through
+  `poll_io`/`run_jobs`. M4/M9-C/M8 expectations updated.
+- `filereader_abort.any.js` "Aborting after read": the runner now yields a
+  task/microtask boundary between the `loadstart` dispatch and the first
+  chunk application, so the test's `.then()` continuation observes
+  `LOADING` before the read completes; the product still emits exactly one
+  `abort`+`loadend` pair per `abort()` (TZ §7.3).
 - `filereader_result` "result is null during loadstart/progress" holds by
   construction: packaging publishes only at EOF (`finish_at_eof`), so
   every non-terminal continuation observes null. The 8 `progress`-matrix
   rows that need browser microtask interleaving between dispatch and
-  packaging are exact `worker-runtime` NOTRUN exclusions, not failures.
+  packaging remain exact `worker-runtime` NOTRUN exclusions.
 - `url-format` origin/parse rows need the WHATWG URL constructor plus
   `location.origin`; the URL shim stays create/revoke-only by M6 design,
   so the 3 rows are exact `navigation` NOTRUN exclusions.
-- `readAsDataURL` for empty-type Blobs: pinned upstream
-  (`filereader_readAsDataURL.any.js`, two rows) expects
-  `data:application/octet-stream;base64,...`, but the crate contract
-  (M4, pinned by `m4_filereader_async::read_as_data_url_exact_packaging`
-  and `m4_filereader_sync::sync_data_url_exact_packaging`) emits the Blob
-  type verbatim (`data:;base64,...`). Recorded as open defects (2);
-  changing the packaging would break the M4 suites and is out of scope
-  for M9-E.
-- `File` name `dummy/foo`: pinned upstream (`File-constructor.any.js`,
-  "No replacement when using special character in fileName") expects the
-  slash verbatim, but the normative File API replaces every U+002F with
-  U+003A and the crate (M2, `normalize_file_name`) emits `dummy:foo`.
-  Recorded as an open defect (1); the product follows the spec, not the
-  upstream row.
-- Open defects (5 total, all recorded `supported`/`FAIL`, release-red):
-  `filereader_abort.any.js :: Aborting after read` — the test's own
-  `.then()` continuation re-arms `wait_for(['abort','loadend'])` and
-  calls `abort()` a second time after the sync dispatch already delivered
-  the pair; the harness observes a phantom second pair (`2 !== 1`).
-  Product behavior (exactly one pair per `abort()`) matches TZ §7.3;
-  the fix needs upstream EventWatcher queue semantics. Plus the
-  `fileReader.any.js` sync-abort row and the two `readAsDataURL`
-  empty-type rows and the `File` slash row above. See
-  `docs/reviews/M9E-handoff.md` §3.
+- `readAsDataURL` for empty-type Blobs now emits
+  `data:application/octet-stream;base64,...` (`package_data_url`), matching
+  the pinned upstream rows; the M4 async/sync packaging suites were
+  updated accordingly.
+- `File` name is kept verbatim (WD §4.1 step 4.4): `normalize_file_name`
+  no longer replaces `/` with `:`; M2/M5/M6/appendix-A expectations were
+  updated.
+- Open defects: 0 (were 5). See
+  `docs/reviews/M9F-WPT-DEFECT-REMEDIATION-handoff.md`.

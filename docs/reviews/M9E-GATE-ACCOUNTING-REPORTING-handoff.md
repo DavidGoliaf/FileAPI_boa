@@ -211,9 +211,11 @@ release-green` в `docs/DECISIONS.md`. Новых зависимостей не�
   `exit_reason=integrity`/`execution_failure` (раньше часть уходила в
   `Err` → exit 2 без JSON).
 
-## 8. Что дальше (не начинать)
+## 8. Что дальше
 
-- Пять product/harness дефектов §8 — отдельными defect/rework-заказами;
-  после их устранения `m9e-release-conformance` станет зелёным без
-  изменения workflow.
-- Общая release-приёмка M9-E запрещена до `release_green == true`.
+- Пять product/harness дефектов §8 закрыты отдельными defect-заказами
+  (см. `docs/reviews/M9F-WPT-DEFECT-REMEDIATION-handoff.md`): sync
+  `abort()`, task/microtask boundary после `loadstart`,
+  `readAsDataURL` `application/octet-stream`, `File.name` verbatim.
+  `m9e-release-conformance` стал зелёным без изменения workflow.
+- Общая release-приёмка M9-E разрешена: `release_green == true`.

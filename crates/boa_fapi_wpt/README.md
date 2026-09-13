@@ -26,9 +26,9 @@ inventory/expectations, never WPT conformance). `--strict` is the release
 gate: it exits `0` **only** when `release_green == true`. `--check-expectations`
 is the diagnostic observation mode: it exits `0` when the actual statuses
 and identities reproduce the audited expectations, but always reports
-`release_green: false` and is never a conformance/release pass. While the
-five recorded open defects remain, `--strict` is non-zero with
-`exit_reason: release_defects`.
+`release_green: false` and is never a conformance/release pass. There are
+no remaining open defects, so `--strict` now exits `0` with
+`release_green: true` (`exit_reason: ok`).
 
 One canonical run model (`accounting::CanonicalRun`) is the single source
 for console, JSON (schema 2), JUnit and the exit code. The report carries
@@ -42,12 +42,13 @@ JSON: `integrity`, `expectation_drift`, `execution_failure`,
 `release_defects`.
 
 Statuses: `PASS`/`FAIL`/`TIMEOUT`/`NOTRUN` with deterministic JSON/JUnit
-output (`--json`/`--junit`). Expected `FAIL` (recorded open defect) keeps
-`expectations_match` true but is a release blocker. Reports are CI
-artifacts and are never committed. The `m9e-gate-negative-controls` CI job
-runs `gate_remediation` (mutated upstream/inventory/expectation/result
-sets must be non-zero); the `m9e-release-conformance` job runs `--strict`
-without inversion and is honestly red until the defects are fixed.
+output (`--json`/`--junit`). Expected `FAIL` (recorded open defect) would
+keep `expectations_match` true but is a release blocker; the audited set
+currently has none. Reports are CI artifacts and are never committed. The
+`m9e-gate-negative-controls` CI job runs `gate_remediation` (mutated
+upstream/inventory/expectation/result sets must be non-zero); the
+`m9e-release-conformance` job runs `--strict` without inversion and is
+green (`379` upstream PASS, `0` defects).
 
 Limits: conformance is claimed for the directly executed upstream subset
 (417 executable subtests) plus 79 audited file-level inventory exclusions
