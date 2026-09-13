@@ -959,7 +959,14 @@ fn stale_completion_after_restart_is_noop() {
     let settled = handle.poll_io(&mut context).expect("poll_io");
     assert_eq!(settled, 0, "stale completion settles nothing");
     context.run_jobs().expect("run_jobs");
-    assert_eq!(js_log(&mut context), "");
+    // The synchronous `abort()` (WD §6.2.3.5) logged exactly one
+    // `abort`+`loadend` pair at the moment of cancellation; the late
+    // first-generation chunk produced no further event.
+    assert_eq!(
+        js_log(&mut context),
+        "abort:0/5:2|loadend:0/5:2",
+        "stale completion must add no event"
+    );
     for _ in 0..4 {
         executor.run_chunks();
         drive(&mut context, &handle);

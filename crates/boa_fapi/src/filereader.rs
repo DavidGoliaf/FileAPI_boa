@@ -90,14 +90,16 @@ pub(crate) enum ReadKind {
 }
 
 /// Terminal outcome of an operation, decided before any event dispatch.
+///
+/// `abort` is not an asynchronous terminal here: `abort()` dispatches
+/// `abort`+`loadend` synchronously (WD §6.2.3.5), so only the pump-driven
+/// `load`/`error` terminals flow through the queued dispatch path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalKind {
     /// Success: dispatch `load` then conditionally `loadend`.
     Load,
     /// Failure: dispatch `error` then conditionally `loadend`.
     Error,
-    /// Cancellation: dispatch `abort` then conditionally `loadend`.
-    Abort,
 }
 
 /// Mutable state of one `FileReader` object.
@@ -789,11 +791,11 @@ fn read_as_data_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> 
 /// `abort()`: `length = 0`.
 ///
 /// In `EMPTY`/`DONE` sets `result = null`, returns `undefined`, alters no
-/// `error` and queues no event. In `LOADING` invalidates the generation,
+/// `error` and fires no event. In `LOADING` invalidates the generation,
 /// cancels the worker token, releases the quota slot once (bridge +
 /// mirror counter), drops the reader root so queued chunks go stale,
-/// sets `(DONE, null, null)`, then queues `abort` followed conditionally
-/// by `loadend`.
+/// sets `(DONE, null, null)`, then dispatches `abort` followed
+/// conditionally by `loadend` synchronously (WD §6.2.3.5).
 fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     #[cfg(feature = "tracing")]
     let trace_start = crate::observability::now();
@@ -863,20 +865,9 @@ fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<J
             env,
         );
     }
-    enqueue_reading_job(
-        context,
-        FileReadingJob {
-            reader: object,
-            generation,
-            operation,
-            step: JobStep::Dispatch(DispatchState {
-                event_type: String::from("abort"),
-                loaded,
-                total,
-                terminal: Some(TerminalKind::Abort),
-            }),
-        },
-    );
+    // File API WD §6.2.3.5 steps 5–6: `abort` and the conditional
+    // `loadend` are dispatched synchronously before `abort()` returns.
+    dispatch_terminal_now(&object, generation, "abort", loaded, total, context)?;
     Ok(JsValue::undefined())
 }
 
@@ -1053,6 +1044,7 @@ fn run_pump(
     // still wins. When the handler replaced the generation, the drained
     // chunk is dropped unread (it was already produced off-thread, but no
     // Boa job consumes it and no progress/packaging observes it).
+    let mut dispatched_loadstart = false;
     if !state.loadstart_sent {
         state.loadstart_sent = true;
         // Persist the flag before dispatch: a reentrant handler that
@@ -1087,6 +1079,31 @@ fn run_pump(
             state.last_progress_at = fresh.last_progress_at;
             state.final_progress_sent = fresh.final_progress_sent;
         }
+        dispatched_loadstart = true;
+    }
+    if dispatched_loadstart {
+        // Browser task/microtask boundary: a promise continuation armed by
+        // the `loadstart` dispatch must run before the first chunk is
+        // applied and the read reaches a terminal state (the pinned
+        // `filereader_abort` "Aborting after read" row observes `LOADING`
+        // in its `.then()` continuation). Re-enqueue the already-drained
+        // chunk for the next job; the promise reactions queued during
+        // `loadstart` are ahead of it in the job queue.
+        if let Some(chunk) = chunk {
+            enqueue_reading_job(
+                context,
+                FileReadingJob {
+                    reader: reader.clone(),
+                    generation,
+                    operation,
+                    step: JobStep::PumpChunk {
+                        state: Box::new(state),
+                        chunk: Some(chunk),
+                    },
+                },
+            );
+        }
+        return Ok(JsValue::undefined());
     }
     let Some(chunk) = chunk else {
         // No worker chunk available yet (only reachable when a submit
@@ -1505,7 +1522,7 @@ fn run_dispatch(
             .is_some_and(|native| {
                 native.ready_state == DONE
                     && match kind {
-                        TerminalKind::Load | TerminalKind::Abort => true,
+                        TerminalKind::Load => true,
                         TerminalKind::Error => native.error.is_some(),
                     }
             });
@@ -1573,6 +1590,77 @@ fn run_dispatch(
     if let Some(error) = first_error {
         // Listener exceptions surface as JS job errors without stopping the
         // remaining listeners (which already ran) or the queued `loadend`.
+        enqueue_listener_error(context, error.to_string());
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Dispatches a terminal event and the conditional `loadend` synchronously
+/// on the calling stack (File API WD §6.2.3.5 steps 5–6).
+///
+/// `abort()` fires `abort` (and then `loadend`, because the state is no
+/// longer `"loading"`) before it returns; the asynchronous pump's terminal
+/// path keeps queueing `loadend` through [`run_dispatch`]. A reentrant
+/// handler that starts a new operation suppresses the trailing `loadend`
+/// exactly like the queued path; a throwing listener is reported as a JS
+/// job error after both events ran.
+fn dispatch_terminal_now(
+    reader: &JsObject,
+    generation: u64,
+    event_type: &str,
+    loaded: u64,
+    total: u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    if !generation_current(reader, generation) {
+        return Ok(JsValue::undefined());
+    }
+    if crate::extension::snapshot(context)
+        .map(|specs| specs.shutdown.is_shutdown())
+        .unwrap_or(false)
+    {
+        return Ok(JsValue::undefined());
+    }
+    let specs = crate::extension::snapshot(context)?;
+    let time_stamp = specs.config.clock.now_unix_millis() as f64;
+    let event = dom::create_progress_event(
+        &specs,
+        event_type,
+        loaded,
+        total,
+        reader.clone(),
+        time_stamp,
+    );
+    let event_value = JsValue::from(event);
+    let listeners = reader_listeners(reader);
+    let first_error = dom::invoke_event(reader, &listeners, event_type, &event_value, context)?;
+    if let Some(mut native) = reader.downcast_mut::<FileReaderNative>()
+        && native.generation == generation
+    {
+        native.terminal_dispatched = true;
+    }
+    // Conditional `loadend`: state is DONE (not loading), so it fires unless
+    // a reentrant handler replaced the generation with a new read.
+    let mut reported = first_error;
+    if generation_current(reader, generation) {
+        let event = dom::create_progress_event(
+            &specs,
+            "loadend",
+            loaded,
+            total,
+            reader.clone(),
+            time_stamp,
+        );
+        let event_value = JsValue::from(event);
+        let listeners = reader_listeners(reader);
+        if let Some(error) =
+            dom::invoke_event(reader, &listeners, "loadend", &event_value, context)?
+            && reported.is_none()
+        {
+            reported = Some(error);
+        }
+    }
+    if let Some(error) = reported {
         enqueue_listener_error(context, error.to_string());
     }
     Ok(JsValue::undefined())
@@ -2619,9 +2707,11 @@ mod tests {
 
     #[test]
     fn loadstart_abort_then_restart_emits_only_new_operation() {
-        // `loadstart` handler aborts and immediately starts a new read: the
-        // old abort dispatch is stale (generation replaced before delivery)
-        // and emits nothing; only the new operation's events follow. The
+        // `loadstart` handler aborts and immediately starts a new read:
+        // `abort()` dispatches its `abort`+`loadend` synchronously
+        // (WD §6.2.3.5) before the handler starts the new operation; the
+        // old operation's later pump jobs are stale and emit nothing. Only
+        // the new operation's `loadstart|progress|load|loadend` follow. The
         // old worker chunk is dropped unread by the Boa job.
         let reads = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(CountingSource {
@@ -2660,8 +2750,8 @@ mod tests {
         );
         assert_eq!(
             js_log(context),
-            "loadstart|loadstart|progress|load|loadend",
-            "old abort/loadend are stale and emit nothing"
+            "loadstart|abort|loadend|loadstart|progress|load|loadend",
+            "synchronous abort pair precedes the restarted operation"
         );
         let result = context
             .eval(Source::from_bytes("reader.result"))

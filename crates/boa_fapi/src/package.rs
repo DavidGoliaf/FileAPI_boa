@@ -409,12 +409,21 @@ pub(crate) fn package_binary_string(bytes: &[u8]) -> String {
 /// computation overflows; callers compare against `max_data_url_output`.
 pub(crate) fn data_url_len(media_type: &str, byte_len: u64) -> Option<u64> {
     let payload_len = byte_len.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
-    let prefix_len = u64::try_from(media_type.len().saturating_add("data:;base64,".len())).ok()?;
+    // An empty Blob type uses `application/octet-stream` in the data URL
+    // (WD §6.3 + pinned upstream `filereader_readAsDataURL.any.js`).
+    let effective = if media_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        media_type
+    };
+    let prefix_len = u64::try_from(effective.len().saturating_add("data:;base64,".len())).ok()?;
     payload_len.checked_add(prefix_len)
 }
 
-/// Packages bytes as `data:<type>;base64,<payload>` (`data:;base64,` for an
-/// empty media type) with standard base64 (no whitespace or line breaks).
+/// Packages bytes as `data:<type>;base64,<payload>`; an empty media type is
+/// rendered as `application/octet-stream` (WD §6.3 and the pinned upstream
+/// `filereader_readAsDataURL.any.js` rows), with standard base64 (no
+/// whitespace or line breaks).
 ///
 /// Re-checks the exact output length against the ceiling before
 /// allocating the payload; exceeding it is `ResourceLimit(DataUrlOutput)`.
@@ -425,7 +434,7 @@ pub(crate) fn package_data_url(
 ) -> Result<String, FileApiError> {
     let payload = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
     let prefix = if media_type.is_empty() {
-        String::from("data:;base64,")
+        String::from("data:application/octet-stream;base64,")
     } else {
         format!("data:{media_type};base64,")
     };

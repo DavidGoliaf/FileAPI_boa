@@ -753,7 +753,7 @@ mod tests {
             .expect("verdict string")
             .to_std_string_escaped();
         assert_eq!(
-            value, "true:2:2:104:105:hi:data:;base64,aGk=",
+            value, "true:2:2:104:105:hi:data:application/octet-stream;base64,aGk=",
             "sync packaging must match the async representations"
         );
     }

@@ -864,7 +864,7 @@ fn tracing_preserves_async_order_and_stale_suppression() {
         eval(&mut context, "globalThis.log.join('|')")
     });
     assert_eq!(
-        js_log, "loadstart|loadstart|progress|load|loadend",
+        js_log, "loadstart|abort|loadend|loadstart|progress|load|loadend",
         "M7 ordering must be preserved"
     );
     let events = snapshot_events(&events);

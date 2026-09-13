@@ -468,9 +468,9 @@ fn sync_data_url_exact_packaging() {
         (() => {
             var sync = new FileReaderSync();
             if (sync.readAsDataURL(new Blob(['hello'], { type: 'text/plain' })) !== 'data:text/plain;base64,aGVsbG8=') return false;
-            if (sync.readAsDataURL(new Blob(['hello'])) !== 'data:;base64,aGVsbG8=') return false;
+            if (sync.readAsDataURL(new Blob(['hello'])) !== 'data:application/octet-stream;base64,aGVsbG8=') return false;
             if (sync.readAsDataURL(new Blob([new Uint8Array([])], { type: 'text/plain' })) !== 'data:text/plain;base64,') return false;
-            if (sync.readAsDataURL(new Blob([new Uint8Array([0, 255, 16])])) !== 'data:;base64,AP8Q') return false;
+            if (sync.readAsDataURL(new Blob([new Uint8Array([0, 255, 16])])) !== 'data:application/octet-stream;base64,AP8Q') return false;
             var url = sync.readAsDataURL(new Blob(['x']));
             if (url.indexOf(' ') !== -1 || url.indexOf('\n') !== -1) return false;
             return true;
@@ -483,13 +483,13 @@ fn sync_data_url_exact_packaging() {
 fn sync_data_url_quota_boundary() {
     // `== max_data_url_output` succeeds, `+1` fails with
     // `QuotaExceededError` before any source read or allocation.
-    let prefix = "data:;base64,";
+    let prefix = "data:application/octet-stream;base64,";
     let limit = (prefix.len() + 4) as u64;
     let mut context = setup_worker_with_data_url_limit(limit);
     assert_eval(
         &mut context,
         "new FileReaderSync().readAsDataURL(new Blob([new Uint8Array([1, 2, 3])])) \
-         === 'data:;base64,AQID'",
+         === 'data:application/octet-stream;base64,AQID'",
     );
     assert_throws_dom(
         &mut context,
@@ -516,7 +516,7 @@ fn sync_size_limit_boundary() {
             if (sync.readAsArrayBuffer(exact).byteLength !== 64) return false;
             if (sync.readAsBinaryString(exact).length !== 64) return false;
             if (sync.readAsText(exact).length !== 64) return false;
-            if (sync.readAsDataURL(exact).indexOf('data:;base64,') !== 0) return false;
+            if (sync.readAsDataURL(exact).indexOf('data:application/octet-stream;base64,') !== 0) return false;
             return true;
         })()
         ",

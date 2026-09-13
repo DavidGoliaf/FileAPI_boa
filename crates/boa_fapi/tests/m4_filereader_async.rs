@@ -797,9 +797,9 @@ fn read_as_data_url_exact_packaging() {
             globalThis.urls = [];
             var cases = [
                 [new Blob(['hello'], { type: 'text/plain' }), 'data:text/plain;base64,aGVsbG8='],
-                [new Blob(['hello']), 'data:;base64,aGVsbG8='],
+                [new Blob(['hello']), 'data:application/octet-stream;base64,aGVsbG8='],
                 [new Blob([new Uint8Array([])], { type: 'text/plain' }), 'data:text/plain;base64,'],
-                [new Blob([new Uint8Array([0, 255, 16])]), 'data:;base64,AP8Q'],
+                [new Blob([new Uint8Array([0, 255, 16])]), 'data:application/octet-stream;base64,AP8Q'],
             ];
             globalThis.pending = cases.length;
             for (var [blob, _] of cases) {
@@ -821,9 +821,9 @@ fn read_as_data_url_exact_packaging() {
         r"
         globalThis.pending === 0
         && globalThis.urls[0] === 'data:text/plain;base64,aGVsbG8='
-        && globalThis.urls[1] === 'data:;base64,aGVsbG8='
+        && globalThis.urls[1] === 'data:application/octet-stream;base64,aGVsbG8='
         && globalThis.urls[2] === 'data:text/plain;base64,'
-        && globalThis.urls[3] === 'data:;base64,AP8Q'
+        && globalThis.urls[3] === 'data:application/octet-stream;base64,AP8Q'
         && globalThis.urls.every(u => u.indexOf(' ') === -1 && u.indexOf('\n') === -1)
         ",
     );
@@ -1116,7 +1116,7 @@ fn reentrant_error_handler_starts_new_read() {
     // dispatches before the 64 threaded filler chunks complete, so a restart
     // from the handler would racily hit the still-full quota. Quota recovery
     // itself is covered by `concurrent_read_quota_recovers_after_success_…`.)
-    let prefix = "data:;base64,";
+    let prefix = "data:application/octet-stream;base64,";
     let limit = (prefix.len() + 4) as u64;
     let (mut context, handle) = setup_with_data_url_limit(limit);
     assert_eval(
@@ -1324,7 +1324,7 @@ fn gc_survives_queued_filereader_jobs() {
 fn data_url_quota_boundary() {
     // `== limit` succeeds, `+1` fails before allocation with
     // `QuotaExceededError`, no partial result, then `loadend`.
-    let prefix = "data:;base64,";
+    let prefix = "data:application/octet-stream;base64,";
     // 3 bytes -> 4 payload chars: pick a limit of prefix + 4. The
     // 4-byte blob needs prefix + 8 chars, so it fails in the synchronous
     // preflight (readyState DONE with `error` set, no load yet).
@@ -1353,7 +1353,7 @@ fn data_url_quota_boundary() {
     drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
-        "typeof globalThis.ok === 'string' && globalThis.ok.indexOf('data:;base64,') === 0",
+        "typeof globalThis.ok === 'string' && globalThis.ok.indexOf('data:application/octet-stream;base64,') === 0",
     );
     assert_eval(
         &mut context,
@@ -1506,20 +1506,13 @@ enum Action {
     Abort,
 }
 
-/// Terminal kinds for the pure model queue.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TermKind {
-    Load,
-    Abort,
-}
-
 /// A queued model job.
 #[derive(Clone, Copy, Debug)]
 enum ModelJob {
     /// One pump of a single-chunk operation.
     Pump { generation: u64 },
-    /// One terminal dispatch.
-    Term { generation: u64, kind: TermKind },
+    /// One `load` terminal dispatch (`abort` is dispatched synchronously).
+    Term { generation: u64 },
 }
 
 /// Small pure model of the single-chunk FileReader state machine.
@@ -1574,6 +1567,10 @@ impl PureModel {
         self.queue.push_back(ModelJob::Pump { generation });
     }
 
+    /// `abort()` effect: WD §6.2.3.5 fires `abort` and the conditional
+    /// `loadend` synchronously on the calling stack. A reentrant restart
+    /// handler starts a new generation, which suppresses the trailing
+    /// `loadend`.
     fn abort_effect(&mut self) {
         self.generation += 1;
         self.ready = 2;
@@ -1581,10 +1578,15 @@ impl PureModel {
         self.error = None;
         self.terminal = false;
         let generation = self.generation;
-        self.queue.push_back(ModelJob::Term {
-            generation,
-            kind: TermKind::Abort,
-        });
+        self.emit("abort");
+        self.terminal = true;
+        if !self.restarted && self.handler == HandlerMode::AbortRestart {
+            self.restarted = true;
+            self.start_ok();
+        }
+        if generation == self.generation {
+            self.emit("loadend");
+        }
     }
 
     /// Applies one synchronous driver action, recording sync throws.
@@ -1632,12 +1634,9 @@ impl PureModel {
                     self.result = Some("model".to_owned());
                     self.error = None;
                     let generation = self.generation;
-                    self.queue.push_back(ModelJob::Term {
-                        generation,
-                        kind: TermKind::Load,
-                    });
+                    self.queue.push_back(ModelJob::Term { generation });
                 }
-                ModelJob::Term { generation, kind } => {
+                ModelJob::Term { generation } => {
                     if generation != self.generation {
                         self.stale_jobs += 1;
                         continue;
@@ -1645,21 +1644,12 @@ impl PureModel {
                     if self.terminal {
                         continue;
                     }
-                    let name = match kind {
-                        TermKind::Load => "load",
-                        TermKind::Abort => "abort",
-                    };
-                    self.emit(name);
+                    self.emit("load");
                     self.terminal = true;
                     // Restart handlers are one-shot per scenario.
                     // (`error` never fires in the unknown-label-free
                     // corpus: every start path succeeds or aborts.)
-                    let restart = !self.restarted
-                        && matches!(
-                            (kind, self.handler),
-                            (TermKind::Load, HandlerMode::LoadRestart)
-                                | (TermKind::Abort, HandlerMode::AbortRestart)
-                        );
+                    let restart = !self.restarted && self.handler == HandlerMode::LoadRestart;
                     if restart {
                         self.restarted = true;
                         self.start_ok();
