@@ -57,11 +57,14 @@ impl FileNative {
     }
 }
 
-/// Normalizes a file name: USVString semantics, then `/` becomes `:`.
+/// Normalizes a file name: USVString semantics only.
 ///
-/// No basename computation is performed; host paths never become names.
+/// File API WD §4.1 step 4.4 sets `F.name` to the `fileName` argument
+/// verbatim (the historical `/`→`:` replacement was removed); no basename
+/// computation is performed either. Host paths never become names — the
+/// caller supplies an already-safe display name.
 pub(crate) fn normalize_file_name(name: &str) -> String {
-    name.replace('/', ":")
+    name.to_owned()
 }
 
 /// Builds the native state for a File from host-provided bytes.
@@ -120,7 +123,7 @@ pub(crate) fn constructor(
     // the options-dependent processing step.
     let limits = specs.limits().clone();
     let converted = convert_sequence(&arg(args, 0), true, &limits, context)?;
-    // Required `fileName`: USVString, then every `/` becomes `:`.
+    // Required `fileName`: USVString, kept verbatim (WD §4.1 step 4.4).
     let file_name = usv_string(&arg(args, 1), context)?;
     let file_name = normalize_file_name(&file_name);
 

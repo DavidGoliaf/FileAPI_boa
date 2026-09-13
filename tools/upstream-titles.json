@@ -1986,16 +1986,13 @@
     "subtest": "Using fileName",
     "trace": "M9E-WPT-02"
    },
-    {
-     "capability": "file-constructor",
-     "classification": "supported",
-     "issue": "docs/reviews/M9E-handoff.md",
-     "reason": "hand-audited: upstream expects dummy/foo verbatim but the normative File API replaces every U+002F (/) with U+003A (:); product emits the spec-mandated dummy:foo",
-     "spec_section": "FileAPI WD File",
-     "status": "FAIL",
-     "subtest": "No replacement when using special character in fileName",
-     "trace": "M9E-WPT-02"
-    },
+     {
+      "capability": "file-constructor",
+      "classification": "supported",
+      "spec_section": "FileAPI WD File",
+      "subtest": "No replacement when using special character in fileName",
+      "trace": "M9E-WPT-02"
+     },
    {
     "classification": "supported",
     "spec_section": "FileAPI WD File",

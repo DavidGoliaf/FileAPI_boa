@@ -1417,8 +1417,9 @@ impl FileApiHandle {
 
     /// Creates a `File` from host bytes.
     ///
-    /// `name` is a display name: no basename is computed, but `/` is
-    /// replaced by `:` like the JS constructor. `options.last_modified` of
+    /// `name` is a display name: no basename is computed, and it is stored
+    /// verbatim (WD §4.1 step 4.4, no `/`→`:` replacement).
+    /// `options.last_modified` of
     /// `None` reads the injected clock. After `shutdown` the call fails
     /// before touching JS state.
     pub fn file_from_bytes(
@@ -2186,8 +2187,7 @@ impl FileApiHandle {
     /// Decodes a clone payload into a live `File` object.
     ///
     /// Only `File` payloads are accepted; the stored `name`/`lastModified`
-    /// are reused verbatim (no clock read, no re-sanitization beyond the
-    /// constructor-equivalent slash replacement, which is idempotent).
+    /// are reused verbatim (no clock read, no re-sanitization).
     pub fn file_from_clone(
         &self,
         payload: &FileApiClonePayload,

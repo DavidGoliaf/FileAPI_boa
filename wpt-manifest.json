@@ -4182,15 +4182,15 @@
         {
           "test": "File-constructor.any.js",
           "subtest": "No replacement when using special character in fileName",
-          "status": "FAIL",
-          "reason": "hand-audited: upstream expects dummy/foo verbatim but the normative File API replaces every U+002F (/) with U+003A (:); product emits the spec-mandated dummy:foo",
+          "status": "PASS",
+          "reason": "",
           "capability": "file-constructor",
           "owner": "m9e",
           "review_by": "2027-09-08",
           "trace": "M9E-WPT-02",
           "classification": "supported",
           "spec_section": "FileAPI WD File",
-          "issue": "docs/reviews/M9E-handoff.md"
+          "issue": ""
         },
         {
           "test": "File-constructor.any.js",

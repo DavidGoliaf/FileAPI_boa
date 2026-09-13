@@ -160,7 +160,7 @@ fn blob_creation_brands_prototypes_descriptors() {
     assert_eval(
         &mut context,
         "var f = new File(['xy'], 'a/b.txt', { lastModified: 7 }); \
-         f instanceof File && f instanceof Blob && f.name === 'a:b.txt' \
+         f instanceof File && f instanceof Blob && f.name === 'a/b.txt' \
          && f.size === 2 && f.lastModified === 7 \
          && Object.prototype.toString.call(f) === '[object File]'",
     );

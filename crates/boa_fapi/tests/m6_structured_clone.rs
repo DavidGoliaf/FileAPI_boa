@@ -127,7 +127,7 @@ fn clone_blob_file_round_trip() {
     };
     assert_eq!(&file_body.bytes[..], b"file-bytes");
     assert_eq!(file_body.media_type, "text/plain");
-    assert_eq!(file_body.name, "a:b.txt");
+    assert_eq!(file_body.name, "a/b.txt");
     assert_eq!(file_body.last_modified, 12345);
 
     // Decode into new live objects with a fresh immutable backing.
@@ -142,7 +142,7 @@ fn clone_blob_file_round_trip() {
     assert_eval(
         &mut context,
         "backBlob.size === 13 && backBlob.type === 'text/plain' \
-         && backFile.size === 10 && backFile.name === 'a:b.txt' \
+         && backFile.size === 10 && backFile.name === 'a/b.txt' \
          && backFile.lastModified === 12345 && backFile.type === 'text/plain'",
     );
     // Mutation isolation: encoding snapshots bytes at clone time.

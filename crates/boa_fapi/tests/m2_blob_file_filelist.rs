@@ -614,8 +614,9 @@ fn file_name_conversions() {
         &mut context,
         "new File([], 'report.txt').name === 'report.txt'",
     );
-    assert_eval(&mut context, "new File([], 'a/b').name === 'a:b'");
-    assert_eval(&mut context, "new File([], '/leading').name === ':leading'");
+    // WD §4.1 step 4.4: the fileName is kept verbatim (no `/`→`:`).
+    assert_eval(&mut context, "new File([], 'a/b').name === 'a/b'");
+    assert_eval(&mut context, "new File([], '/leading').name === '/leading'");
     // Lone surrogates become U+FFFD.
     assert_eval(&mut context, r"new File([], '\uD800x').name === '\uFFFDx'");
     // A regular USVString argument converts through ToString.
@@ -902,7 +903,7 @@ fn host_file_from_bytes() {
     assert_eval(
         &mut context,
         r"
-        hostFile.name === 'host:path.txt'
+        hostFile.name === 'host/path.txt'
         && hostFile.type === 'text/plain'
         && hostFile.lastModified === 1700000000000
         && hostFile.size === 4

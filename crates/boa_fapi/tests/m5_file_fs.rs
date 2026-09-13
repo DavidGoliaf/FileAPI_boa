@@ -181,8 +181,8 @@ fn file_from_resource_metadata_and_text() {
         "notes/display.txt",
     );
     publish(&mut context, "srcFile", object);
-    // Display name is the only visible name; slash becomes colon; no secret leaks.
-    assert_eq!(eval_str(&mut context, "srcFile.name"), "notes:display.txt");
+    // Display name is the only visible name, kept verbatim; no secret leaks.
+    assert_eq!(eval_str(&mut context, "srcFile.name"), "notes/display.txt");
     assert_eval(&mut context, "srcFile.size === 8");
     assert_eval(
         &mut context,
@@ -766,8 +766,8 @@ fn file_list_accepts_only_explicit_files() {
 fn display_name_is_the_only_visible_name() {
     let (mut context, handle) = setup();
     let registry = boa_fapi_fs::FsRegistry::new();
-    // A display name that looks like a secret location stays verbatim
-    // (slash → colon); no basename is ever computed from host state.
+    // A display name that looks like a secret location stays verbatim; no
+    // basename is ever computed from host state.
     let (path, object) = import_file(
         &handle,
         &mut context,
@@ -778,7 +778,7 @@ fn display_name_is_the_only_visible_name() {
     publish(&mut context, "srcFile", object);
     assert_eq!(
         eval_str(&mut context, "srcFile.name"),
-        ":secret:mount:name.txt"
+        "/secret/mount/name.txt"
     );
     std::fs::remove_file(&path).ok();
 }
