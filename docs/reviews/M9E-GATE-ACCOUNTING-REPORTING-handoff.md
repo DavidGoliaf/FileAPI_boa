@@ -178,6 +178,31 @@ release-green` в `docs/DECISIONS.md`. Новых зависимостей не�
   `gate_remediation` (self-contained fixtures), а не в shell-мутацию
   pinned checkout.
 
+Дополнительный ретроспективный проход (второй) нашёл и исправил:
+
+- **Класс exit reason для timeout**: чистый TIMEOUT (нет harness entry)
+  классифицировался как `expectation_drift`, потому что `blockers.unexpected`
+  инкрементировался в timeout-ветке и проверялся раньше. Теперь timeout —
+  только `blockers.timeouts` → `execution_failure`, а `expectations_match`
+  дополнительно требует `timeouts == 0`. `--strict` по-прежнему non-zero.
+- **Adapted-conformance учёт**: PASS-строка genuine `adapted`-файла
+  (classification `supported`) ошибочно попадала в `smoke_pass`, потому что
+  бакет выбирался по provenance. Теперь бакет выбирается по classification:
+  `project-acceptance` → smoke, иначе upstream. На текущих данных 374/6 не
+  меняется, но будущие `executed-adapted` файлы считаются upstream.
+- **JSON/JUnit totals при duplicate result**: `files[]` сохранял дубликаты,
+  из-за чего JUnit `tests` мог превысить `results.total`. Канонический
+  `files` теперь дедуплицируется (первая occurrence), дубликат остаётся
+  только в `expectation_drift`; JSON/JUnit/console totals совпадают для
+  любого входа.
+- **Bare `--manifest` без режима**: принимался и мог маркировать smoke-run
+  как `WPT_STRICT`. Теперь требуется ровно один из
+  `--smoke`/`--strict`/`--check-expectations`.
+- **Launch-ошибки теперь несут JSON reason**: чтение/парсинг manifest,
+  hash-проверка и worker launch errors пишут failure-JSON с
+  `exit_reason=integrity`/`execution_failure` (раньше часть уходила в
+  `Err` → exit 2 без JSON).
+
 ## 8. Что дальше (не начинать)
 
 - Пять product/harness дефектов §8 — отдельными defect/rework-заказами;

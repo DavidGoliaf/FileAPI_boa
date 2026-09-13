@@ -135,6 +135,9 @@ impl Args {
             .into_iter()
             .filter(|set| *set)
             .count();
+        if modes == 0 {
+            return Err("one of --smoke, --strict or --check-expectations is required".to_owned());
+        }
         if modes > 1 {
             return Err(
                 "--smoke, --strict and --check-expectations are mutually exclusive".to_owned(),
@@ -1124,10 +1127,23 @@ fn run(argv: &[String]) -> Result<i32, String> {
     if args.smoke && args.filter.is_some() {
         return Err("--filter cannot be combined with --smoke".to_owned());
     }
-    let manifest_text = read_text(&args.manifest)?;
+    let manifest_text = match read_text(&args.manifest) {
+        Ok(text) => text,
+        Err(message) => {
+            let failure = CliFailure::new(ExitReason::Integrity, message);
+            emit_failure(&args, mode, &failure, None);
+            return Ok(failure.reason.exit_code());
+        }
+    };
     let today = today_utc();
-    let manifest = load_manifest_for_mode(&manifest_text, &today, strict_effective)
-        .map_err(|e| format_manifest_error(&e))?;
+    let manifest = match load_manifest_for_mode(&manifest_text, &today, strict_effective) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let failure = CliFailure::new(ExitReason::Integrity, format_manifest_error(&error));
+            emit_failure(&args, mode, &failure, None);
+            return Ok(failure.reason.exit_code());
+        }
+    };
     // Mode/schema agreement (M9-E §2): smoke accepts schema 1 (legacy
     // adapted manifest) or schema 2 (runs the same corpus, still labelled
     // ADAPTED_SMOKE); a gate mode requires schema 2 plus inventory and
@@ -1149,7 +1165,14 @@ fn run(argv: &[String]) -> Result<i32, String> {
     }
     // Hash/path validation first: every CLI path (sequential and
     // parallel) reuses the same validated texts.
-    let texts = verify_hashes(&args.manifest, &manifest)?;
+    let texts = match verify_hashes(&args.manifest, &manifest) {
+        Ok(texts) => texts,
+        Err(message) => {
+            let failure = CliFailure::new(ExitReason::Integrity, message);
+            emit_failure(&args, mode, &failure, Some(&manifest.source));
+            return Ok(failure.reason.exit_code());
+        }
+    };
     // Gate inputs (M9-E §3/§4): inventory + expectations are verified
     // before any file executes. Failures keep a distinct JSON reason.
     let gate = if strict_effective {
@@ -1170,7 +1193,14 @@ fn run(argv: &[String]) -> Result<i32, String> {
     // number of concurrent children; rows always re-sort by manifest
     // index. `run_file` stays the library mapping for unit tests.
     let slots = args.threads.min(manifest.files.len().max(1));
-    let mut files = run_files_parallel(&args, &manifest, slots, &texts)?;
+    let mut files = match run_files_parallel(&args, &manifest, slots, &texts) {
+        Ok(files) => files,
+        Err(message) => {
+            let failure = CliFailure::new(ExitReason::ExecutionFailure, message);
+            emit_failure(&args, mode, &failure, Some(&manifest.source));
+            return Ok(failure.reason.exit_code());
+        }
+    };
     if files.is_empty() {
         return Err("filter matched no manifest files".to_owned());
     }
@@ -1460,5 +1490,13 @@ mod tests {
             "--unknown".to_owned(),
         ];
         assert!(Args::parse(&unknown_flag).is_err());
+        // A bare manifest with no explicit mode is rejected (never a
+        // silently mislabelled smoke/strict run).
+        let no_mode = vec![
+            "boa_fapi_wpt".to_owned(),
+            "--manifest".to_owned(),
+            "wpt-manifest.json".to_owned(),
+        ];
+        assert!(Args::parse(&no_mode).is_err());
     }
 }

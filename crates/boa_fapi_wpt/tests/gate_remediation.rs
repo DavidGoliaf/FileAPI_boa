@@ -441,7 +441,14 @@ fn r1_02_result_identity_drift_is_non_zero() {
         assert_ne!(code, 0, "{name} must be non-zero: {json}");
         let root = parse(&json);
         assert!(!json_bool(&root, "expectations_match"));
-        assert_eq!(json_str(&root, "exit_reason"), "expectation_drift");
+        // A missing harness entry becomes a TIMEOUT (execution failure);
+        // duplicate/extra identities are expectation drift.
+        let expected_reason = if case == Case::MissingResult {
+            "execution_failure"
+        } else {
+            "expectation_drift"
+        };
+        assert_eq!(json_str(&root, "exit_reason"), expected_reason);
         // A duplicate result never inflates the ordinary totals as if it
         // were a second independent test.
         if case == Case::DuplicateResult {

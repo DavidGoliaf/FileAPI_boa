@@ -274,12 +274,16 @@ pub fn build_gate_run(
     // 2. Expected identity index from the manifest.
     let expected_index = expected_subtest_index(manifest);
 
-    // 3. Result accounting over executed rows (deduplicated).
+    // 3. Result accounting over executed rows (deduplicated). The canonical
+    // `files` list keeps only the first occurrence of each identity so JSON,
+    // JUnit and `results` totals always agree (a duplicate is reported as
+    // `expectation_drift`, never as a second independent test).
     let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut results = ResultsTotals::default();
     let mut blockers = ReleaseBlockers::default();
-    let mut executed_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut canonical_files: Vec<FileResult> = Vec::new();
     for file in &files {
+        let mut kept: Vec<crate::runner::SubtestResult> = Vec::new();
         for sub in &file.subtests {
             let key = (
                 file.upstream_path.clone(),
@@ -290,15 +294,14 @@ pub fn build_gate_run(
                 blockers.expectation_drift += 1;
                 continue;
             }
-            executed_keys.insert(key.clone());
+            kept.push(sub.clone());
             match expected_index.get(&key) {
-                Some((provenance, classification)) => {
+                Some(classification) => {
                     classify_expected(
                         &mut results,
                         &mut blockers,
                         sub.actual,
                         sub.expected.token(),
-                        *provenance,
                         *classification,
                     );
                 }
@@ -315,6 +318,12 @@ pub fn build_gate_run(
                 }
             }
         }
+        canonical_files.push(FileResult {
+            path: file.path.clone(),
+            upstream_path: file.upstream_path.clone(),
+            group: file.group.clone(),
+            subtests: kept,
+        });
     }
     // Missing actual rows: every manifest subtest must be represented once.
     for key in expected_index.keys() {
@@ -339,13 +348,17 @@ pub fn build_gate_run(
     results.unique = seen.len();
 
     // 5. Verdicts (M9E-R1 §3.1): expectations_match is identity+status
-    // equality; release_green additionally forbids recorded defects.
-    let expectations_match = blockers.expectation_drift == 0 && blockers.unexpected == 0;
-    let release_green = expectations_match && blockers.defects == 0 && blockers.timeouts == 0;
-    let exit_reason = if blockers.expectation_drift > 0 || blockers.unexpected > 0 {
-        ExitReason::ExpectationDrift
-    } else if blockers.timeouts > 0 {
+    // equality (including no timeout); release_green additionally forbids
+    // recorded defects. Exit classes are distinct: a timeout is an
+    // execution failure, identity/status drift is expectation drift, and a
+    // matched recorded defect is a release defect.
+    let expectations_match =
+        blockers.expectation_drift == 0 && blockers.unexpected == 0 && blockers.timeouts == 0;
+    let release_green = expectations_match && blockers.defects == 0;
+    let exit_reason = if blockers.timeouts > 0 {
         ExitReason::ExecutionFailure
+    } else if blockers.expectation_drift > 0 || blockers.unexpected > 0 {
+        ExitReason::ExpectationDrift
     } else if blockers.defects > 0 {
         ExitReason::ReleaseDefects
     } else {
@@ -360,7 +373,7 @@ pub fn build_gate_run(
         release_blockers: blockers,
         inventory: Some(inventory_totals),
         results,
-        files,
+        files: canonical_files,
         exclusions,
         exit_reason,
     })
@@ -389,7 +402,9 @@ pub fn build_smoke_run(
         not_a_release_mode: 1,
         ..ReleaseBlockers::default()
     };
+    let mut canonical_files: Vec<FileResult> = Vec::new();
     for file in &files {
+        let mut kept: Vec<crate::runner::SubtestResult> = Vec::new();
         for sub in &file.subtests {
             let key = (
                 file.upstream_path.clone(),
@@ -400,14 +415,14 @@ pub fn build_smoke_run(
                 blockers.expectation_drift += 1;
                 continue;
             }
+            kept.push(sub.clone());
             match expected_index.get(&key) {
-                Some((provenance, classification)) => {
+                Some(classification) => {
                     classify_expected(
                         &mut results,
                         &mut blockers,
                         sub.actual,
                         sub.expected.token(),
-                        *provenance,
                         *classification,
                     );
                 }
@@ -417,6 +432,12 @@ pub fn build_smoke_run(
                 }
             }
         }
+        canonical_files.push(FileResult {
+            path: file.path.clone(),
+            upstream_path: file.upstream_path.clone(),
+            group: file.group.clone(),
+            subtests: kept,
+        });
     }
     results.total = seen.len();
     results.unique = seen.len();
@@ -429,7 +450,7 @@ pub fn build_smoke_run(
         release_blockers: blockers,
         inventory: None,
         results,
-        files,
+        files: canonical_files,
         exclusions: Vec::new(),
         exit_reason: ExitReason::Ok,
     })
@@ -522,10 +543,10 @@ fn inventory_totals(
     })
 }
 
-/// Maps a canonical identity to its manifest provenance + classification.
+/// Maps a canonical identity to its manifest classification.
 fn expected_subtest_index(
     manifest: &Manifest,
-) -> BTreeMap<(String, String, String), (Provenance, Classification)> {
+) -> BTreeMap<(String, String, String), Classification> {
     let mut index = BTreeMap::new();
     for file in &manifest.files {
         for sub in &file.subtests {
@@ -535,7 +556,7 @@ fn expected_subtest_index(
                     sub.test.clone(),
                     sub.subtest.clone(),
                 ),
-                (file.provenance, sub.classification),
+                sub.classification,
             );
         }
     }
@@ -543,22 +564,23 @@ fn expected_subtest_index(
 }
 
 /// Classifies one executed row that has a manifest expectation.
+///
+/// An adapted file that preserves upstream assertions (classification not
+/// `project-acceptance`) counts as upstream PASS, exactly like a direct
+/// file; only project-owned acceptance rows count as smoke PASS.
 fn classify_expected(
     results: &mut ResultsTotals,
     blockers: &mut ReleaseBlockers,
     actual: ActualStatus,
     expected: &str,
-    provenance: Provenance,
     classification: Classification,
 ) {
     match (actual, expected) {
         (ActualStatus::Pass, "PASS") => {
-            if provenance == Provenance::Direct
-                && classification != Classification::ProjectAcceptance
-            {
-                results.upstream_pass += 1;
-            } else {
+            if classification == Classification::ProjectAcceptance {
                 results.smoke_pass += 1;
+            } else {
+                results.upstream_pass += 1;
             }
         }
         (ActualStatus::Fail, "FAIL") => {
@@ -569,9 +591,9 @@ fn classify_expected(
             results.notrun += 1;
         }
         (ActualStatus::Timeout, _) => {
+            // Execution failure: counted once, never as expectation drift.
             results.unexpected += 1;
             blockers.timeouts += 1;
-            blockers.unexpected += 1;
         }
         _ => {
             results.unexpected += 1;
