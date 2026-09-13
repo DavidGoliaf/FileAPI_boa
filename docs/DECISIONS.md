@@ -1124,28 +1124,36 @@ cleanup boundary + exactly-once arbitration, без `unsafe` и без новы�
    `Rc`, не равные JS ownership.
 2. Finalizer-to-Boa-thread cleanup boundary (§3.2 буквально): GC
    finalizer не мутирует `Context`, не исполняет JS, не делает I/O/worker
-   join и НЕ ЖДЁТ НИКАКОГО lock — только lock-free publish одного
-   packed-`u64` intent `(context:15, operation:32, generation:16,
-   is_reader:1)` в слот-ринг owning context (`StreamDropIntentStack`:
-   4096 `AtomicU64` слотов, CAS `0 -> packed`; без `Mutex`, без аллокации,
-   без `RefCell`, без `unsafe`). Переполнение структурно невозможно
-   (слотов >> живых эпох ≤ quota; плюс sweep sideless-эпох без записи;
-   плюс stale no-op). Глобального registry/orphan-очереди нет:
-   маршрутизация — клоном стека в native data. КРИТИЧНО (P1 rework):
+   join и НЕ ЖДЁТ НИКАКОГО lock — только infallible publish одного
+   verbatim intent `(context, operation, is_reader)` (полные `u64`, без
+   packing) в unbounded очередь owning context
+   (`StreamDropIntentStack`: `Mutex<VecDeque>`, push — один append под
+   коротким mutex, poison-tolerant; без `RefCell`, без `unsafe`).
+   Переполнение структурно невозможно — очереди нет предела: при любом
+   легальном `max_concurrent_reads_per_global` (верхней границы API не
+   ставит, см. `limits.rs:75`) каждый опубликованный intent гарантированно
+   ждёт своего `poll_io` (P0-1: фиксированного кольца 4096 больше нет;
+   P0-2: packing-окна `(15, 32, 16)` бит больше нет — ids едут verbatim;
+   P1-3: weak-CAS по слотам больше нет — retry-цикл не нужен вовсе;
+   P1-4: requeue идёт через ту же infallible очередь). Глобального
+   registry/orphan-очереди нет:
+   маршрутизация — клоном очереди в native data. КРИТИЧНО (P1 rework):
    claim покрывает только ПУБЛИКАЦИЮ — снятие флага стороны происходит
    исключительно в `poll_io` (`apply_stream_drop_intent`) с retry через
    requeue при занятом `RefCell`, так что contention откладывает, но
    никогда не теряет снятие (прежний дизайн терял claim: `dropped=true`
    до `try_borrow_mut()` + пропуск при занятости = вечный phantom
    owner). Native data не хранит `Rc<RefCell>` вообще (только
-   identity-инты + клон стека); brand gates резолвят shared из
+   identity-инты + клон очереди); brand gates резолвят shared из
    context-таблиц. `poll_io` (Boa thread, единственное место transition)
    дренит intents до и после stream chunks: сначала применяет снятия
-   сторон (retry), затем валидирует (живой op root, та же generation, не
-   terminal, ноль сторон, пустая очередь, не in-flight; demand —
-   demand-first с табличным/bridge views как defense-in-depth) и только
-   тогда выполняет single abandoned transition; плюс sweep. Stale intents
-   — strict no-op.
+   сторон (retry), затем валидирует (живой op root — ids не reused, см.
+   `IoBridge::reserve`, — не terminal, ноль сторон, пустая очередь, не
+   in-flight; demand — demand-first с табличным/bridge views как
+   defense-in-depth) и только тогда выполняет single abandoned
+   transition; плюс sweep. Stale intents — strict no-op. Поколения
+   (generation) из intent убраны осознанно: op ids не reused, живой op
+   entry сам называет свою эпоху, replay счётчика не нужен.
 3. Exactly-once arbitration и conditional release: EOF, text-tail EOF,
    error, cancel, abandoned/drop и shutdown конкурируют за одну terminal
    ownership transition (флаги `terminal`/`released` в op entry + lease).

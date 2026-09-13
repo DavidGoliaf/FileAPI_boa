@@ -169,17 +169,20 @@ owns the host bridge; `extension.rs` owns the entry points:
   opaque ids only, no GC pointers). Publish-claims live in the native
   data (`StreamNative::published` / `ReaderNative::published:
   Cell<bool>`, the latter shared with `releaseLock()` via `take_lease`);
-  `Finalize`/`Drop` only lock-free publish one packed-`u64` intent into
-  the owning context's slot ring (`StreamDropIntentStack`: 4096
-  `AtomicU64` slots, CAS `0 -> packed`; no `Mutex`, no allocation, no
-  `RefCell`, no `unsafe`, no lock wait of any kind). Native data holds no
-  `Rc<RefCell>` at all — only identity integers plus the stack clone.
-  `poll_io` (the only transition site) first applies the announced side
-  clearings (with requeue-retry while the shared cell is borrowed
-  elsewhere — contention delays but never loses a clearing), then
-  validates (live op root, same generation, not terminal, zero sides,
-  empty queue, not in-flight; demand-first with the table/bridge views
-  as defense-in-depth) and runs the single abandoned transition (token
+  `Finalize`/`Drop` only publish one verbatim intent
+  (`StreamDropIntent { context, operation, is_reader }` — full `u64`
+  ids, no packing, no generation replay) into the owning context's
+  unbounded intent queue (`StreamDropIntentStack`: `Mutex<VecDeque>`,
+  one push per publish, poison-tolerant; no `RefCell`, no `unsafe`,
+  only a constant-short mutex hold — never I/O, never a nested lock).
+  Native data holds no `Rc<RefCell>` at all — only identity integers
+  plus the queue clone. `poll_io` (the only transition site) first
+  applies the announced side clearings (with requeue-retry while the
+  shared cell is borrowed elsewhere — contention delays but never loses
+  a clearing; the requeue push is infallible), then validates (live op
+  root — ids are never reused — not terminal, zero sides, empty queue,
+  not in-flight; demand-first with the table/bridge views as
+  defense-in-depth) and runs the single abandoned transition (token
   cancel, cursor clear, op root + payload removal, one conditional quota
   release, one `stream_read` event in the existing `cancelled` class —
   no JS event/error, no new telemetry class), plus a sweep for sideless

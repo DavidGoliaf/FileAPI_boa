@@ -312,23 +312,23 @@ pub(crate) struct RegisteredSpecs {
     /// (M9-D-R2).
     ///
     /// Native `Finalize`/`Drop` impls (`StreamNative`/`ReaderNative`)
-    /// cannot touch `Context`, JS, locks, or the shared state, so they
-    /// publish a plain-integer intent through a clone of this lock-free
-    /// stack captured at object creation time (see
-    /// [`StreamDropIntents`]). The stack is drained only by `poll_io` on
-    /// the owning Boa thread, which first applies the announced side
-    /// clearings (with retry while the shared cell is borrowed elsewhere)
-    /// and then runs the single abandoned transition for eligible
-    /// operations. Holds only opaque ids — no bytes, paths, or JS values.
+    /// cannot touch `Context`, JS, or the shared state, so they publish
+    /// a plain-integer intent through a clone of this queue captured at
+    /// object creation time (see [`StreamDropIntents`]). The queue is
+    /// drained only by `poll_io` on the owning Boa thread, which first
+    /// applies the announced side clearings (with retry while the shared
+    /// cell is borrowed elsewhere) and then runs the single abandoned
+    /// transition for eligible operations. Holds only opaque ids — no
+    /// bytes, paths, or JS values.
     ///
-    /// The stack is intentionally unbounded: at most a handful of intents
+    /// The queue is intentionally unbounded: at most a handful of intents
     /// per live operation can exist (finalize + drop per side, each
     /// guarded by the native-data publish claim), so its length never
     /// exceeds a small multiple of the live stream operation count, which
     /// is itself bounded by `max_concurrent_reads_per_global`. A fixed
     /// extra cap would contradict that host-configured limit. Shared (not
     /// duplicated) between specs and handle so drops observe the same
-    /// stack `poll_io` drains.
+    /// queue `poll_io` drains.
     #[cfg(feature = "streams-shim")]
     pub(crate) stream_drop_intents: StreamDropIntents,
     /// Extension configuration.
@@ -339,16 +339,15 @@ pub(crate) struct RegisteredSpecs {
     pub(crate) identity: RegistrationIdentity,
 }
 
-/// Lock-free stack of stream endpoint-drop intent notices, shared by one
+/// Queue of stream endpoint-drop intent notices, shared by one
 /// context (M9-D-R2 finalizer boundary).
 ///
-/// Alias of the intrusive stack owned by `streams.rs`
+/// Alias of the queue owned by `streams.rs`
 /// ([`crate::streams::StreamDropIntentStack`]): native `Finalize`/`Drop`
 /// impls push plain-integer intents through a clone captured at object
-/// creation — never touching `Context`, JS, locks, or the shared state —
-/// and `poll_io` drains the same stack on the owning Boa thread. See the
-/// stack docs for the wait-free argument, the ABA argument, and the
-/// memory bound.
+/// creation — never touching `Context`, JS, or the shared state — and
+/// `poll_io` drains the same queue on the owning Boa thread. See the
+/// queue docs for the bounded-wait argument and the memory bound.
 #[cfg(feature = "streams-shim")]
 pub(crate) type StreamDropIntents = std::sync::Arc<crate::streams::StreamDropIntentStack>;
 
@@ -541,7 +540,7 @@ impl RegisteredSpecs {
     /// Swaps out every queued stream endpoint-drop intent for this
     /// context (M9-D-R2).
     ///
-    /// Lock-free swap; owns every intent exclusively afterwards. Called
+    /// Queue swap; owns every intent exclusively afterwards. Called
     /// only from `poll_io` on the owning Boa thread; every intent is
     /// validated by the caller before acting.
     #[cfg(feature = "streams-shim")]
@@ -553,8 +552,9 @@ impl RegisteredSpecs {
     /// borrow (M9-D-R2 retry).
     ///
     /// Boa thread only (`poll_io`). Pushing back through the same
-    /// lock-free stack preserves every notice until it is applied — a
-    /// contended borrow delays, never loses, the side clearing.
+    /// unbounded queue preserves every notice until it is applied — a
+    /// contended borrow delays, never loses, the side clearing (the
+    /// queue push itself is infallible, so retry cannot drop either).
     #[cfg(feature = "streams-shim")]
     pub(crate) fn requeue_stream_drop_intents(
         &self,

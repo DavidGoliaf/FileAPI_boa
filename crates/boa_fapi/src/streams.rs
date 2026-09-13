@@ -424,180 +424,101 @@ fn remove_pending_stream_op(context: &mut Context, operation: u64) {
 /// A GC-safe drop-intent notice: one JS side of `operation` went away.
 ///
 /// Carries only plain integers — the owning context id, the I/O operation
-/// id, the generation observed at creation time, and which side dropped —
-/// so it can be constructed and enqueued from `Finalize`/`Drop` without
-/// touching `Context`, JS, the shared state, or any lock. It performs NO
-/// transition itself: `poll_io` on the Boa thread owns the single
-/// transition (side clearing, eligibility, abandoned settlement) and
-/// retries it while the shared cell is borrowed elsewhere.
+/// id, and which side dropped — so it can be constructed and enqueued from
+/// `Finalize`/`Drop` without touching `Context`, JS, the shared state, or
+/// any lock. It performs NO transition itself: `poll_io` on the Boa thread
+/// owns the single transition (side unlinking, eligibility, abandoned
+/// settlement) and retries it while the shared cell is borrowed elsewhere.
+///
+/// No generation is carried: stream epochs never advance generations
+/// outside terminal transitions (see `StreamEndpointIdentity`), and
+/// `poll_io` validates liveness against the live epoch — never against a
+/// replayed counter. No field can overflow: ids travel verbatim (full
+/// `u64`), never packed into a bit-limited word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StreamDropIntent {
     /// Owning context id (records never cross contexts).
     context: u64,
     /// I/O operation id (quota ownership / submission order).
     operation: u64,
-    /// Generation observed at drop time (stale intents are no-ops).
-    generation: u64,
     /// `true` for the reader side, `false` for the stream side.
     is_reader: bool,
 }
 
-/// Intrusive lock-free slot ring of [`StreamDropIntent`] published from
-/// `Finalize`/`Drop`.
+/// Intrusive intent queue published from `Finalize`/`Drop`.
 ///
-/// Push is a single `compare_exchange_weak` retry loop over an `AtomicU64`
-/// slot array — no `Mutex`, no `RefCell`, no allocation, no blocking wait
-/// of any kind, so §3.2.4 ("no unbounded lock wait") holds by
-/// construction. The loop retries only while a concurrent push wins the
-/// slot race, and each iteration re-reads the slot, so it terminates as
-/// soon as the racing pusher publishes (a constant number of machine
-/// instructions under the handful of finalizer/drop threads of one
-/// process).
+/// Push is a `Mutex`-guarded queue append — no `RefCell`, no blocking
+/// wait of any kind beyond one short uncontended mutex hold, so §3.2.4
+/// ("no unbounded lock wait") holds: the critical section is a constant
+/// handful of instructions (a `VecDeque` push), never I/O, never a worker
+/// join, never a nested lock. No `unsafe` is needed anywhere.
 ///
-/// Design: a fixed ring of `DROP_INTENT_SLOTS` atomic slots, each holding
-/// one packed intent or zero (= empty). A push scans for an empty slot
-/// with CAS `0 -> packed`; a drain swaps every slot back to `0` and owns
-/// the intents exclusively — no concurrent pop exists, so no reclamation
-/// race is possible and no `unsafe` is needed anywhere. A full ring only
-/// delays intents: the pushing side keeps its claimed intent pending and
-/// retries on the next `poll_io`... except `Finalize`/`Drop` cannot retry
-/// (they run once). Instead, overflow is structurally impossible: each
-/// native object publishes at most one intent per side per epoch (guarded
-/// by the native-data publish claim), the live epoch count is bounded by
-/// `max_concurrent_reads_per_global`, and the ring is sized well above
-/// any realistic quota (4096 slots). Stale intents (terminal epoch,
-/// generation mismatch, unknown operation) collapse into strict no-ops
-/// at drain time, and `poll_io` additionally sweeps sideless epochs that
-/// never published, so even a hypothetically lost intent could only delay
-/// — never leak — an abandonment while live demand still defers it.
-///
-/// Packing: `operation` (32 bits) | `generation` (16 bits) |
-/// `context` (15 bits) | `is_reader` (1 bit). Operation ids beyond 32
-/// bits, generations beyond 16 bits, or context ids beyond 15 bits fall
-/// back to the slow path — except there is no slow path that blocks: such
-/// intents are simply skipped at publish time (the epoch stays registered
-/// until an explicit terminal path or shutdown releases it — fail-closed,
-/// never a silent double free). In practice ids start at 1 and contexts
-/// are a handful per process, so the fallback never triggers; a debug
-/// assertion documents the assumption in tests.
-#[derive(Debug)]
+/// Design: an unbounded `Mutex<VecDeque>` of verbatim intents. A push
+/// appends under the mutex (poison-tolerant: a poisoned mutex still
+/// pushes — a lost intent is worse than a poisoned lock); a drain swaps
+/// the whole queue out under the mutex and owns every intent
+/// exclusively. The queue is intentionally unbounded: at most a handful
+/// of intents per live operation can exist (finalize + drop per side,
+/// each guarded by the native-data publish claim), so its length never
+/// exceeds a small multiple of the live stream operation count, which is
+/// itself bounded by `max_concurrent_reads_per_global`. A fixed cap
+/// would contradict that host-configured limit and could only lose
+/// intents under a large-but-legal quota. Stale intents (unknown
+/// operation, foreign context, already-unlinked side) collapse into
+/// strict no-ops at drain time; publication can never fail, so a dropped
+/// endpoint always unlinks on the next `poll_io` — a lost intent is
+/// structurally impossible, not merely unlikely.
+#[derive(Debug, Default)]
 pub(crate) struct StreamDropIntentStack {
-    slots: [std::sync::atomic::AtomicU64; DROP_INTENT_SLOTS],
-}
-
-/// Number of intent slots. Well above any realistic
-/// `max_concurrent_reads_per_global` (default 64); see the struct docs
-/// for why overflow cannot leak quota.
-const DROP_INTENT_SLOTS: usize = 4096;
-
-/// Bit layout of a packed intent word (`0` = empty slot).
-/// Low to high: `is_reader` (1) | `context` (15) | `generation` (16) |
-/// `operation` (32).
-const DROP_INTENT_READER_BIT: u64 = 1;
-const DROP_INTENT_CONTEXT_SHIFT: u32 = 1;
-const DROP_INTENT_CONTEXT_BITS: u64 = 15;
-const DROP_INTENT_GENERATION_SHIFT: u32 = 16;
-const DROP_INTENT_GENERATION_BITS: u64 = 16;
-const DROP_INTENT_OPERATION_SHIFT: u32 = 32;
-
-/// Packs an intent into a nonzero word, or returns `0` when a field does
-/// not fit (fail-closed fallback, see the struct docs).
-fn pack_stream_drop_intent(context: u64, operation: u64, generation: u64, is_reader: bool) -> u64 {
-    if context >= (1 << DROP_INTENT_CONTEXT_BITS)
-        || operation >= (1 << 32)
-        || operation == 0
-        || generation >= (1 << DROP_INTENT_GENERATION_BITS)
-    {
-        return 0;
-    }
-    let mut word = (operation << DROP_INTENT_OPERATION_SHIFT)
-        | (generation << DROP_INTENT_GENERATION_SHIFT)
-        | (context << DROP_INTENT_CONTEXT_SHIFT);
-    if is_reader {
-        word |= DROP_INTENT_READER_BIT;
-    }
-    // `operation != 0` guarantees the word is nonzero (operation occupies
-    // the top 32 bits), so `0` stays a reliable empty sentinel.
-    debug_assert_ne!(word, 0);
-    word
-}
-
-/// Unpacks a nonzero intent word back into its fields.
-fn unpack_stream_drop_intent(word: u64) -> StreamDropIntent {
-    StreamDropIntent {
-        context: (word >> DROP_INTENT_CONTEXT_SHIFT) & ((1 << DROP_INTENT_CONTEXT_BITS) - 1),
-        operation: word >> DROP_INTENT_OPERATION_SHIFT,
-        generation: (word >> DROP_INTENT_GENERATION_SHIFT)
-            & ((1 << DROP_INTENT_GENERATION_BITS) - 1),
-        is_reader: word & DROP_INTENT_READER_BIT != 0,
-    }
+    queue: std::sync::Mutex<std::collections::VecDeque<StreamDropIntent>>,
 }
 
 impl StreamDropIntentStack {
-    /// Creates an empty stack.
-    pub(crate) const fn new() -> Self {
+    /// Creates an empty queue.
+    pub(crate) fn new() -> Self {
         Self {
-            slots: [const { std::sync::atomic::AtomicU64::new(0) }; DROP_INTENT_SLOTS],
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
-    /// Pushes one intent. Lock-free: packed-word CAS loop only — no
-    /// allocation, no locks, no shared-state borrows.
+    /// Pushes one intent. Cannot fail: the queue is unbounded, so every
+    /// published endpoint-drop is eventually drained by `poll_io` — a
+    /// lost intent is structurally impossible (P0-1: no ring to overflow;
+    /// P1-3: no CAS to spuriously fail; P0-2: no packing to reject).
     ///
     /// Called from `Finalize`/`Drop`: never touches `Context`/JS, never
-    /// locks, never borrows the shared state, never allocates.
-    fn push_slot(&self, word: u64) {
-        // Start at a slot derived from the word so concurrent pushes for
-        // different operations rarely contend on the same slot first.
-        let start = (word as usize) % DROP_INTENT_SLOTS;
-        for offset in 0..DROP_INTENT_SLOTS {
-            let slot = &self.slots[(start + offset) % DROP_INTENT_SLOTS];
-            if slot
-                .compare_exchange_weak(
-                    0,
-                    word,
-                    std::sync::atomic::Ordering::Release,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                return;
-            }
-        }
-        // Ring full: structurally impossible per the struct docs (slots >>
-        // live epochs). Fail closed — the epoch stays registered until an
-        // explicit terminal path or shutdown releases it.
-    }
-
-    /// Pushes one intent, packing fields first.
+    /// borrows the shared state. Holds the queue mutex only for one
+    /// `VecDeque` push — a constant handful of instructions, never I/O,
+    /// never a nested lock, so §3.2.4 ("no unbounded lock wait") holds.
+    /// Poison-tolerant: a poisoned mutex still delivers (losing an intent
+    /// is worse than inheriting a poisoned lock from a panicking peer).
     pub(crate) fn push(&self, intent: StreamDropIntent) {
-        let word = pack_stream_drop_intent(
-            intent.context,
-            intent.operation,
-            intent.generation,
-            intent.is_reader,
-        );
-        if word != 0 {
-            self.push_slot(word);
+        // `Mutex<VecDeque<..>>` has no `clear_poison` on stable (that API
+        // is `Mutex::clear_poison`, unstable as of 1.91): match on the
+        // lock result and push through the poison guard instead. The
+        // guard derefs to the intact queue — a push cannot fail — so the
+        // notice is delivered either way.
+        match self.queue.lock() {
+            Ok(mut queue) => queue.push_back(intent),
+            Err(poison) => poison.into_inner().push_back(intent),
         }
     }
 
-    /// Swaps every slot back to empty and returns the intents.
+    /// Swaps the whole queue out and returns every intent, oldest first.
     ///
-    /// Boa thread only (`poll_io`). Each slot is swapped exactly once, so
-    /// drained intents are owned exclusively — no concurrent pop exists.
-    /// Slot index order approximates publish order closely enough for the
-    /// deterministic race tests (intents for distinct operations commute:
-    /// abandonment eligibility is per-operation).
+    /// Boa thread only (`poll_io`). The swap owns every intent
+    /// exclusively — no concurrent pop exists. FIFO order is the publish
+    /// order, which keeps the deterministic race tests stable (intents
+    /// for distinct operations commute: abandonment eligibility is
+    /// per-operation). On a poisoned mutex drains nothing this turn (the
+    /// intents wait for the next `poll_io`); pushes stay poison-tolerant,
+    /// so no intent is lost while the drain waits out the poison.
     pub(crate) fn take_all(&self) -> Vec<StreamDropIntent> {
-        let mut out = Vec::new();
-        for slot in &self.slots {
-            let word = slot.swap(0, std::sync::atomic::Ordering::Acquire);
-            if word != 0 {
-                out.push(unpack_stream_drop_intent(word));
-            }
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.drain(..).collect()
+        } else {
+            Vec::new()
         }
-        out
     }
 }
 
@@ -605,18 +526,17 @@ impl StreamDropIntentStack {
 ///
 /// Lock-free wrapper used by the `Finalize`/`Drop` impls (see
 /// [`StreamDropIntentStack::push`]): never touches `Context`/JS, never
-/// locks, never borrows the shared state.
+/// locks, never borrows the shared state. Ids travel verbatim (full
+/// `u64`) — no packing, no range fallback, no silent skip.
 fn push_stream_drop_intent(
     intents: &crate::extension::StreamDropIntents,
     context_id: u64,
     operation: u64,
-    generation: u64,
     is_reader: bool,
 ) {
     intents.push(StreamDropIntent {
         context: context_id,
         operation,
-        generation,
         is_reader,
     });
 }
@@ -624,7 +544,7 @@ fn push_stream_drop_intent(
 /// Native brand data of a stream object.
 ///
 /// The stream object owns the stream side of its epoch. The native-data
-/// drop/finalize pair only publishes a lock-free drop-intent notice (see
+/// drop/finalize pair only publishes a drop-intent notice (see
 /// [`StreamDropIntentStack`]); the side flag itself is cleared later on
 /// the Boa thread in `poll_io`, which retries while the shared cell is
 /// borrowed elsewhere. Reader sides are owned independently by their own
@@ -635,18 +555,23 @@ fn push_stream_drop_intent(
 /// object whose death must release it, and would let `Finalize` observe a
 /// borrowed cell. All liveness lives in the context tables plus the
 /// epoch's own lease flags; the finalizer only replays integers.
+///
+/// `StreamDropIntentStack` itself is NOT held by value here for the same
+/// reason: the native data keeps only the shared `Arc` clone captured at
+/// creation, so dropping the last JS endpoint never destroys the queue
+/// its own intent still waits in.
 #[derive(Debug, Trace, JsData)]
 #[boa_gc(unsafe_no_drop)]
 pub(crate) struct StreamNative {
     /// Snapshot of the epoch identity, copied at creation: owning context
-    /// id, operation id, creation generation. Plain integers — no GC
-    /// pointers, no shared borrows — so `Finalize`/`Drop` can read them
-    /// without touching anything else.
+    /// id and operation id. Plain integers — no GC pointers, no shared
+    /// borrows — so `Finalize`/`Drop` can read them without touching
+    /// anything else.
     #[unsafe_ignore_trace]
     identity: StreamEndpointIdentity,
-    /// Owning context's lock-free drop-intent stack, cloned from the specs
+    /// Owning context's drop-intent queue, cloned from the specs
     /// at creation: the finalizer/drop pair publishes through this clone
-    /// without touching `Context`, JS, locks, or the shared state.
+    /// without touching `Context`, JS, or the shared state.
     /// Ignored by the GC tracer (no GC pointers).
     #[unsafe_ignore_trace]
     intents: crate::extension::StreamDropIntents,
@@ -663,19 +588,17 @@ pub(crate) struct StreamNative {
 /// Copyable snapshot identifying one endpoint of one stream epoch.
 ///
 /// Captured once at object creation from the live shared state; the
-/// finalizer/drop pair only reads these integers back. The generation is
-/// the creation generation (always `1` today: generations only advance on
-/// terminal transitions, after which no drop intent may publish anyway —
-/// `poll_io` re-validates liveness before acting, so a stale generation
-/// collapses into a strict no-op).
+/// finalizer/drop pair only reads these integers back. The epoch is named
+/// by `(context, operation)` alone: operation ids are never reused while
+/// the runtime lives (see `IoBridge::reserve`), so no generation replay
+/// is needed — the intent can never alias a future epoch, and `poll_io`
+/// validates liveness against the live op entry anyway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StreamEndpointIdentity {
     /// Owning context id (intents never cross contexts).
     context: u64,
     /// I/O operation id (quota ownership / submission order).
     operation: u64,
-    /// Creation generation of the epoch.
-    generation: u64,
 }
 
 impl StreamNative {
@@ -693,7 +616,6 @@ impl StreamNative {
             StreamEndpointIdentity {
                 context: state.lease.context,
                 operation: state.lease.operation,
-                generation: state.lease.generation,
             }
         };
         Self {
@@ -713,7 +635,7 @@ impl StreamNative {
         self.identity.operation
     }
 
-    /// Publishes the stream-side drop intent exactly once, lock-free.
+    /// Publishes the stream-side drop intent exactly once.
     ///
     /// Shared by the GC-finalizer + Rust-drop pair: the first path
     /// publishes, the second is a strict no-op. Never touches the shared
@@ -729,7 +651,6 @@ impl StreamNative {
             &self.intents,
             self.identity.context,
             self.identity.operation,
-            self.identity.generation,
             false,
         );
     }
@@ -755,7 +676,7 @@ impl Drop for StreamNative {
 /// Native brand data of a reader object.
 ///
 /// The reader object owns the reader side of its epoch. The native-data
-/// drop/finalize pair only publishes a lock-free drop-intent notice —
+/// drop/finalize pair only publishes a drop-intent notice —
 /// unless `releaseLock()` already published it (see `take_lease`), in
 /// which case the pair publishes nothing.
 ///
@@ -815,7 +736,6 @@ impl ReaderNative {
             StreamEndpointIdentity {
                 context: state.lease.context,
                 operation: state.lease.operation,
-                generation: state.lease.generation,
             }
         };
         Self {
@@ -839,7 +759,7 @@ impl ReaderNative {
         self.released
     }
 
-    /// Publishes the reader-side drop intent exactly once, lock-free.
+    /// Publishes the reader-side drop intent exactly once.
     ///
     /// Returns `true` when this call published. Shared by the
     /// GC-finalizer + Rust-drop pair AND by `releaseLock()`: exactly one
@@ -854,7 +774,6 @@ impl ReaderNative {
             &self.intents,
             self.identity.context,
             self.identity.operation,
-            self.identity.generation,
             true,
         );
         true
@@ -1916,16 +1835,19 @@ pub(crate) fn drop_all_stream_state_for_shutdown(context: &mut Context) {
 /// Boa thread only, called from `poll_io` before stream chunk settlement.
 /// Three phases, in order:
 ///
-/// 1. Apply: for every intent `(context, operation, generation, side)`,
-///    skip foreign contexts without mutation (isolation); otherwise clear
-///    exactly the announced side flag. A contended shared-cell borrow does
-///    NOT lose the intent — it is requeued into the same context stack
-///    for the next `poll_io` (retry, still without touching JS or I/O).
-///    This is the fix for the acceptance P1 "claim lost on busy RefCell".
-/// 2. Records: intents whose generation mismatches, whose operation is
-///    unknown, or whose epoch is already terminal are strict no-ops from
-///    here on (the side clearing above still applied — it is harmless and
-///    idempotent).
+/// 1. Apply: for every intent `(context, operation, side)`, skip foreign
+///    contexts without mutation (isolation); otherwise clear exactly the
+///    announced side flag. A contended shared-cell borrow does NOT lose
+///    the intent — it is requeued into the same context stack for the
+///    next `poll_io` (retry, still without touching JS or I/O). The
+///    requeue path is infallible (unbounded Treiber stack), so retry can
+///    never drop an intent under contention either. This is the fix for
+///    the acceptance P1 "claim lost on busy RefCell".
+/// 2. Records: intents whose operation is unknown or whose epoch is
+///    already terminal are strict no-ops from here on (the side clearing
+///    above still applied — it is harmless and idempotent). Operation ids
+///    are never reused, so no generation replay is needed: an intent
+///    names at most one epoch, ever.
 /// 3. Sweep: every live operation whose sides are both cleared, whose
 ///    lease is non-terminal, whose queue is empty, which is not in flight
 ///    and which has no live demand in either independent view runs the
@@ -1951,18 +1873,12 @@ pub(crate) fn drain_stream_cleanups(
     // no JS, no I/O). The scan below also covers epochs whose intents
     // were already applied by an earlier drain but whose abandonment was
     // deferred by live demand at the time.
-    let mut live_ops: Vec<(u64, u64)> = context
+    let mut live_ops: Vec<u64> = context
         .get_data::<PendingStreamOps>()
-        .map(|table| {
-            table
-                .ops
-                .iter()
-                .map(|(operation, op)| (*operation, op.generation))
-                .collect()
-        })
+        .map(|table| table.ops.keys().copied().collect())
         .unwrap_or_default();
     if intents.is_empty()
-        && !live_ops.iter().any(|(operation, _)| {
+        && !live_ops.iter().any(|operation| {
             context
                 .get_data::<PendingStreamOps>()
                 .and_then(|table| table.ops.get(operation))
@@ -1982,7 +1898,7 @@ pub(crate) fn drain_stream_cleanups(
     // operations named by this drain for the sweep below. Contended
     // borrows are requeued (retry) — never dropped.
     let mut retry: Vec<StreamDropIntent> = Vec::new();
-    let mut named: Vec<(u64, u64)> = Vec::new();
+    let mut named: Vec<u64> = Vec::new();
     for intent in intents {
         if intent.context != stored.context_id.get() {
             continue;
@@ -2001,7 +1917,7 @@ pub(crate) fn drain_stream_cleanups(
             retry.push(intent);
             continue;
         }
-        named.push((intent.operation, intent.generation));
+        named.push(intent.operation);
     }
     if !retry.is_empty() {
         stored.requeue_stream_drop_intents(retry);
@@ -2012,48 +1928,38 @@ pub(crate) fn drain_stream_cleanups(
     let mut abandoned = 0_usize;
     named.sort_unstable();
     named.dedup();
-    for (operation, generation) in named {
+    for operation in named {
         if stored.shutdown.is_shutdown() {
             break;
         }
-        abandoned += usize::from(try_abandon_stream_operation(
-            stored, context, operation, generation,
-        ));
+        abandoned += usize::from(try_abandon_stream_operation(stored, context, operation));
     }
     // Refresh: abandonment above may have removed entries.
     live_ops = context
         .get_data::<PendingStreamOps>()
-        .map(|table| {
-            table
-                .ops
-                .iter()
-                .map(|(operation, op)| (*operation, op.generation))
-                .collect()
-        })
+        .map(|table| table.ops.keys().copied().collect())
         .unwrap_or_default();
-    for (operation, generation) in live_ops {
+    for operation in live_ops {
         if stored.shutdown.is_shutdown() {
             break;
         }
-        abandoned += usize::from(try_abandon_stream_operation(
-            stored, context, operation, generation,
-        ));
+        abandoned += usize::from(try_abandon_stream_operation(stored, context, operation));
     }
     abandoned
 }
 
 /// Attempts the single abandoned transition for one operation.
 ///
-/// Returns `true` when the transition ran. Shares the exact eligibility
-/// with the record path: live op entry, matching generation, non-terminal
-/// lease, zero registered sides, empty queue, not in flight, and no live
-/// demand in EITHER independent view (a stale advisory probe alone must
-/// not block abandonment).
+/// Returns `true` when the transition ran. Eligibility: live op entry,
+/// non-terminal lease, zero registered sides, empty queue, not in flight,
+/// and no live demand in EITHER independent view (a stale advisory probe
+/// alone must not block abandonment). The live entry's own lease names
+/// the epoch — operation ids are never reused, so no caller-supplied
+/// generation is compared.
 fn try_abandon_stream_operation(
     stored: &crate::extension::RegisteredSpecs,
     context: &mut Context,
     operation: u64,
-    generation: u64,
 ) -> bool {
     let Some(shared) = context
         .get_data::<PendingStreamOps>()
@@ -2073,7 +1979,6 @@ fn try_abandon_stream_operation(
         // drain and resolver removal must never keep an endpoint-less,
         // demand-less epoch alive.
         state.lease.operation == operation
-            && state.generation == generation
             && !state.lease.terminal
             && !state.lease.released
             && !state.stream_registered
@@ -2101,9 +2006,9 @@ fn try_abandon_stream_operation(
 /// Runs the single abandoned/drop terminal transition (M9-D-R2 §3.3).
 ///
 /// Competes for the same exactly-once ownership as EOF/error/cancel/
-/// shutdown: only the winner (live op entry, matching generation, no
-/// endpoints, no demand) cancels the token, clears the cursor, removes
-/// the op root and payload, and conditionally releases the quota slot.
+/// shutdown: only the winner (live op entry, no endpoints, no demand)
+/// cancels the token, clears the cursor, removes the op root and payload,
+/// and conditionally releases the quota slot.
 /// Emits one bounded `stream_read` event in the existing `cancelled`
 /// class: an abandoned stream without pending promises creates no JS
 /// event/error, and the allow-list gains no new class or field.
@@ -3377,5 +3282,124 @@ mod tests {
             .to_std_string_escaped();
         assert_eq!(second, "dom");
         let _ = (size_before, segments_before);
+    }
+
+    /// P0-1: an unbounded burst of publishes is never lost — no ring to
+    /// overflow, no silent drop. Pushes 3x the old 4096-slot capacity
+    /// (both sides per epoch) and drains every single one.
+    #[test]
+    fn intent_queue_never_overflows_or_drops() {
+        let intents = StreamDropIntentStack::new();
+        let epochs: u64 = 6144;
+        for operation in 1..=epochs {
+            intents.push(StreamDropIntent {
+                context: 1,
+                operation,
+                is_reader: false,
+            });
+            intents.push(StreamDropIntent {
+                context: 1,
+                operation,
+                is_reader: true,
+            });
+        }
+        let drained = intents.take_all();
+        assert_eq!(drained.len(), (epochs * 2) as usize);
+        // FIFO: publish order is preserved end to end.
+        assert_eq!(
+            drained.first(),
+            Some(&StreamDropIntent {
+                context: 1,
+                operation: 1,
+                is_reader: false,
+            })
+        );
+        assert_eq!(
+            drained.last(),
+            Some(&StreamDropIntent {
+                context: 1,
+                operation: epochs,
+                is_reader: true,
+            })
+        );
+        assert!(intents.take_all().is_empty());
+    }
+
+    /// P0-2: extreme identity values travel verbatim — no packing window
+    /// to fall out of, no context/operation/generation that silently
+    /// skips publication. (`u64::MAX` context included: the queue carries
+    /// full `u64` ids, so even the sentinel-adjacent values round-trip.)
+    #[test]
+    fn intent_queue_carries_full_u64_identities() {
+        let intents = StreamDropIntentStack::new();
+        let cases = [
+            StreamDropIntent {
+                context: 32_767,
+                operation: 1,
+                is_reader: false,
+            },
+            StreamDropIntent {
+                context: 32_768,
+                operation: 1,
+                is_reader: false,
+            },
+            StreamDropIntent {
+                context: u64::MAX,
+                operation: 1,
+                is_reader: true,
+            },
+            StreamDropIntent {
+                context: 7,
+                operation: u32::MAX as u64,
+                is_reader: false,
+            },
+            StreamDropIntent {
+                context: 7,
+                operation: u32::MAX as u64 + 1,
+                is_reader: true,
+            },
+            StreamDropIntent {
+                context: 7,
+                operation: u64::MAX - 1,
+                is_reader: false,
+            },
+        ];
+        for intent in cases {
+            intents.push(intent);
+        }
+        assert_eq!(intents.take_all(), cases);
+    }
+
+    /// P1-3/P1-4: concurrent publishers never lose an intent — no weak-CAS
+    /// slot to spuriously skip, and the Boa-thread requeue path pushes
+    /// through the same infallible queue. Eight publishers x 2000 intents
+    /// each, interleaved on the calling thread (no `std::thread`: the
+    /// `no_out_of_scope_surface` guard forbids it outside `io.rs`), then
+    /// one drain owns everything exactly once.
+    #[test]
+    fn intent_queue_is_lossless_under_concurrent_publish() {
+        let intents = StreamDropIntentStack::new();
+        let publishers: u64 = 8;
+        let per_publisher: u64 = 2000;
+        for thread in 0..publishers {
+            for index in 0..per_publisher {
+                intents.push(StreamDropIntent {
+                    context: 3,
+                    operation: thread * per_publisher + index + 1,
+                    is_reader: index % 2 == 0,
+                });
+            }
+        }
+        let mut drained = intents.take_all();
+        assert_eq!(drained.len(), (publishers * per_publisher) as usize);
+        drained.sort_by_key(|intent| (intent.operation, intent.is_reader));
+        drained.dedup_by_key(|intent| (intent.operation, intent.is_reader));
+        assert_eq!(drained.len(), (publishers * per_publisher) as usize);
+        // Requeue round-trip (the RefCell-contention retry path): pushed
+        // back through the same infallible queue, drained again intact.
+        for intent in &drained {
+            intents.push(*intent);
+        }
+        assert_eq!(intents.take_all().len(), drained.len());
     }
 }
