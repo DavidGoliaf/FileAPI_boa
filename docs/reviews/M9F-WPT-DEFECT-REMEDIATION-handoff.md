@@ -82,6 +82,13 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations 
 `0` defects; `cargo test --workspace --all-features -- --test-threads=1`
 проходит без падений; fmt/clippy чисты.
 
+Внешний CI полностью зелёный: run
+`https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/34772448617`
+(commit `9975de5`) — `M8 validation (ubuntu-latest|windows-latest|
+macos-14)` success, `M9E gate negative controls (ubuntu-latest|
+windows-latest)` success, `M9E release conformance (strict gate)`
+**success** (`--strict` exit 0, `release_green: true`).
+
 ## 4. Затронутые suites (обновлены под новое нормативное поведение)
 
 - M2: `file_name_conversions`, `host_file_from_bytes`;
