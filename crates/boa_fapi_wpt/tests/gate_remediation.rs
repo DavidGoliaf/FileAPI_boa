@@ -319,7 +319,7 @@ fn inventory_entry(path: &str, content: &str) -> String {
 
 fn manifest_json(files: &[String]) -> String {
     format!(
-        "{{\"schema_version\":2,\"source\":{{\"repository\":\"{REPOSITORY}\",\"commit\":\"{COMMIT}\",\"license\":\"BSD-3-Clause\"}},\"corpus_root\":\"corpus\",\"default_timeout_ms\":5000,\"files\":[{}]}}",
+        "{{\"schema_version\":2,\"source\":{{\"repository\":\"{REPOSITORY}\",\"commit\":\"{COMMIT}\",\"license\":\"BSD-3-Clause\"}},\"corpus_root\":\"corpus\",\"default_timeout_ms\":60000,\"files\":[{}]}}",
         files.join(",")
     )
 }
