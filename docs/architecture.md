@@ -88,7 +88,7 @@ owns the host bridge; `extension.rs` owns the entry points:
   `MAX_CLONE_STRING_BYTES` / `MAX_CLONE_FILES`: malformed/truncated/
   overflow/unknown-version/unknown-tag/trailing fail without panic or
   partial output; payloads carry materialized bytes + public metadata
-  only (M1-normalized type, sanitized name, stored `lastModified`) —
+  only (M1-normalized type, verbatim name per ADR-0048, stored `lastModified`) —
   never paths, capabilities, OS handles or snapshot identities;
 - `clone_blob`/`clone_file`/`clone_file_list` materialize through the
   existing checked path (`SourceFailed` typed, no partial payload;
@@ -304,7 +304,8 @@ packaging shared with the async reader:
   import plus the weak-platform gate before any JS object, preflights
   `max_blob_size`, tracks the registry for shutdown `close_all`, wraps in
   `ArcResourceSource` (shutdown-aware, per-read snapshot checks),
-  attaches only the display name (`/` → `:`, no basename). Signature
+  attaches only the supplied display name verbatim (including `/`, no
+  basename; accepted ADR-0048). The host must not supply a secret path. Signature
   adaptation (`registry` + `Arc` vs target `&dyn`) recorded in ADR-0024.
 - `boa_fapi::lifecycle` — `ShutdownFlag` (closed bit + cancellation +
   tracked closers) in `RegisteredSpecs`/handle/every fs import;

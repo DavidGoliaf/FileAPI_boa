@@ -12,6 +12,10 @@
 `docs/reviews/M9E-handoff.md` §3 / `tasks/22…md` §8. После этой ветки
 `release_green == true`, `--strict` exit 0, CI release job зелёный.
 
+Разделы 1–6 ниже сохраняют исторический handoff и CI evidence для commit
+`9975de5`; они не подтверждают текущий локальный audit follow-up. Его
+отдельный статус и ожидаемая валидация указаны в §7.
+
 ## 1. Четыре изменения
 
 1. **`File.name` verbatim** (WD §4.1 step 4.4). `normalize_file_name` больше
@@ -113,3 +117,65 @@ windows-latest)` success, `M9E release conformance (strict gate)`
 
 - M9-F release/delivery closure (`tasks/17_TASK_M9F_RELEASE_DELIVERY.md`).
 - Общая release-приёмка M9-E разрешена (`release_green == true`).
+
+## 7. Текущий локальный audit follow-up — local validation green, CI pending
+
+Пользователь принял remediation всех findings аудита и change-control
+ADR-0048–0051. Это отдельный локальный follow-up, не повторное утверждение
+исторических totals, report hashes или CI из §2–3.
+
+Документационная часть: исправлены обещания slash replacement в TZ
+(требования и приложение A), spec matrix, architecture и host integration;
+clone metadata описывает verbatim name. Уточнены синхронный abort с
+условным loadend, Data URL fallback и его влияние на квоту (+24 байта,
+37-байтный prefix). CHANGELOG содержит unreleased compatibility changes;
+spec-delta и ADR-0052 фиксируют границы принятого change-control.
+
+Точный scope родительского исправления: очистка таблиц FileReader при
+shutdown (включая roots и deferred state на границе `loadstart`), shutdown
+guard после `abort` handler до `loadend`/enqueue listener error, проверка
+полной длины в `package_data_url` до allocation base64 payload. Host byte
+creation/context validation и изменения telemetry не входят в follow-up.
+В этой документационной подзадаче Rust source и тесты не редактируются.
+
+Регрессии, добавленные родителем (сообщённое evidence, без независимого
+запуска в этой подзадаче):
+
+- `M9C-FR-03`: `shutdown_drops_all_reader_state` — родитель сообщил RED
+  на удержанных roots, затем green после исправления;
+  `shutdown_in_abort_handler_suppresses_loadend_and_listener_error` —
+  RED с `abort|loadend|returned`, затем исправление;
+  `shutdown_at_loadstart_boundary_drops_deferred_reader_state` — проверка
+  очистки deferred state.
+- `M4-FR-05` / `M4B-FRS-05` (data URL и общий sync/async packaging):
+  `package::tests::data_url_exact_limit_and_one_below_cover_base64_boundaries`.
+  Старый prefix — 13 байт, новый — 37; +24 байта учитываются в квоте.
+
+Повторное ревью расширило `M9C-FR-03` двумя проверками:
+`shutdown_in_progress_handler_keeps_state_cleared` и
+`shutdown_in_final_progress_preserves_loading_and_null_result`.
+Промежуточный progress не восстанавливает очищенный PumpState. После
+финального progress проверяется shutdown до packaging и публикации
+DONE/result. Финальный тест перебирает четыре readAs-метода и пустой/
+непустой Blob; до исправления получил `2:string:null` вместо `1:null:null`,
+после исправления все восемь вариантов проходят, поздние poll/jobs не
+меняют состояние и не добавляют событий. Причина пропуска: прежние
+shutdown-тесты проверяли события/bridge, но не итоговые readyState/result.
+В тесте промежуточного progress assert перенесён после run_jobs: первый
+pump выполняет только loadstart и откладывает chunk.
+
+Локальная валидация текущего рабочего дерева поверх `b1f1d7b` (Windows):
+
+```powershell
+cargo test -p boa_fapi --all-features --lib shutdown_in_final_progress_preserves_loading_and_null_result
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=1
+cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict
+```
+
+Все команды exit 0; strict: `expectations_match=true`, `release_green=true`,
+379 upstream PASS, 6 smoke PASS, 0 defects, 111 NOTRUN, 0 unexpected.
+Внешний CI текущего diff, coverage/deny/package/fresh-clone gates не
+перезапускались; полная release/delivery приёмка не заявляется.
+Старый CI commit `9975de5` не доказывает исправление новых findings.

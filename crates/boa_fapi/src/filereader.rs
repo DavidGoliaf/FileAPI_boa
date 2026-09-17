@@ -1188,8 +1188,15 @@ fn run_pump(
                 // A `progress` handler runs reentrantly here with the same
                 // consequences as `loadstart` above: on generation
                 // replacement the old job emits nothing further, releases
-                // no slot, and submits no successor.
-                if !generation_current(reader, generation) {
+                // no slot, and submits no successor. A shutdown inside the
+                // handler keeps the generation current but forbids every
+                // further settlement: become a strict no-op instead of
+                // restoring cleared packaging state or submitting.
+                if !generation_current(reader, generation)
+                    || crate::extension::snapshot(context)
+                        .map(|specs| specs.shutdown.is_shutdown())
+                        .unwrap_or(true)
+                {
                     return Ok(JsValue::undefined());
                 }
             }
@@ -1263,7 +1270,9 @@ fn finish_at_eof(
         // consequences as `loadstart`/`progress` in `run_pump`: on
         // generation replacement nothing below may publish packaging,
         // release the old slot, or emit events.
-        if !generation_current(reader, generation) {
+        if !generation_current(reader, generation)
+            || crate::extension::snapshot(context)?.shutdown.is_shutdown()
+        {
             return Ok(JsValue::undefined());
         }
     }
@@ -1642,7 +1651,7 @@ fn dispatch_terminal_now(
     // Conditional `loadend`: state is DONE (not loading), so it fires unless
     // a reentrant handler replaced the generation with a new read.
     let mut reported = first_error;
-    if generation_current(reader, generation) {
+    if !specs.shutdown.is_shutdown() && generation_current(reader, generation) {
         let event = dom::create_progress_event(
             &specs,
             "loadend",
@@ -1660,7 +1669,9 @@ fn dispatch_terminal_now(
             reported = Some(error);
         }
     }
-    if let Some(error) = reported {
+    if !specs.shutdown.is_shutdown()
+        && let Some(error) = reported
+    {
         enqueue_listener_error(context, error.to_string());
     }
     Ok(JsValue::undefined())
@@ -1964,7 +1975,22 @@ pub(crate) fn drop_pending_for_shutdown(context: &mut Context, operation: u64) {
 /// Quota itself releases through the bridge shutdown closer; this drain
 /// only removes the Boa-side roots. Idempotent: an empty table is a
 /// no-op.
-pub(crate) fn drop_all_reader_state_for_shutdown(_context: &mut Context) {}
+pub(crate) fn drop_all_reader_state_for_shutdown(context: &mut Context) {
+    if let Some(table) = context.host_defined_mut().get_mut::<PendingReaderOps>() {
+        table.ops.clear();
+    }
+    if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+        table.states.clear();
+    }
+    if let Some(holder) = context.host_defined_mut().get_mut::<QueueHolder>() {
+        holder.queue.active = 0;
+    }
+    if let Ok(specs) = crate::extension::snapshot(context)
+        && let Ok(mut payloads) = specs.reader_payloads.lock()
+    {
+        payloads.clear();
+    }
+}
 
 /// Releases the quota slot after a successful terminal settlement.
 fn settle_success_release(
@@ -2703,6 +2729,302 @@ mod tests {
         assert_eq!(js_log(context), "loadstart|abort|loadend");
         assert_eq!(js_state(context), "2:null:null");
         assert_quota_recovered(context);
+    }
+
+    fn install_shutdown_callback(context: &mut Context) {
+        let callback = boa_engine::object::FunctionObjectBuilder::new(
+            context.realm(),
+            boa_engine::NativeFunction::from_fn_ptr(|_, _, context| {
+                let handle = crate::extension::snapshot(context)?.test_handle();
+                handle.shutdown(context).expect("shutdown callback");
+                Ok(JsValue::undefined())
+            }),
+        )
+        .build();
+        context
+            .register_global_property(
+                js_string!("shutdownRuntime"),
+                callback,
+                boa_engine::property::Attribute::all(),
+            )
+            .expect("publish shutdown callback");
+    }
+
+    #[test]
+    fn shutdown_in_abort_handler_suppresses_loadend_and_listener_error() {
+        for throws in [false, true] {
+            let mut context = setup_with_limits(quota_one_limits());
+            install_shutdown_callback(&mut context);
+            context
+                .eval(Source::from_bytes(&format!(
+                    "globalThis.log = []; globalThis.reader = new FileReader();
+                     reader.onabort = () => {{ log.push('abort'); shutdownRuntime();
+                         if ({throws}) throw new Error('listener failure'); }};
+                     reader.onloadend = () => log.push('loadend');
+                     reader.readAsText(new Blob(['pending'])); reader.abort();
+                     log.push('returned');"
+                )))
+                .expect("abort returns normally");
+            assert_eq!(js_log(&mut context), "abort|returned");
+            context
+                .run_jobs()
+                .expect("no listener error after shutdown");
+            assert_eq!(js_log(&mut context), "abort|returned");
+        }
+    }
+
+    #[test]
+    fn shutdown_in_progress_handler_keeps_state_cleared() {
+        let mut context = setup_with_limits(quota_one_limits());
+        install_shutdown_callback(&mut context);
+        let specs = crate::extension::snapshot(&context).expect("registered");
+        let handle = specs.test_handle();
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; globalThis.reader = new FileReader();
+                 reader.onprogress = () => { log.push('progress'); shutdownRuntime(); };
+                 for (const type of ['load', 'loadend', 'error', 'abort'])
+                     reader.addEventListener(type, () => log.push(type));
+                 reader.readAsText(new Blob([new Uint8Array(200000)]));",
+            ))
+            .expect("start read");
+        let (operation, reader, generation) = context
+            .get_data::<PendingReaderOps>()
+            .expect("roots")
+            .ops
+            .iter()
+            .map(|(id, pending)| (*id, pending.reader.clone(), pending.generation))
+            .next()
+            .expect("pending read");
+        let state = take_pump_state(&mut context, operation).expect("pump state");
+        run_pump(
+            &reader,
+            generation,
+            operation,
+            state,
+            Some(crate::io::FileReaderChunkKind::Chunk(bytes::Bytes::from(
+                vec![0x41; 100_000],
+            ))),
+            &mut context,
+        )
+        .expect("loadstart defers the chunk");
+        assert_eq!(js_log(&mut context), "");
+        context.run_jobs().expect("deferred chunk job");
+        assert_eq!(js_log(&mut context), "progress");
+        context.run_jobs().expect("run_jobs");
+        assert!(
+            context
+                .get_data::<PendingReaderOps>()
+                .expect("roots")
+                .ops
+                .is_empty()
+        );
+        assert!(
+            context
+                .get_data::<PumpStates>()
+                .expect("states")
+                .states
+                .is_empty()
+        );
+        assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+        assert_eq!(active_count(&context), 0);
+        assert!(!handle.has_pending_io());
+        assert_eq!(handle.poll_io(&mut context).expect("late poll"), 0);
+    }
+
+    #[test]
+    fn shutdown_in_final_progress_preserves_loading_and_null_result() {
+        for method in [
+            "readAsText",
+            "readAsArrayBuffer",
+            "readAsBinaryString",
+            "readAsDataURL",
+        ] {
+            for bytes in [&b""[..], &b"data"[..]] {
+                let mut context = setup_with_limits(quota_one_limits());
+                install_shutdown_callback(&mut context);
+                let specs = crate::extension::snapshot(&context).expect("registered");
+                let handle = specs.test_handle();
+                context
+                    .eval(Source::from_bytes(&format!(
+                        "globalThis.log = []; globalThis.reader = new FileReader();
+                     reader.onprogress = event => {{
+                         if (event.loaded !== event.total) throw new Error('not final');
+                         log.push('progress'); shutdownRuntime();
+                     }};
+                     for (const type of ['load', 'loadend', 'error', 'abort'])
+                         reader.addEventListener(type, () => log.push(type));
+                     reader.{method}(new Blob([new Uint8Array({})]));",
+                        bytes.len()
+                    )))
+                    .expect("start read");
+                let (operation, reader, generation) = context
+                    .get_data::<PendingReaderOps>()
+                    .expect("roots")
+                    .ops
+                    .iter()
+                    .map(|(id, pending)| (*id, pending.reader.clone(), pending.generation))
+                    .next()
+                    .expect("pending read");
+                let state = take_pump_state(&mut context, operation).expect("pump state");
+                let chunk = if bytes.is_empty() {
+                    crate::io::FileReaderChunkKind::Eof
+                } else {
+                    crate::io::FileReaderChunkKind::Chunk(bytes::Bytes::copy_from_slice(bytes))
+                };
+                run_pump(
+                    &reader,
+                    generation,
+                    operation,
+                    state,
+                    Some(chunk),
+                    &mut context,
+                )
+                .expect("loadstart");
+                context.run_jobs().expect("final progress");
+                assert_eq!(js_log(&mut context), "progress");
+                assert_eq!(
+                    js_state(&mut context),
+                    "1:null:null",
+                    "{method}, {} bytes",
+                    bytes.len()
+                );
+                assert!(
+                    context
+                        .get_data::<PendingReaderOps>()
+                        .expect("roots")
+                        .ops
+                        .is_empty()
+                );
+                assert!(
+                    context
+                        .get_data::<PumpStates>()
+                        .expect("states")
+                        .states
+                        .is_empty()
+                );
+                assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+                assert_eq!(active_count(&context), 0);
+                assert!(!handle.has_pending_io());
+                assert_eq!(handle.poll_io(&mut context).expect("late poll"), 0);
+                context.run_jobs().expect("late jobs");
+                assert_eq!(js_state(&mut context), "1:null:null");
+                assert_eq!(js_log(&mut context), "progress");
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_at_loadstart_boundary_drops_deferred_reader_state() {
+        for deferred in [false, true] {
+            let mut context = setup_with_limits(quota_one_limits());
+            install_shutdown_callback(&mut context);
+            let specs = crate::extension::snapshot(&context).expect("registered");
+            let handle = specs.test_handle();
+            context
+                .eval(Source::from_bytes(&format!(
+                    "globalThis.log = []; globalThis.reader = new FileReader();
+                     reader.onloadstart = () => {{ log.push('loadstart');
+                         if ({deferred}) Promise.resolve().then(shutdownRuntime);
+                         else shutdownRuntime(); }};
+                     for (const type of ['progress', 'load', 'loadend', 'error', 'abort'])
+                         reader.addEventListener(type, () => log.push(type));
+                     reader.readAsText(new Blob(['pending']));"
+                )))
+                .expect("start read");
+            let (operation, reader, generation) = context
+                .get_data::<PendingReaderOps>()
+                .expect("roots")
+                .ops
+                .iter()
+                .map(|(id, pending)| (*id, pending.reader.clone(), pending.generation))
+                .next()
+                .expect("pending read");
+            let state = take_pump_state(&mut context, operation).expect("pump state");
+            run_pump(
+                &reader,
+                generation,
+                operation,
+                state,
+                Some(crate::io::FileReaderChunkKind::Chunk(
+                    bytes::Bytes::from_static(b"pending"),
+                )),
+                &mut context,
+            )
+            .expect("loadstart");
+            context.run_jobs().expect("deferred chunk");
+            assert_eq!(js_log(&mut context), "loadstart");
+            assert!(
+                context
+                    .get_data::<PendingReaderOps>()
+                    .expect("roots")
+                    .ops
+                    .is_empty()
+            );
+            assert!(
+                context
+                    .get_data::<PumpStates>()
+                    .expect("states")
+                    .states
+                    .is_empty()
+            );
+            assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+            assert_eq!(active_count(&context), 0);
+            assert!(!handle.has_pending_io());
+            assert_eq!(handle.poll_io(&mut context).expect("late poll"), 0);
+        }
+    }
+
+    #[test]
+    fn shutdown_drops_all_reader_state() {
+        let mut context = setup_with_limits(quota_one_limits());
+        let specs = crate::extension::snapshot(&context).expect("registered");
+        let handle = specs.test_handle();
+        context
+            .eval(Source::from_bytes(
+                "globalThis.reader = new FileReader(); reader.readAsText(new Blob(['pending']));",
+            ))
+            .expect("start read");
+        assert_eq!(
+            context
+                .get_data::<PendingReaderOps>()
+                .expect("roots")
+                .ops
+                .len(),
+            1
+        );
+        assert_eq!(
+            context
+                .get_data::<PumpStates>()
+                .expect("states")
+                .states
+                .len(),
+            1
+        );
+        assert_eq!(specs.reader_payloads.lock().expect("payloads").len(), 1);
+        assert_eq!(active_count(&context), 1);
+        for _ in 0..2 {
+            handle.shutdown(&mut context).expect("shutdown");
+            assert!(
+                context
+                    .get_data::<PendingReaderOps>()
+                    .expect("roots")
+                    .ops
+                    .is_empty()
+            );
+            assert!(
+                context
+                    .get_data::<PumpStates>()
+                    .expect("states")
+                    .states
+                    .is_empty()
+            );
+            assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+            assert_eq!(active_count(&context), 0);
+            assert!(!handle.has_pending_io());
+        }
+        context.run_jobs().expect("late jobs");
+        assert_eq!(active_count(&context), 0);
     }
 
     #[test]

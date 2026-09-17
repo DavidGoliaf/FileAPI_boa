@@ -1259,6 +1259,9 @@ inventory disposition и exit semantics; CI получает required
 
 ## ADR-0048 (M9-R1 defect order): File.name сохраняется verbatim
 
+Статус: принято. Supersedes slash replacement в M2 и name sanitization
+в ADR-0032; остальные решения ADR-0032 сохраняются.
+
 Контекст: pinned `File-constructor.any.js` ("No replacement when using
 special character in fileName") ожидает `new File([], 'dummy/foo').name
 === 'dummy/foo'`, а WD §4.1 шаг 4.4 устанавливает `F.name = n` без
@@ -1271,6 +1274,9 @@ appendix-A ожидания обновлены (`a/b`, `/leading`, `host/path.tx
 Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
 
 ## ADR-0049 (M9-R1 defect order): синхронный FileReader.abort()
+
+Статус: принято. Supersedes queued abort в ADR-0018; EMPTY/DONE остаются
+без событий, LOADING диспатчит `abort` и условный `loadend`.
 
 Контекст: WD §6.2.3.5 шаги 5–6 предписывают `abort()` синхронно
 диспатчить `abort` (и условный `loadend`) до возврата; pinned
@@ -1289,6 +1295,10 @@ M8-observability лог обновлены под новый порядок.
 
 ## ADR-0050 (M9-R1 defect order): task/microtask boundary после loadstart
 
+Статус: принято. Уточнение: пара abort/loadend ниже относится к LOADING
+без reentrant restart/shutdown; loadend условный по ADR-0049, EMPTY/DONE
+событий не создают.
+
 Контекст: `filereader_abort.any.js` "Aborting after read" в
 `.then()`-продолжении после `wait_for('loadstart')` читает
 `readyState === LOADING`; раннер завершал весь read (включая `load`/
@@ -1306,6 +1316,11 @@ task/microtask. Порядок событий `loadstart|progress|load|loadend`
 
 ## ADR-0051 (M9-R1 defect order): readAsDataURL пустого типа → octet-stream
 
+Статус: принято. Supersedes empty-type packaging в ADR-0019; общий
+sync/async packaging contract ADR-0023 сохраняется. Новый prefix — 37 байт
+вместо 13, то есть +24 байта в `max_data_url_output`; прежнее чтение у
+границы квоты может теперь дать `QuotaExceededError`.
+
 Контекст: pinned `filereader_readAsDataURL.any.js` ожидает
 `data:application/octet-stream;base64,...` для Blob с пустым type (две
 строки); crate паковал `data:;base64,...`. WD §6.3 текст
@@ -1319,3 +1334,44 @@ packaging-тесты обновлены. Это осознанное следо�
 поверх нечёткого текста WD.
 Последствия: trace `M9E-WPT-02`; два дефекта закрыты, `upstream_pass` +2;
 `release_green` становится `true` (0 defects).
+
+## ADR-0052 (M9-R1 audit follow-up): документация, shutdown и preallocation
+
+Статус: remediation принято пользователем; локальные fmt/clippy,
+workspace tests и strict WPT прошли; внешний CI текущего diff pending. Исторический зелёный CI commit `9975de5`
+из M9F handoff не является evidence для этого локального follow-up.
+
+Контекст/evidence: принятый аудит выявил stale slash replacement в
+`docs/spec-matrix.md` (M2-FILE-02) и TZ (§5.3, приложение A), отсутствие
+M9-R1 compatibility entries в `CHANGELOG.md` вопреки TZ §13, а также
+неполную очистку таблиц FileReader при shutdown, отсутствие shutdown guard
+после `abort` handler перед `loadend`/enqueue listener error и проверку
+длины в `package_data_url` после allocation base64 payload. Прямое чтение
+документации дополнительно выявило
+тот же stale host/clone-name contract в architecture/host integration и
+empty-type Data URL/queued-abort требования в TZ и spec matrix.
+
+Решение: применить принятые ADR-0048–0051 как точечный change-control,
+не заменяя WD 23.08.2026 целиком; согласовать текущие требования/примеры
+и записать совместимость, включая +24 байта Data URL prefix в квоте.
+Исторические handoff/CI claims не переписывать; текущий pending follow-up
+выделить в M9F handoff §7. Старые ADR-0018/0019/0032 сохраняются как
+история, supersession отмечен в ADR-0049/0051/0048 соответственно.
+
+Точный scope исправления: очистить таблицы FileReader при shutdown,
+включая roots и deferred state на границе `loadstart`; проверить shutdown
+после `abort` handler до dispatch `loadend` и enqueue listener error;
+в `package_data_url` проверять полную выходную длину до allocation base64
+payload. Host byte creation/context validation и изменения telemetry
+не входят в это решение.
+
+Trace mapping по существующей spec matrix: `M9C-FR-03` — cleanup/reentrant
+shutdown; `M4-FR-05` и `M4B-FRS-05` — data URL quota/shared packaging.
+Дополнение повторного ревью: shutdown после промежуточного progress не
+должен восстанавливать PumpState; после финального progress не должен
+публиковать DONE/result. Проверка shutdown выполняется после callback
+до продолжения pump/packaging. Регрессия финального progress дала RED
+на `2:string:null` вместо `1:null:null`, затем GREEN для четырёх методов
+и пустого/непустого Blob. Локальные команды и результаты записаны в M9F
+handoff §7; внешний CI текущего diff ещё не запускался.
+Новых зависимостей и расширения release/delivery closure нет.

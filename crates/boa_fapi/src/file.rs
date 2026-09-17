@@ -69,8 +69,8 @@ pub(crate) fn normalize_file_name(name: &str) -> String {
 
 /// Builds the native state for a File from host-provided bytes.
 ///
-/// `name` is already a Rust string; the same slash replacement as the JS
-/// constructor applies. When `last_modified` is `None`, the injected clock
+/// `name` is already a Rust string and is kept verbatim, like the JS
+/// constructor. When `last_modified` is `None`, the injected clock
 /// provides the timestamp.
 pub(crate) fn native_from_bytes(
     bytes: Bytes,

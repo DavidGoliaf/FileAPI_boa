@@ -83,14 +83,37 @@ Window/Worker orchestration and the WPT server have no binding surface
 in M1–M6 and are recorded as exact capability gaps, not behavior
 differences. No new normative requirement is introduced by M7.
 
+## Accepted change control (M9-R1, ADR-0048–0051)
+
+The user accepted these four decisions: verbatim `File.name` (after
+USVString conversion), synchronous LOADING `abort()` with conditional
+`loadend`, a task/microtask boundary after `loadstart`, and the
+`application/octet-stream` fallback for empty-type Data URLs. The first
+three follow the draft/WPT evidence recorded in the ADRs; the Data URL choice
+explicitly follows pinned WPT despite the WD §6.3 ambiguity (issue #104).
+The WD 23.08.2026 baseline is not replaced wholesale. These accepted
+exceptions supersede the old slash-replacement, queued-abort and omitted
+Data URL media-type requirements and examples in TZ.
+
+Both readers include the fallback in preallocation quota checks: the empty
+MIME prefix is now 37 bytes instead of 13, so output grows by 24 bytes and
+previously accepted near-limit reads can fail with `QuotaExceededError`.
+Host and clone names preserve `/`; the host remains responsible for not
+supplying secret paths as display names. Compatibility is recorded in
+`CHANGELOG.md`.
+
 ## M9-E direct-run findings (36 upstream files, 417 executable subtests)
+
+The results below are historical M9-R1 evidence (CI commit `9975de5`), not
+validation of the current local audit follow-up. See the M9F handoff §7
+for pending parent validation; this follow-up does not close release delivery.
 
 All five M9-E open defects were remediated by the M9-R1 defect orders, so
 the direct-run set is now green: `release_green == true`, `defects == 0`,
 `upstream_pass == 379` (canonical `results.total == 496`, inventory
 `115/115`).
 
-- Sync `abort()` dispatches `abort`+`loadend` back-to-back on the calling
+- While LOADING, `abort()` dispatches `abort` and conditional `loadend` on the calling
   stack (WD §6.2.3.5 steps 5–6). Pinned `fileReader.any.js` ("FileReader
   States -- abort") asserts exactly this (handler runs before `abort()`
   returns); the product now dispatches synchronously in `abort()`
@@ -99,8 +122,9 @@ the direct-run set is now green: `release_green == true`, `defects == 0`,
 - `filereader_abort.any.js` "Aborting after read": the runner now yields a
   task/microtask boundary between the `loadstart` dispatch and the first
   chunk application, so the test's `.then()` continuation observes
-  `LOADING` before the read completes; the product still emits exactly one
-  `abort`+`loadend` pair per `abort()` (TZ §7.3).
+  `LOADING` before the read completes; a LOADING abort emits `abort` once
+  and `loadend` only if the operation remains current and the runtime is
+  open (TZ §7.3). EMPTY/DONE abort emits neither event.
 - `filereader_result` "result is null during loadstart/progress" holds by
   construction: packaging publishes only at EOF (`finish_at_eof`), so
   every non-terminal continuation observes null. The 8 `progress`-matrix

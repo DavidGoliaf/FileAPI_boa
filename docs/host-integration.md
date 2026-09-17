@@ -143,8 +143,10 @@ let file = handle
     .unwrap();
 ```
 
-`display_name` is the only name JS observes (`/` becomes `:`; no
-basename is computed from host state). The import validates the live
+`display_name` is the only name JS observes (preserved verbatim, including
+`/`; no basename is computed from host state, accepted ADR-0048). The host
+must supply a safe display name rather than a secret path; the library does
+not sanitize it. The import validates the live
 snapshot before any JS object exists; a stale resource fails with no
 partial state. Reads go through the async `FileReader`, worker
 `FileReaderSync`, `text()`/`arrayBuffer()`/`bytes()`, `slice()`, and

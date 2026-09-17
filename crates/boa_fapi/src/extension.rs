@@ -1380,7 +1380,7 @@ impl FileApiHandle {
     ///
     /// Same purpose as [`Self::blob_from_data`]: imports a pre-built
     /// host payload without exposing its source implementation to JS.
-    /// `name` is a display name (`/` becomes `:`); `last_modified`
+    /// `name` is a display name kept verbatim; `last_modified`
     /// defaults to the injected clock.
     pub fn file_from_data(
         &self,
@@ -1450,7 +1450,7 @@ impl FileApiHandle {
     /// The host passes an opaque [`FileResource`](boa_fapi_core::policy::FileResource)
     /// handle (already open, read-only, capability-checked) plus the only
     /// name JS observes, `display_name` (no basename is computed from any
-    /// secret host location; `/` becomes `:` like the JS constructor). The
+    /// secret host location; the supplied name is kept verbatim). The
     /// resource is validated (live snapshot matches the import snapshot,
     /// plus a preflight size check against `max_blob_size`) before any
     /// JS-visible object exists, so a denial leaves no partial state. Name

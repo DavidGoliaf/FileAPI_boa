@@ -432,18 +432,19 @@ pub(crate) fn package_data_url(
     bytes: &[u8],
     limit: u64,
 ) -> Result<String, FileApiError> {
+    let byte_len = u64::try_from(bytes.len()).ok();
+    let total_len = byte_len.and_then(|len| data_url_len(media_type, len));
+    if total_len.is_none_or(|len| len > limit || usize::try_from(len).is_err()) {
+        return Err(FileApiError::ResourceLimit(
+            ResourceLimitKind::DataUrlOutput,
+        ));
+    }
     let payload = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
     let prefix = if media_type.is_empty() {
         String::from("data:application/octet-stream;base64,")
     } else {
         format!("data:{media_type};base64,")
     };
-    let total_len = prefix.len().saturating_add(payload.len());
-    if total_len as u64 > limit {
-        return Err(FileApiError::ResourceLimit(
-            ResourceLimitKind::DataUrlOutput,
-        ));
-    }
     let mut out = prefix;
     out.push_str(&payload);
     Ok(out)
@@ -452,6 +453,35 @@ pub(crate) fn package_data_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_url_exact_limit_and_one_below_cover_base64_boundaries() -> Result<(), FileApiError> {
+        for media_type in ["", "text/plain", "application/octet-stream"] {
+            for byte_len in 0..=7 {
+                let bytes = vec![0xff; byte_len];
+                let output = package_data_url(media_type, &bytes, u64::MAX)?;
+                let exact = output.len() as u64;
+                assert_eq!(data_url_len(media_type, byte_len as u64), Some(exact));
+                assert_eq!(package_data_url(media_type, &bytes, exact)?, output);
+                assert!(matches!(
+                    package_data_url(media_type, &bytes, exact - 1),
+                    Err(FileApiError::ResourceLimit(
+                        ResourceLimitKind::DataUrlOutput
+                    ))
+                ));
+                assert!(matches!(
+                    package_data_url(media_type, &bytes, 0),
+                    Err(FileApiError::ResourceLimit(
+                        ResourceLimitKind::DataUrlOutput
+                    ))
+                ));
+            }
+        }
+        assert_eq!(data_url_len("", 0), Some(37));
+        assert_eq!(data_url_len("", u64::MAX), None);
+        assert_eq!(data_url_len("", u64::MAX - 2), None);
+        Ok(())
+    }
 
     #[test]
     fn incremental_decoder_sniffs_bom_when_split_after_first_or_second_byte() {
