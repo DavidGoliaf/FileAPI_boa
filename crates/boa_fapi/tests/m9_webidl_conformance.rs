@@ -105,25 +105,78 @@ fn setup_chunked_worker() -> (Context, boa_fapi::FileApiHandle) {
 
 /// Drives the M9-C host loop until quiescent (bounded).
 fn drain_host(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
-    for _ in 0..200 {
-        let settled = handle.poll_io(context).unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        handle.poll_io(context).expect("poll_io");
         context.run_jobs().expect("run_jobs");
-        if settled == 0 && !handle.has_pending_io() {
-            context.run_jobs().expect("run_jobs");
+        if !handle.has_pending_io() {
+            context.run_jobs().expect("final jobs");
             if !handle.has_pending_io() {
-                break;
+                return;
             }
         }
-        if handle.has_pending_io() {
-            for _ in 0..50 {
-                let _ = handle.poll_io(context);
-                context.run_jobs().expect("run_jobs");
-                if !handle.has_pending_io() {
-                    break;
-                }
-            }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "host drain timed out with pending I/O after 30 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn host_drain_waits_for_delayed_bom_completion() {
+    struct HeldExecutor(std::sync::Mutex<Option<boa_fapi::FileReaderChunkTask>>);
+
+    impl boa_fapi::FileIoExecutor for HeldExecutor {
+        fn submit(&self, _: boa_fapi::FileIoTask) -> Result<(), boa_fapi::FileIoSubmitError> {
+            Err(boa_fapi::FileIoSubmitError::QueueFull)
+        }
+
+        fn submit_reader(
+            &self,
+            task: boa_fapi::FileReaderChunkTask,
+        ) -> Result<(), boa_fapi::FileIoSubmitError> {
+            *self.0.lock().expect("held task") = Some(task);
+            Ok(())
         }
     }
+
+    let executor = Arc::new(HeldExecutor(std::sync::Mutex::new(None)));
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .io_executor(executor.clone())
+        .build()
+        .register(&mut context)
+        .expect("registration");
+    assert_eval(
+        &mut context,
+        "globalThis.delayedReader = new FileReader();
+         globalThis.delayedEvents = [];
+         delayedReader.onload = () => delayedEvents.push('load');
+         delayedReader.readAsText(new Blob([new Uint8Array([0xEF, 0xBB, 0xBF, 0x42])]));
+         delayedReader.readyState === FileReader.LOADING",
+    );
+    let task = executor
+        .0
+        .lock()
+        .expect("held task")
+        .take()
+        .expect("submitted chunk");
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            task.execute();
+        });
+        drain_host(&mut context, &handle);
+        assert!(
+            !handle.has_pending_io(),
+            "drain returned before worker completion"
+        );
+        assert_eval(
+            &mut context,
+            "delayedReader.result === 'B' && delayedEvents.join(',') === 'load'",
+        );
+    });
 }
 
 /// Evaluates `source` and asserts the result is `true`.

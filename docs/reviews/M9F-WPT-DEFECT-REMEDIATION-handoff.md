@@ -179,3 +179,31 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations 
 Внешний CI текущего diff, coverage/deny/package/fresh-clone gates не
 перезапускались; полная release/delivery приёмка не заявляется.
 Старый CI commit `9975de5` не доказывает исправление новых findings.
+
+## 8. Windows coverage follow-up (M9A-RW-13)
+
+CI `56f0261`, run https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/35210624376:
+Linux/macOS validation и strict WPT прошли; Windows упал в llvm-cov на
+`m9a_rw_13_utf8_bom_at_start_has_independent_expected_output`. Обычный
+Windows workspace test перед coverage прошёл.
+
+В `drain_host` обнаружен независимый дефект тестового ожидания: фиксированные
+200 × 50 итераций завершались без проверки pending I/O, ошибки poll_io
+подавлялись. Тест `host_drain_waits_for_delayed_bom_completion` с удержанным
+на 250 ms worker chunk воспроизвёл ранний возврат до исправления как обычным
+запуском, так и под workspace coverage. Исходное случайное CI-падение локально
+не повторилось; его связь с этим дефектом вероятна, но CI не сохранил фактические
+result/events для однозначного доказательства.
+
+Исправлен только test driver: завершение по отсутствию pending I/O после
+run_jobs, deadline 30 s с явной ошибкой, пауза 1 ms между опросами, ошибки
+poll_io не скрываются. Ожидаемые BOM output `B` и единственное событие load
+не изменены; production decoder не менялся. Deadline — hang guard, не oracle
+успеха. Регрессия RED → GREEN проверяет результат после задержанного completion.
+
+Локально exit 0: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo test -p boa_fapi --all-features --test m9_webidl_conformance` (24 tests),
+`cargo llvm-cov --no-report --workspace --all-features --tests`.
+Последняя команда проверяет instrumented tests, а не пороги coverage.
+Повторный CI с исправлением ещё не запускался.
