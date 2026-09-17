@@ -1337,8 +1337,12 @@ packaging-тесты обновлены. Это осознанное следо�
 
 ## ADR-0052 (M9-R1 audit follow-up): документация, shutdown и preallocation
 
-Статус: remediation принято пользователем; локальные fmt/clippy,
-workspace tests и strict WPT прошли; внешний CI текущего diff pending. Исторический зелёный CI commit `9975de5`
+Статус: remediation принято пользователем и реализовано. Локальные
+fmt/clippy, workspace tests и strict WPT прошли; внешний CI:
+run 35210624376 (commit `56f0261`) зелёный на Linux/macOS/strict WPT,
+Windows упал в llvm-cov (test driver, handoff §8); run 35213828592
+(commit `8d7c1ed`) — все шесть jobs success, включая Windows.
+Исторический зелёный CI commit `9975de5`
 из M9F handoff не является evidence для этого локального follow-up.
 
 Контекст/evidence: принятый аудит выявил stale slash replacement в
@@ -1373,5 +1377,5 @@ shutdown; `M4-FR-05` и `M4B-FRS-05` — data URL quota/shared packaging.
 до продолжения pump/packaging. Регрессия финального progress дала RED
 на `2:string:null` вместо `1:null:null`, затем GREEN для четырёх методов
 и пустого/непустого Blob. Локальные команды и результаты записаны в M9F
-handoff §7; внешний CI текущего diff ещё не запускался.
+handoff §7; CI evidence — runs 35210624376/35213828592 (handoff §7–8).
 Новых зависимостей и расширения release/delivery closure нет.

@@ -118,7 +118,7 @@ windows-latest)` success, `M9E release conformance (strict gate)`
 - M9-F release/delivery closure (`tasks/17_TASK_M9F_RELEASE_DELIVERY.md`).
 - Общая release-приёмка M9-E разрешена (`release_green == true`).
 
-## 7. Текущий локальный audit follow-up — local validation green, CI pending
+## 7. Текущий локальный audit follow-up — validated, CI green (commits 56f0261/8d7c1ed)
 
 Пользователь принял remediation всех findings аудита и change-control
 ADR-0048–0051. Это отдельный локальный follow-up, не повторное утверждение
@@ -176,9 +176,22 @@ cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations 
 
 Все команды exit 0; strict: `expectations_match=true`, `release_green=true`,
 379 upstream PASS, 6 smoke PASS, 0 defects, 111 NOTRUN, 0 unexpected.
-Внешний CI текущего diff, coverage/deny/package/fresh-clone gates не
-перезапускались; полная release/delivery приёмка не заявляется.
-Старый CI commit `9975de5` не доказывает исправление новых findings.
+
+Внешнее CI evidence follow-up:
+
+- commit `56f0261` (shutdown boundaries + data URL preflight): run
+  https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/35210624376 —
+  Linux/macOS validation и strict WPT success; Windows упал в llvm-cov
+  (см. §8).
+- commit `8d7c1ed` (§8 test-driver fix): run
+  https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/35213828592 —
+  все шесть jobs success, включая `M8 validation (windows-latest)` и
+  `M9E release conformance (strict gate)`.
+
+Пороговые coverage-проверки и deny/package/fresh-clone gates выполняются
+внутри CI-работ; отдельные skipped-шаги на отдельных раннерах компенсируются
+парными runner jobs. Полная release/delivery приёмка (заказ M9-F) не
+заявляется; старый CI commit `9975de5` не является evidence этих изменений.
 
 ## 8. Windows coverage follow-up (M9A-RW-13)
 
@@ -206,4 +219,11 @@ poll_io не скрываются. Ожидаемые BOM output `B` и един
 `cargo test -p boa_fapi --all-features --test m9_webidl_conformance` (24 tests),
 `cargo llvm-cov --no-report --workspace --all-features --tests`.
 Последняя команда проверяет instrumented tests, а не пороги coverage.
-Повторный CI с исправлением ещё не запускался.
+
+Повторный CI закрыл вопрос: commit `8d7c1ed`, run
+https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/35213828592 —
+conclusion success, все шесть jobs success, включая
+`M8 validation (windows-latest)`. Это внешнее evidence исправленного
+test driver; сама причина исходного случайного падения остаётся
+вероятностной реконструкцией, так как упавший run не сохранил
+фактические result/events.
