@@ -1,5 +1,13 @@
 # M1 Specification Traceability Matrix
 
+## Current M9 release status
+
+| Stage | Current evidence | Status |
+|---|---|---|
+| M9-A–M9-D | Source and regression coverage are mapped in the sections below; local workspace tests and feature-powerset check passed on candidate `644faf40`. | Implemented and validated locally |
+| M9-E | `boa_fapi_wpt` canonical accounting, exact 115-path inventory and strict gate; CI run [35216670609](https://github.com/DavidGoliaf/FileAPI_boa/actions/runs/35216670609) passed on candidate `644faf40` with `release_green=true`. | Conformance gate green for audited subset |
+| M9-F | Delivery evidence is in `docs/m9-validation.md` and `docs/reviews/M9F-handoff.md`. Default branch remains `task/m2`; fresh clone returns the old `5620dc4` SHA; no PR exists, protection is absent, and nightly is not registered from default branch. | Incomplete; integration and release delivery remain |
+
 Public `BlobData` API is exactly the M1 contract (`empty`, `from_segments`, `size`,
 `media_type`, `snapshot`, `segment_count`, `slice`) plus the M2 no-copy
 composition primitives (`concat_shared`, `push_shared`). Raw segments, byte

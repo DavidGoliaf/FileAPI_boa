@@ -22,7 +22,7 @@
   `QuotaExceededError`; equality with the full output limit still succeeds.
   This is accepted pinned-WPT change-control, not a wholesale WD update.
 
-### Accepted audit fixes — locally validated; external CI pending
+### Accepted audit fixes — locally validated; CI green for code/test commit
 
 - Clean up FileReader state tables at shutdown, including reader roots
   and deferred state at the `loadstart` boundary.
@@ -33,8 +33,9 @@
 - Stop after shutdown inside intermediate or final `progress`: do not
   restore cleared state or publish `DONE`/`result` after shutdown.
 - Reconcile current specification, host-name and clone-name documentation
-  with the accepted behavior. Local validation is recorded in the M9F
-  handoff; external CI for these uncommitted changes remains pending.
+  with the accepted behavior. Historical code/test CI is recorded in
+  `docs/reviews/M9F-WPT-DEFECT-REMEDIATION-handoff.md`; current candidate
+  evidence is recorded in `docs/m9-validation.md`.
 
 ## M8 — release closure and observability (task/m8, unreleased)
 

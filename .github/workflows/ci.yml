@@ -211,9 +211,8 @@ jobs:
         run: git diff --check
 
   # Required release status (M9E-R1 §6): `--strict` with no exit-code
-  # inversion, no `continue-on-error` and no masking. While the recorded
-  # product/harness defects remain, this job is honestly red; once they are
-  # fixed it turns green without any workflow change.
+  # inversion, no `continue-on-error` and no masking. The remediation branch
+  # clears the audited defects; any future regression remains a hard failure.
   m9e-release-conformance:
     name: M9E release conformance (strict gate)
     runs-on: ubuntu-latest
