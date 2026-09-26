@@ -1527,6 +1527,21 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config({
+            let config = ProptestConfig::default();
+            #[cfg(miri)]
+            {
+                // Miri isolation rejects getcwd, which proptest uses only to
+                // locate regression files. Keep generated cases enabled.
+                let mut config = config;
+                config.failure_persistence = None;
+                config
+            }
+            #[cfg(not(miri))]
+            {
+                config
+            }
+        })]
         #[test]
         fn slice_matches_reference(
             data in proptest::collection::vec(any::<u8>(), 0..256),

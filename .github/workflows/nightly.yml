@@ -48,11 +48,6 @@ jobs:
         if: matrix.miri == 'run' && steps.miri_setup.outcome == 'success'
         timeout-minutes: 20
         run: cargo +nightly miri test --package boa_fapi_core --lib
-        env:
-          # proptest's default regression-file persistence calls getcwd,
-          # which Miri rejects under isolation. The generated cases still run;
-          # only writing failure-regression files is disabled for this job.
-          PROPTEST_DISABLE_FAILURE_PERSISTENCE: "1"
 
       - name: Miri unavailable
         if: matrix.miri == 'run' && steps.miri_setup.outcome != 'success'
