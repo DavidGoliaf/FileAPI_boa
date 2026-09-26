@@ -157,6 +157,16 @@ impl BlobData {
         self.segments.len()
     }
 
+    /// Borrows the segment list for bounded chunk reads.
+    ///
+    /// Exposed for the off-thread FileReader path only: chunk workers
+    /// iterate segments to serve a precomputed logical sub-range without
+    /// whole-blob accumulation. No source identity, position, or content
+    /// accessor is added beyond the existing `BlobSegment` input shape.
+    pub fn segments_slice(&self) -> &[BlobSegment] {
+        &self.segments
+    }
+
     /// Appends the segments of `other` to a new blob under `limits`.
     ///
     /// This is the sole no-copy composition primitive for bindings: every

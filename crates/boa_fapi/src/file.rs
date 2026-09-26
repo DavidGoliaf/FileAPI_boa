@@ -15,7 +15,9 @@ use crate::brand;
 use crate::clock::Clock;
 use crate::error::type_error;
 use crate::extension::snapshot;
-use crate::webidl::{FileOptions, arg, blob_parts, collect_parts, usv_string};
+use crate::webidl::{
+    FileOptions, PartsCollector, arg, convert_sequence, process_converted, usv_string,
+};
 
 /// The internal File brand: Blob payload plus immutable `name`/`lastModified`.
 ///
@@ -55,17 +57,20 @@ impl FileNative {
     }
 }
 
-/// Normalizes a file name: USVString semantics, then `/` becomes `:`.
+/// Normalizes a file name: USVString semantics only.
 ///
-/// No basename computation is performed; host paths never become names.
+/// File API WD §4.1 step 4.4 sets `F.name` to the `fileName` argument
+/// verbatim (the historical `/`→`:` replacement was removed); no basename
+/// computation is performed either. Host paths never become names — the
+/// caller supplies an already-safe display name.
 pub(crate) fn normalize_file_name(name: &str) -> String {
-    name.replace('/', ":")
+    name.to_owned()
 }
 
 /// Builds the native state for a File from host-provided bytes.
 ///
-/// `name` is already a Rust string; the same slash replacement as the JS
-/// constructor applies. When `last_modified` is `None`, the injected clock
+/// `name` is already a Rust string and is kept verbatim, like the JS
+/// constructor. When `last_modified` is `None`, the injected clock
 /// provides the timestamp.
 pub(crate) fn native_from_bytes(
     bytes: Bytes,
@@ -82,11 +87,10 @@ pub(crate) fn native_from_bytes(
 
 /// Builds the native state for a File over an existing [`BlobData`].
 ///
-/// Used by the `fs` host import: the payload already carries its
-/// filesystem snapshot, and only the display name/timestamp are attached
-/// here. No basename is computed; `display_name` is the only name JS
-/// observes.
-#[cfg(feature = "fs")]
+/// Used by host imports and advanced host integrations: the payload already
+/// carries its immutable snapshot, and only the display name/timestamp are
+/// attached here. No basename is computed; `display_name` is the only name
+/// JS observes.
 pub(crate) fn native_from_data(
     data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
     display_name: &str,
@@ -113,21 +117,22 @@ pub(crate) fn constructor(
             "File constructor requires at least two arguments",
         ));
     }
-    let prototype = constructor_prototype(&target, specs.file_proto(), context)?;
-
-    // Required `fileBits` sequence: `undefined` fails the sequence conversion.
-    let parts = blob_parts(&arg(args, 0), context)?;
-    // Required `fileName`: USVString, then every `/` becomes `:`.
+    // Web IDL argument order: `fileBits` sequence conversion first
+    // (typed conversion with conversion-time snapshots, no `endings`
+    // yet), then `fileName` USVString, then the options dictionary, then
+    // the options-dependent processing step.
+    let limits = specs.limits().clone();
+    let converted = convert_sequence(&arg(args, 0), true, &limits, context)?;
+    // Required `fileName`: USVString, kept verbatim (WD §4.1 step 4.4).
     let file_name = usv_string(&arg(args, 1), context)?;
     let file_name = normalize_file_name(&file_name);
 
     let options = FileOptions::parse(&arg(args, 2), context)?;
-    let collector = collect_parts(
-        parts.as_ref(),
-        options.blob.endings,
-        specs.limits(),
-        context,
-    )?;
+    // `NewTarget.prototype` is observable and therefore follows every
+    // argument conversion, including the options dictionary.
+    let prototype = constructor_prototype(&target, specs.file_proto(), context)?;
+    let mut collector = PartsCollector::new(limits);
+    process_converted(converted, options.blob.endings, &mut collector)?;
     let data = Arc::new(collector.into_blob_data(&options.blob.media_type)?);
 
     let timestamp = options

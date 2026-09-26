@@ -10,12 +10,18 @@ use boa_fapi_core::cancellation::CancellationToken;
 use boa_fapi_core::file_api_error::FileApiError;
 #[cfg(unix)]
 use boa_fapi_core::policy::FileResource;
+#[cfg(not(unix))]
+use boa_fapi_core::policy::FileResource;
 use boa_fapi_core::policy::{DenyAllPolicy, FileAccessPolicy, FileOpenRequest};
 #[cfg(unix)]
 use boa_fapi_core::snapshot::SnapshotState;
 #[cfg(unix)]
 use boa_fapi_core::source::ByteSource;
+#[cfg(not(unix))]
+use boa_fapi_core::source::ByteSource;
 #[cfg(unix)]
+use boa_fapi_fs::RootConfinedPolicy;
+#[cfg(not(unix))]
 use boa_fapi_fs::RootConfinedPolicy;
 use boa_fapi_fs::{
     DenyRawPathPolicy, FileSource, FsRegistry, RegistryPolicy, platform_has_strong_identity,
@@ -519,6 +525,112 @@ fn weak_platform_direct_import_is_refused() {
     ));
     let bytes = boa_fapi_fs::open_copy_on_import(&registry, &resource, 64).expect("copy");
     assert_eq!(&bytes[..], b"weak-bytes!");
+    std::fs::remove_file(&path).ok();
+}
+
+/// Windows/weak-platform coverage for the refusal boundaries.
+///
+/// Every `#[cfg(unix)]` test above is compiled out on Windows, which leaves
+/// `FileSource` constructors, the read path, `RegistryPolicy` happy paths,
+/// `RootConfinedPolicy` delegation, the host adapter, and the registry error
+/// arms (`NotFound` after close, poisoned-mutex `Internal`) uncovered.
+/// These tests exercise the same boundaries through the platform-neutral
+/// `new_for_copy`/`open_copy_on_import` surface so the workspace coverage
+/// gate stays green on every OS.
+#[cfg(not(unix))]
+#[test]
+fn weak_platform_registry_error_and_debug_surfaces() {
+    use boa_fapi_core::policy::HostResourceId;
+    let registry = FsRegistry::new();
+    let (path, resource) = register_bytes(&registry, b"weak-coverage");
+    // Debug impls must not leak locations/handles (SlotFile hides the fd).
+    let debug = format!("{:?}", registry);
+    assert!(debug.contains("FsRegistry"));
+    // Unknown ids fail as `NotFound` on both snapshot probes.
+    let missing = HostResourceId::new(u64::MAX);
+    assert!(matches!(
+        registry.import_snapshot(missing),
+        Err(FileApiError::NotFound)
+    ));
+    assert!(matches!(
+        registry.live_snapshot(missing),
+        Err(FileApiError::NotFound)
+    ));
+    assert!(matches!(
+        registry.read_at(missing, 0, 1),
+        Err(FileApiError::NotFound)
+    ));
+    // `HostFileSource` adapter carries the import snapshot and round-trips
+    // through the copy-safe constructor on every platform.
+    let adapter = boa_fapi_fs::HostFileSource::new(&registry, &resource, None).expect("adapter");
+    let adapter_debug = format!("{adapter:?}");
+    assert!(adapter_debug.contains("HostFileSource"));
+    assert_eq!(adapter.resource_id(), resource.id());
+    let import = adapter.import_snapshot();
+    let live = adapter.current_snapshot().expect("live snapshot");
+    assert_eq!(import, live);
+    assert_eq!(adapter.read_at(0, 4).expect("read"), b"weak");
+    // `limit == size` boundary: exact-fit succeed, `+1` refused, each copy
+    // consuming its registration (handle released on every exit).
+    let (path2, resource2) = register_bytes(&registry, b"weak");
+    let exact = boa_fapi_fs::open_copy_on_import(&registry, &resource2, 4).expect("exact copy");
+    assert_eq!(&exact[..], b"weak");
+    assert_eq!(registry.live_slot_count(), 1);
+    let (path3, resource3) = register_bytes(&registry, b"weak");
+    assert!(matches!(
+        boa_fapi_fs::open_copy_on_import(&registry, &resource3, 3),
+        Err(FileApiError::ResourceLimit(_))
+    ));
+    assert_eq!(registry.live_slot_count(), 1);
+    std::fs::remove_file(&path2).ok();
+    std::fs::remove_file(&path3).ok();
+    let source_debug = format!("{:?}", adapter.source());
+    assert!(source_debug.contains("FileSource"));
+    assert_eq!(adapter.source().len(), 13);
+    // `FileSource` Debug shows ids/length, never locations.
+    assert!(source_debug.contains("has_policy"));
+    adapter.close();
+    assert_eq!(registry.live_slot_count(), 0);
+    assert!(adapter.read_at(0, 1).is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[cfg(not(unix))]
+#[test]
+fn weak_platform_copy_read_validates_ranges_and_snapshots() {
+    use boa_fapi_core::policy::FileGrant;
+    let registry = FsRegistry::new();
+    let (path, resource) = register_bytes(&registry, b"weak-range-16-bytes!");
+    let adapter = boa_fapi_fs::HostFileSource::new(&registry, &resource, None).expect("adapter");
+    // Overflow-checked end arithmetic refuses before any I/O.
+    assert!(matches!(
+        adapter.read_at(u64::MAX, 2),
+        Err(FileApiError::InvalidRange)
+    ));
+    // Over-long reads fail without partial bytes.
+    assert!(adapter.read_at(0, 1024).is_err());
+    // `RootConfinedPolicy` delegates open/read decisions to the inner
+    // policy; a forged snapshot fails the identity comparison first.
+    // (`DenyRawPathPolicy` stands in for the inner policy: on weak
+    // platforms `RegistryPolicy::authorize_open` is refused by design,
+    // so the delegation boundary is what this covers here.)
+    let inner = DenyRawPathPolicy;
+    let policy = RootConfinedPolicy::new(inner);
+    let _ = policy.inner();
+    let snapshot = registry.import_snapshot(resource.id()).expect("snapshot");
+    let grant = FileGrant::new(resource.id(), snapshot.clone());
+    let forged = boa_fapi_core::snapshot::SnapshotState::Memory;
+    assert!(matches!(
+        policy.authorize_read(&grant, &forged),
+        Err(FileApiError::SnapshotChanged)
+    ));
+    // `authorize_open` delegates verbatim (deny stays deny).
+    let request = FileOpenRequest::new(resource.id(), "display.txt", None);
+    assert!(matches!(
+        policy.authorize_open(&request),
+        Err(FileApiError::PermissionDenied)
+    ));
+    let _ = (grant, snapshot);
     std::fs::remove_file(&path).ok();
 }
 

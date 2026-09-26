@@ -292,9 +292,34 @@ fn setup_with_bridge() -> (Context, boa_fapi::FileApiHandle) {
     (context, handle)
 }
 
-fn run_jobs(context: &mut Context) {
-    context.run_jobs().expect("run_jobs");
-    context.run_jobs().expect("run_jobs");
+fn run_jobs(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs");
+        context.run_jobs().expect("run_jobs");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Host-loop drain for stream paths (M9-D worker I/O).
+#[allow(dead_code)]
+fn run_jobs_boa(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    run_jobs(context, handle);
 }
 
 fn eval(context: &mut Context, source: &str) -> String {
@@ -388,14 +413,14 @@ fn tracing_emits_only_allowlisted_fields() {
     let (collector, events) = TestCollector::new();
     with_collector(collector, || {
         // Memory promise reads.
-        let (mut context, _) = setup_default();
+        let (mut context, handle) = setup_default();
         context
             .eval(Source::from_bytes(
                 "globalThis.out = 'pending'; \
                  new Blob(['hello']).text().then(v => { globalThis.out = v; });",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.out"), "hello");
         context
             .eval(Source::from_bytes(
@@ -403,10 +428,11 @@ fn tracing_emits_only_allowlisted_fields() {
                  new Blob(['abc']).bytes().then(a => { globalThis.n = a.length; });",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.n"), "3");
 
-        // Stream read (one demand chunk + EOF).
+        // Stream read (one demand chunk + EOF): M9-D host loop (`poll_io`
+        // turns the worker completion into a Boa job).
         context
             .eval(Source::from_bytes(
                 "globalThis.chunks = 0; globalThis.done = false; \
@@ -415,11 +441,12 @@ fn tracing_emits_only_allowlisted_fields() {
                      globalThis.chunks = r.value.length; globalThis.done = r.done; });",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.chunks"), "9");
         assert_eq!(eval(&mut context, "globalThis.done"), "false");
 
-        // Async FileReader.
+        // Async FileReader (M9-C host loop: `poll_io` drains the worker
+        // chunk into a pump job).
         context
             .eval(Source::from_bytes(
                 "globalThis.text = null; \
@@ -428,7 +455,7 @@ fn tracing_emits_only_allowlisted_fields() {
                  reader.readAsText(new Blob(['async-ok']));",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         assert_eq!(eval(&mut context, "globalThis.text"), "async-ok");
 
         // Sync FileReaderSync (worker env).
@@ -547,13 +574,13 @@ fn tracing_emits_terminal_result_classes() {
     let (collector, events) = TestCollector::new();
     with_collector(collector, || {
         // success (ok).
-        let (mut context, _) = setup_default();
+        let (mut context, handle) = setup_default();
         context
             .eval(Source::from_bytes(
                 "new Blob(['ok']).text().then(() => {});",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
 
         // quota: sync ceiling rejects a 5-byte read (valid config: sync <= materialize).
         let mut tight_context = Context::default();
@@ -578,7 +605,7 @@ fn tracing_emits_terminal_result_classes() {
             .expect("eval");
 
         // cancel: abort a LOADING FileReader.
-        let (mut cancel_context, _) = setup_default();
+        let (mut cancel_context, cancel_handle) = setup_default();
         cancel_context
             .eval(Source::from_bytes(
                 "globalThis.reader = new FileReader(); \
@@ -586,17 +613,18 @@ fn tracing_emits_terminal_result_classes() {
                  reader.abort();",
             ))
             .expect("eval");
-        run_jobs(&mut cancel_context);
+        run_jobs(&mut cancel_context, &cancel_handle);
 
-        // encoding: unknown label fails fast.
-        let (mut enc_context, _) = setup_default();
+        // encoding: a label resolving to the replacement encoding still
+        // succeeds (every byte decodes to U+FFFD) with class "encoding".
+        let (mut enc_context, enc_handle) = setup_default();
         enc_context
             .eval(Source::from_bytes(
                 "globalThis.reader2 = new FileReader(); \
-                 try { reader2.readAsText(new Blob(['x']), 'not-a-label-xyz'); } catch (e) {}",
+                 reader2.readAsText(new Blob(['x']), 'csiso2022kr');",
             ))
             .expect("eval");
-        run_jobs(&mut enc_context);
+        run_jobs(&mut enc_context, &enc_handle);
 
         // invalid range + snapshot-changed via fake resources (Unix live).
         // On Windows the import is refused (permission); both are allow-listed.
@@ -623,7 +651,7 @@ fn tracing_emits_terminal_result_classes() {
                     fs_context
                         .eval(Source::from_bytes("fsBlob.text().then(()=>{},()=>{});"))
                         .expect("eval");
-                    run_jobs(&mut fs_context);
+                    run_jobs(&mut fs_context, &fs_handle);
                 }
                 Err(_) => {
                     // Windows copy-or-deny: permission path exercised instead.
@@ -653,7 +681,7 @@ fn tracing_emits_terminal_result_classes() {
                 fs_context
                     .eval(Source::from_bytes("mutBlob.text().then(()=>{},()=>{});"))
                     .expect("eval");
-                run_jobs(&mut fs_context);
+                run_jobs(&mut fs_context, &fs_handle);
             }
         }
 
@@ -695,7 +723,7 @@ fn tracing_emits_terminal_result_classes() {
         .iter()
         .map(|e| e.fields.get("result_class").expect("class").clone())
         .collect();
-    for required in ["ok", "quota", "cancelled", "encoding", "shutdown", "error"] {
+    for required in ["ok", "quota", "cancelled", "shutdown", "error"] {
         assert!(
             classes.contains(required),
             "missing result_class {required}: {classes:?}"
@@ -765,11 +793,12 @@ fn tracing_never_leaks_sensitive_values() {
             .eval(Source::from_bytes(
                 "sensitiveFile.text().then(()=>{},()=>{}); \
                  var r = new FileReader(); \
-                 try { r.readAsText(sensitiveFile, 'bogus-label-xyz'); } catch (e) {} \
+                 r.readAsText(sensitiveFile, 'csiso2022kr'); \
+                 r.abort(); \
                  r.readAsText(sensitiveFile);",
             ))
             .expect("eval");
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
         // Fake URL/UUID + snapshot marker + error-like text through resolves.
         let _ =
             handle.resolve_blob_url("blob:https://localhost/123e4567-e89b-42d3-a456-426614174000");
@@ -785,7 +814,6 @@ fn tracing_never_leaks_sensitive_values() {
         "secret-bytes-marker-xyz",
         "123e4567-e89b-42d3-a456-426614174000",
         "top-secret-marker-xyz",
-        "bogus-label-xyz",
     ] {
         assert!(
             !joined.contains(secret),
@@ -809,7 +837,7 @@ fn tracing_never_leaks_sensitive_values() {
 fn tracing_preserves_async_order_and_stale_suppression() {
     let (collector, events) = TestCollector::new();
     let js_log = with_collector(collector, || {
-        let (mut context, _) = setup_default();
+        let (mut context, handle) = setup_default();
         context
             .eval(Source::from_bytes(
                 "globalThis.log = []; \
@@ -831,12 +859,12 @@ fn tracing_preserves_async_order_and_stale_suppression() {
                  reader.readAsArrayBuffer(new Blob(['old']));",
             ))
             .expect("start read");
-        run_jobs(&mut context);
-        run_jobs(&mut context);
+        run_jobs(&mut context, &handle);
+        run_jobs(&mut context, &handle);
         eval(&mut context, "globalThis.log.join('|')")
     });
     assert_eq!(
-        js_log, "loadstart|loadstart|progress|load|loadend",
+        js_log, "loadstart|abort|loadend|loadstart|progress|load|loadend",
         "M7 ordering must be preserved"
     );
     let events = snapshot_events(&events);

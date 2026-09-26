@@ -9,9 +9,9 @@ A Rust implementation of the [File API](https://www.w3.org/TR/FileAPI/) for the 
 | `boa_fapi_core` | Platform-independent data model and algorithms (no Boa dependency) |
 | `boa_fapi` | Boa bindings: `Blob`, `File`, `FileList` (M2), promise reads (M3-A), streams shim (M3-B), DOM shim + async `FileReader` (M4-A), worker-only sync `FileReaderSync` (M4-B), `fs` host import + shutdown (M5), Blob URL store + `URL` shim (M6), structured-clone bridge (M6); Web IDL conversions, brands, GC-safe native data |
 | `boa_fapi_fs` | Capability-based filesystem-backed `ByteSource` with snapshot validation (M5) |
-| `boa_fapi_wpt` | Future WPT test harness (M7+) |
+| `boa_fapi_wpt` | Development-only pinned WPT conformance and release gate (M9-E) |
 
-## Current scope (M1–M5)
+## Current scope (M1–M9)
 
 - **M1 (`boa_fapi_core`)**: immutable byte sources, segmented blobs, File API slice semantics, MIME type normalization, and line ending conversion.
 - **M2 (`boa_fapi`)**: registration of `Blob`, `File` and host-created `FileList` into a real `boa_engine::Context` — constructors with correct `name`/`length`/descriptors, `Symbol.toStringTag`, non-forgeable internal brands, `File.prototype → Blob.prototype` inheritance, Web IDL conversions (`DOMString`, `USVString`, `[Clamp] long long`, `long long`, `unsigned long`), Blob parts (USVString, BufferSource snapshot copy, Blob/File zero-copy composition), injectable `Clock` for `File.lastModified`, and atomic registration with rollback.
@@ -147,6 +147,22 @@ full WHATWG Streams (`pipeTo`, `tee`, BYOB, transformers).
   and an optional default-off `tracing` observer with six fixed fields.
   `tracing` never changes JS surface, job ordering, errors, or lifetimes.
 
+- **M9-A–M9-E (Web IDL, asynchronous I/O, and conformance)**: M9-A closes
+  Web IDL sequence conversion, registration identity, and byte-packaging
+  requirements. M9-B adds a bounded `FileIoExecutor` for Promise reads;
+  M9-C moves asynchronous `FileReader` reads onto that executor; M9-D does
+  the same for demand-driven stream chunks and defines GC/drop cleanup.
+  Hosts must alternate `FileApiHandle::poll_io(&mut context)` and
+  `context.run_jobs()` until both queues are quiescent. M9-E verifies the
+  pinned upstream `FileAPI/**` inventory and raw test hashes, accounts for
+  every expectation and capability exclusion, and provides the strict
+  `release_green` gate. The current audited report is 115/115 inventory
+  paths and 496/496 result rows: 379 upstream PASS, 6 project smoke PASS,
+  111 NOTRUN (79 inventory exclusions and 32 non-executed subtests),
+  0 defects, 0 unexpected; `--strict`
+  exits 0. This is conformance evidence for the executed subset, not a claim
+  that the 79 excluded upstream files ran.
+
 ## Release closure (M8)
 
 ```sh
@@ -172,7 +188,8 @@ cargo build --workspace --all-features
 ## Testing
 
 ```sh
-cargo test --workspace --all-features
+cargo test --workspace --all-features -- --test-threads=1
+cargo run --package boa_fapi_wpt -- --manifest wpt-manifest.json --expectations expectations.json --upstream-root target/pinned-wpt --strict
 ```
 
 The M2 integration tests execute real JavaScript (`new Blob`, `new File`,

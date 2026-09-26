@@ -9,8 +9,10 @@ use boa_fapi_core::file_api_error::FileApiError;
 pub enum RegisterError {
     /// The extension is already registered in this context.
     ///
-    /// Per the M2 registration rule every second call returns this error;
-    /// the first registration leaves the context unchanged.
+    /// Returned when a *different* registration identity attempts to
+    /// register on an already-registered context (see the identity-aware
+    /// rule on `FileApiExtension::register`): the first registration is
+    /// left unchanged and no global is reinstalled.
     #[error("the File API extension is already registered in this context")]
     AlreadyRegistered,
     /// The global object is not extensible, so the globals cannot be installed.
@@ -41,6 +43,13 @@ pub enum RegisterError {
     /// and no clone globals are installed.
     #[error("the structured-clone bridge `{0}` speaks an incompatible version")]
     CloneBridgeIncompatible(String),
+    /// The process-wide context/identity id space is exhausted.
+    ///
+    /// Returned before any `globalThis` mutation when no fresh opaque
+    /// context id can be minted (u64 wraparound guard): ids are never
+    /// reused, so registration fails instead of aliasing two contexts.
+    #[error("the File API context id space is exhausted")]
+    IoIdsExhausted,
     /// A Boa engine error occurred while building or installing the classes.
     #[error(transparent)]
     Js(#[from] JsError),

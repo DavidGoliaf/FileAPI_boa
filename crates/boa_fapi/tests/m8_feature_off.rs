@@ -53,7 +53,25 @@ fn tracing_feature_off_has_no_trace_surface() {
         .expect("string")
         .to_std_string_escaped();
     assert_eq!(value, "registered");
-    context.run_jobs().expect("run_jobs");
+    // M9-B promise reads complete off the Boa thread. Drive the documented
+    // host loop rather than assuming a single Boa job turn waits for I/O.
+    for _ in 0..200 {
+        let settled_io = handle.poll_io(&mut context).expect("poll_io");
+        context.run_jobs().expect("run_jobs");
+        if settled_io == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("final run_jobs");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() && std::time::Instant::now() < deadline {
+                let _ = handle.poll_io(&mut context).expect("poll_io");
+                std::thread::yield_now();
+            }
+        }
+    }
     let settled: String = context
         .eval(Source::from_bytes("globalThis.result"))
         .expect("read")
@@ -61,5 +79,4 @@ fn tracing_feature_off_has_no_trace_surface() {
         .expect("string")
         .to_std_string_escaped();
     assert_eq!(settled, "abc");
-    let _ = handle;
 }

@@ -372,7 +372,7 @@ fn sync_binary_string_preserves_nuls_and_high_bytes() {
 }
 
 // ──────────────────────────────────────────────
-// 4. Text: BOM, malformed, multibyte, labels, unknown label
+// 4. Text: BOM, malformed, multibyte, labels, unknown label fallback
 // ──────────────────────────────────────────────
 
 #[test]
@@ -395,14 +395,19 @@ fn sync_text_matches_async_representations() {
             if (sync.readAsText(new Blob(['ab']), '') !== 'ab') return false;
             // File inherits the Blob path.
             if (sync.readAsText(new File(['f'], 'f.txt')) !== 'f') return false;
+            // Unknown explicit label falls through to MIME/UTF-8, never
+            // `EncodingError`: MIME charset wins when present, UTF-8
+            // decoding otherwise.
+            if (sync.readAsText(
+                    new Blob([new Uint8Array([0xE9])], { type: 'text/plain;charset=windows-1252' }),
+                    'not-an-encoding') !== 'é') return false;
+            if (sync.readAsText(new Blob(['abc']), 'not-an-encoding') !== 'abc') return false;
+            if (sync.readAsText(
+                    new Blob([new Uint8Array([0xC3, 0xA9])], { type: 'text/plain;charset=bogus-charset' }),
+                    'not-an-encoding') !== 'é') return false;
             return true;
         })()
         ",
-    );
-    assert_throws_dom(
-        &mut context,
-        "new FileReaderSync().readAsText(new Blob(['abc']), 'not-an-encoding')",
-        "EncodingError",
     );
 }
 
@@ -411,7 +416,7 @@ fn throwing_label_is_converted_after_brand_and_argument_checks() {
     // A throwing encoding object must never be observed when the receiver
     // or the Blob argument itself is illegal: brand/argument `TypeError`s
     // come first. With a valid receiver/blob the conversion throw itself
-    // propagates (not a brand or `EncodingError` failure).
+    // propagates (not a brand failure; no `EncodingError` exists anymore).
     let mut context = setup_with_env(FileApiEnvironment::DedicatedWorker);
     assert_eval(
         &mut context,
@@ -463,9 +468,9 @@ fn sync_data_url_exact_packaging() {
         (() => {
             var sync = new FileReaderSync();
             if (sync.readAsDataURL(new Blob(['hello'], { type: 'text/plain' })) !== 'data:text/plain;base64,aGVsbG8=') return false;
-            if (sync.readAsDataURL(new Blob(['hello'])) !== 'data:;base64,aGVsbG8=') return false;
+            if (sync.readAsDataURL(new Blob(['hello'])) !== 'data:application/octet-stream;base64,aGVsbG8=') return false;
             if (sync.readAsDataURL(new Blob([new Uint8Array([])], { type: 'text/plain' })) !== 'data:text/plain;base64,') return false;
-            if (sync.readAsDataURL(new Blob([new Uint8Array([0, 255, 16])])) !== 'data:;base64,AP8Q') return false;
+            if (sync.readAsDataURL(new Blob([new Uint8Array([0, 255, 16])])) !== 'data:application/octet-stream;base64,AP8Q') return false;
             var url = sync.readAsDataURL(new Blob(['x']));
             if (url.indexOf(' ') !== -1 || url.indexOf('\n') !== -1) return false;
             return true;
@@ -478,13 +483,13 @@ fn sync_data_url_exact_packaging() {
 fn sync_data_url_quota_boundary() {
     // `== max_data_url_output` succeeds, `+1` fails with
     // `QuotaExceededError` before any source read or allocation.
-    let prefix = "data:;base64,";
+    let prefix = "data:application/octet-stream;base64,";
     let limit = (prefix.len() + 4) as u64;
     let mut context = setup_worker_with_data_url_limit(limit);
     assert_eval(
         &mut context,
         "new FileReaderSync().readAsDataURL(new Blob([new Uint8Array([1, 2, 3])])) \
-         === 'data:;base64,AQID'",
+         === 'data:application/octet-stream;base64,AQID'",
     );
     assert_throws_dom(
         &mut context,
@@ -511,7 +516,7 @@ fn sync_size_limit_boundary() {
             if (sync.readAsArrayBuffer(exact).byteLength !== 64) return false;
             if (sync.readAsBinaryString(exact).length !== 64) return false;
             if (sync.readAsText(exact).length !== 64) return false;
-            if (sync.readAsDataURL(exact).indexOf('data:;base64,') !== 0) return false;
+            if (sync.readAsDataURL(exact).indexOf('data:application/octet-stream;base64,') !== 0) return false;
             return true;
         })()
         ",
@@ -578,7 +583,13 @@ fn sync_methods_return_without_jobs_or_events() {
 
 #[test]
 fn sync_reads_do_not_consume_async_quota() {
-    let mut context = setup_with_env(FileApiEnvironment::DedicatedWorker);
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .environment(FileApiEnvironment::DedicatedWorker)
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
     assert_eval(
         &mut context,
         r"
@@ -602,8 +613,26 @@ fn sync_reads_do_not_consume_async_quota() {
         })()
         ",
     );
-    context.run_jobs().expect("run_jobs failed");
-    context.run_jobs().expect("run_jobs failed");
+    // M9-C host loop: `poll_io` drains worker chunks into pump jobs.
+    for _ in 0..200 {
+        let settled = handle.poll_io(&mut context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs failed");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            for _ in 0..50 {
+                let _ = handle.poll_io(&mut context);
+                context.run_jobs().expect("run_jobs failed");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+        }
+    }
     assert_eval(
         &mut context,
         r"

@@ -238,6 +238,12 @@ fn lib_rs_denies_unsafe_and_limits_re_exports() {
         "HostFileOptions",
         "OsEntropy",
         "UrlEntropySource",
+        "pub use io::{",
+        "FileApiContextId",
+        "FileIoExecutor",
+        "FileIoWake",
+        "PollIoError",
+        "ThreadedFileIoExecutor",
     ] {
         assert!(lib.contains(exposed), "lib.rs must contain `{exposed}`");
     }
@@ -393,6 +399,105 @@ fn filereader_and_dom_surface_is_bounded() {
 }
 
 #[test]
+fn promise_read_has_no_sync_filesystem_fallback() {
+    // M9-B: `promise_read.rs` (Boa thread) must never call the blocking
+    // primitives itself. `BlobData::materialize`, `ByteSource::read_range`
+    // and `BlobReader::read_next` may appear only in comments/docs and in
+    // the `#[cfg(test)]` module (controlled unit sources); the worker entry
+    // lives in `io.rs` (`FileIoTask::execute`). Behaviourally this is
+    // proven by `m9_promise_io::blocking_source_never_runs_inside_boa_job`
+    // with a gated blocking source; this guard keeps the call path absent
+    // by construction.
+    let content = read(&workspace_root().join("crates/boa_fapi/src/promise_read.rs"));
+    let stripped = strip_test_modules(&content);
+    for forbidden in [".materialize(", "read_range(", "read_next(", ".execute("] {
+        let mut hits = 0;
+        for line in stripped.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "promise_read.rs must not contain {forbidden}");
+    }
+    // The worker entry point itself is asserted present in `io.rs`, so the
+    // guard above cannot go vacuous (a rename would fail loudly here).
+    let io = read(&workspace_root().join("crates/boa_fapi/src/io.rs"));
+    for required in [
+        "fn run_materialize_guarded",
+        ".materialize(&self.limits",
+        "fn execute(",
+    ] {
+        assert!(io.contains(required), "io.rs must contain `{required}`");
+    }
+    // Docs still describe the intended threading contract.
+    let promise_docs = read(&workspace_root().join("crates/boa_fapi/src/promise_read.rs"));
+    assert!(
+        promise_docs.contains("worker"),
+        "promise_read.rs docs must describe the worker path"
+    );
+}
+
+#[test]
+fn stream_has_no_sync_read_fallback() {
+    // M9-D: `streams.rs` (Boa thread) must never call the blocking
+    // primitives itself. `BlobData::materialize`, `ByteSource::read_range`
+    // and `BlobReader::read_next` may appear only in comments/docs and in
+    // the `#[cfg(test)]` module (controlled unit sources); the worker entry
+    // lives in `io.rs` (`StreamChunkTask::execute` → `read_blob_range`).
+    // Behaviourally this is proven by
+    // `m9_stream_io::blocking_source_never_runs_inside_boa_job` with a
+    // gated blocking source; this guard keeps the call path absent by
+    // construction.
+    let content = read(&workspace_root().join("crates/boa_fapi/src/streams.rs"));
+    let stripped = strip_test_modules(&content);
+    for forbidden in [".materialize(", "read_range(", "read_next(", ".execute("] {
+        let mut hits = 0;
+        for line in stripped.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains(forbidden) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 0, "streams.rs must not contain {forbidden}");
+    }
+    // The worker entry point itself is asserted present in `io.rs`, so the
+    // guard above cannot go vacuous (a rename would fail loudly here).
+    let io = read(&workspace_root().join("crates/boa_fapi/src/io.rs"));
+    for required in [
+        "struct StreamChunkTask",
+        "struct StreamChunkCompletion",
+        "fn submit_stream",
+        "fn push_stream_completion",
+        "fn take_stream_completions",
+        "fn stream_task_for",
+        "fn submit_stream_guarded",
+        "read_blob_range(&self.data",
+        "StreamChunkKind::Chunk",
+    ] {
+        assert!(io.contains(required), "io.rs must contain `{required}`");
+    }
+    // `poll_io` must drain stream completions through the Boa-thread
+    // settlement entry; docs still describe the worker contract.
+    let extension = read(&workspace_root().join("crates/boa_fapi/src/extension.rs"));
+    assert!(
+        extension.contains("settle_stream_completion"),
+        "extension.rs poll_io must settle stream completions"
+    );
+    let stream_docs = read(&workspace_root().join("crates/boa_fapi/src/streams.rs"));
+    assert!(
+        stream_docs.contains("worker"),
+        "streams.rs docs must describe the worker path"
+    );
+}
+
+#[test]
 fn sync_surface_is_bounded() {
     // M4-B registers exactly: the `FileReaderSync` global (worker
     // environments only), four prototype methods with `length = 1`, and
@@ -453,7 +558,8 @@ fn sync_surface_is_bounded() {
     }
     let package = read(&workspace_root().join("crates/boa_fapi/src/package.rs"));
     for required in [
-        "resolve_label",
+        "resolve_text_encoding",
+        "mime_charset",
         "decode_text",
         "package_binary_string",
         "package_data_url",
@@ -546,9 +652,22 @@ fn no_out_of_scope_surface() {
     // capability; `boa_fapi` production code holds no `std::fs`/`std::path`
     // itself — the `fs` feature only wires the opaque `FileResource`
     // trait. `structuredClone` as a JS global never exists: the bridge is
-    // host-side only.)
+    // host-side only. M9-B/M9-C own the single allowed threading site: the
+    // `io.rs` executor/worker plus its documented compatibility yield may
+    // use `std::thread`; every other module must not. `filereader.rs`
+    // production code holds no threading primitive at all: its
+    // `#[cfg(test)]` drain helper spins the non-blocking `poll_io` loop
+    // without sleep/yield (the scanner strips test modules, so the
+    // production assertion below stays exact).)
     let mut all = String::new();
     for entry in walk_rs(&src) {
+        let name = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == "io.rs" {
+            continue;
+        }
         all.push_str(&read(&entry));
         all.push('\n');
     }
@@ -612,6 +731,35 @@ fn no_out_of_scope_surface() {
             );
         }
     }
+    // The `io.rs` threading site itself stays bounded: the I/O protocol
+    // is the single allowed public surface outside `extension.rs`/`lib.rs`
+    // (M9-B), plus only the worker pool, the join-handle list, and the
+    // documented yield may name threading.
+    let io = read(&src.join("io.rs"));
+    for required in [
+        "ThreadedFileIoExecutor",
+        "FileIoExecutor",
+        "FileIoWake",
+        "poll_io",
+        "pub struct FileApiContextId",
+        "pub struct FileIoTask",
+        "pub struct FileIoCompletion",
+        "pub enum FileIoSubmitError",
+        "pub enum PollIoError",
+    ] {
+        assert!(io.contains(required), "io.rs must contain {required}");
+    }
+    let mut io_hits = 0;
+    for line in io.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.contains("tokio") {
+            io_hits += 1;
+        }
+    }
+    assert_eq!(io_hits, 0, "io.rs must not introduce tokio");
     let extension = read(&src.join("extension.rs"));
     assert!(
         extension.contains("environment"),
@@ -747,4 +895,36 @@ fn public_api_exposes_no_paths_or_mutable_bytes() {
             "extension.rs must contain `{required}`"
         );
     }
+    // The M9-B I/O surface exists and stays opaque (no paths, handles or
+    // JS values in the public types).
+    for required in [
+        "poll_io",
+        "has_pending_io",
+        "io_active_count",
+        "stream_payload_count",
+        "stream_operation_count",
+        "io_executor",
+        "io_wake",
+        "FileIoExecutor",
+        "FileIoWake",
+        "PollIoError",
+    ] {
+        assert!(
+            extension.contains(required),
+            "extension.rs must contain `{required}`"
+        );
+    }
+    // Advanced host constructors accept only immutable `BlobData`; they
+    // expose no path, handle or mutable byte surface to JavaScript.
+    for required in ["blob_from_data", "file_from_data"] {
+        assert!(
+            extension.contains(required),
+            "extension.rs must contain `{required}`"
+        );
+    }
+    let lib_rs = read(&workspace_root().join("crates/boa_fapi/src/lib.rs"));
+    assert!(
+        !lib_rs.contains("pub use blob::BlobNative"),
+        "lib.rs must not expose BlobNative"
+    );
 }

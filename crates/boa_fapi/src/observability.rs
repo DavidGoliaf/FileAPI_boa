@@ -87,10 +87,10 @@ pub(crate) fn environment_hash_for_specs(specs: &crate::extension::RegisteredSpe
 /// any `ResourceLimit` to `quota`, `NotFound` to `not_found`,
 /// `PermissionDenied`/`FileLocked` to `permission`, `SnapshotChanged` to
 /// `snapshot_changed`, `InvalidRange` to `invalid_range`; every other
-/// already-existing typed failure maps to `error`. Encoding and shutdown
-/// outcomes are passed explicitly by their call sites (`encoding` for an
-/// unknown text label, `shutdown` for a closed runtime) because the core
-/// error type carries no dedicated encoding/shutdown variant.
+/// already-existing typed failure maps to `error`. Shutdown outcomes are
+/// passed explicitly by their call sites (`shutdown` for a closed
+/// runtime) because the core error type carries no dedicated
+/// shutdown variant.
 pub(crate) fn result_class_for_core(error: Option<&FileApiError>) -> &'static str {
     match error {
         None => "ok",

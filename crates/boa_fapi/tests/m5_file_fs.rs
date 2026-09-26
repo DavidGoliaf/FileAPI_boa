@@ -137,9 +137,33 @@ fn assert_eval(context: &mut Context, source: &str) {
 }
 
 /// Drains Boa jobs until quiescent (FileReader chains enqueue successors).
-fn drain(context: &mut Context) {
-    for _ in 0..64 {
+/// Drives the M9-B host loop: `poll_io` turns worker completions into Boa
+/// jobs (promise reads), then `run_jobs` settles them. `poll_io` is
+/// strictly non-blocking, so the loop yields briefly (bounded, hang-guard
+/// only) while threaded-executor I/O is still outstanding.
+fn drain(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
         context.run_jobs().expect("run_jobs");
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
     }
 }
 
@@ -157,8 +181,8 @@ fn file_from_resource_metadata_and_text() {
         "notes/display.txt",
     );
     publish(&mut context, "srcFile", object);
-    // Display name is the only visible name; slash becomes colon; no secret leaks.
-    assert_eq!(eval_str(&mut context, "srcFile.name"), "notes:display.txt");
+    // Display name is the only visible name, kept verbatim; no secret leaks.
+    assert_eq!(eval_str(&mut context, "srcFile.name"), "notes/display.txt");
     assert_eval(&mut context, "srcFile.size === 8");
     assert_eval(
         &mut context,
@@ -170,7 +194,7 @@ fn file_from_resource_metadata_and_text() {
         &mut context,
         "globalThis.textResult = 'pending'; srcFile.text().then(v => { globalThis.textResult = v; }); true",
     );
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eq!(eval_str(&mut context, "globalThis.textResult"), "hello fs");
     std::fs::remove_file(&path).ok();
 }
@@ -190,7 +214,7 @@ fn file_from_resource_async_filereader() {
              r.readAsText(srcFile);",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eq!(eval_str(&mut context, "globalThis.outcome"), "reader-bytes");
     std::fs::remove_file(&path).ok();
 }
@@ -213,7 +237,7 @@ fn file_from_resource_stream_and_slice() {
              globalThis.pumpPromise = pump();",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eq!(
         eval_str(&mut context, "globalThis.chunks"),
         "stream-me-now!"
@@ -277,7 +301,7 @@ fn changed_file_read_fails_not_readable_without_partial() {
                e => { globalThis.verdict = 'rejected:' + (e instanceof DOMException) + ':' + e.name; });",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eq!(
         eval_str(&mut context, "globalThis.verdict"),
         "rejected:true:NotReadableError"
@@ -308,7 +332,7 @@ fn changed_file_filereader_fails_not_readable() {
              r.readAsArrayBuffer(srcFile);",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eq!(
         eval_str(&mut context, "globalThis.errName"),
         "NotReadableError"
@@ -335,10 +359,10 @@ fn js_errors_carry_no_location_detail() {
         .eval(Source::from_bytes(
             "globalThis.report = 'pending'; \
              srcFile.text().then(v => { globalThis.report = 'fulfilled'; }, \
-               e => { globalThis.report = e.name + '|' + e.message + '|' + String(e); });",
+                e => { globalThis.report = e.name + '|' + e.message + '|' + String(e); });",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     let report = eval_str(&mut context, "globalThis.report");
     assert!(
         report.starts_with("NotReadableError|"),
@@ -366,10 +390,10 @@ fn weak_platform_copy_reports_no_location_detail() {
         .eval(Source::from_bytes(
             "globalThis.report = 'pending'; \
              srcFile.text().then(v => { globalThis.report = 'ok:' + v; }, \
-               e => { globalThis.report = e.name + '|' + e.message; });",
+                e => { globalThis.report = e.name + '|' + e.message; });",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     let report = eval_str(&mut context, "globalThis.report");
     assert_eq!(report, "ok:copy-content", "unexpected report: {report}");
     // A stale live-handle import is denied with a generic error carrying
@@ -512,10 +536,10 @@ fn materialize_limit_rejects_fs_promise_read() {
         .eval(Source::from_bytes(
             "globalThis.verdict = 'pending'; \
              okFile.text().then(v => { globalThis.verdict = 'fulfilled'; }, \
-               e => { globalThis.verdict = (e instanceof DOMException) + ':' + e.name; });",
+                e => { globalThis.verdict = (e instanceof DOMException) + ':' + e.name; });",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     assert_eq!(
         eval_str(&mut context, "globalThis.verdict"),
         "true:QuotaExceededError"
@@ -618,7 +642,7 @@ fn shutdown_rejects_new_operations_and_repeats_idempotently() {
              r.readAsText(srcFile);",
         ))
         .expect("eval");
-    drain(&mut context);
+    drain(&mut context, &handle);
     // Either fail-fast error dispatch (single error+loadend) or nothing —
     // but never success events and never a result.
     let events = eval_str(&mut context, "globalThis.events.join(',')");
@@ -656,7 +680,7 @@ fn shutdown_before_jobs_settles_nothing_late() {
         ))
         .expect("eval");
     handle.shutdown(&mut context).expect("shutdown");
-    drain(&mut context);
+    drain(&mut context, &handle);
     let verdict = eval_str(&mut context, "globalThis.promiseVerdict");
     assert!(
         verdict == "pending" || verdict == "rejected:AbortError",
@@ -742,8 +766,8 @@ fn file_list_accepts_only_explicit_files() {
 fn display_name_is_the_only_visible_name() {
     let (mut context, handle) = setup();
     let registry = boa_fapi_fs::FsRegistry::new();
-    // A display name that looks like a secret location stays verbatim
-    // (slash → colon); no basename is ever computed from host state.
+    // A display name that looks like a secret location stays verbatim; no
+    // basename is ever computed from host state.
     let (path, object) = import_file(
         &handle,
         &mut context,
@@ -754,7 +778,7 @@ fn display_name_is_the_only_visible_name() {
     publish(&mut context, "srcFile", object);
     assert_eq!(
         eval_str(&mut context, "srcFile.name"),
-        ":secret:mount:name.txt"
+        "/secret/mount/name.txt"
     );
     std::fs::remove_file(&path).ok();
 }

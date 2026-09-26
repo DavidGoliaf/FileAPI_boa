@@ -111,6 +111,7 @@
 
 * Нормативные MUST/SHOULD/MAY из Спеки имеют приоритет над примерами этого ТЗ.
 * Фиксированной базой разработки является версия WD от 23.08.2026. Изменения latest draft после этой даты принимаются только отдельным решением и фиксируются в `docs/spec-delta.md`.
+* Принятые исключения M9-R1 (ADR-0048–0051): verbatim `File.name`, синхронный `abort()` с условным `loadend`, task/microtask-граница после `loadstart` и `application/octet-stream` для Data URL пустого type. Соответствующие требования и пример приложения A обновлены по этому change-control; нормативная база целиком не заменяется. Совместимость и влияние на квоту отражены в `CHANGELOG.md`.
 * Известные открытые вопросы самой Спеки (в частности размер chunk, момент `loadstart`, детализация Data URL и security hooks) реализуются согласно разделу 16 и закрепляются тестами проекта.
 * Если браузерное понятие отсутствует в Boa, оно не подменяется глобальным singleton: хост обязан передать эквивалент через конфигурацию среды.
 
@@ -343,7 +344,7 @@ impl FileApiHandle {
 }
 ```
 
-Host API обязан проверять бренд `File` для каждого элемента `file_list`. `display_name` очищается от пути: basename не вычисляется автоматически из секретного host path.
+Host API обязан проверять бренд `File` для каждого элемента `file_list`. `display_name` сохраняется verbatim, включая `/` (принятый ADR-0048); basename не вычисляется из host path. Хост обязан передать безопасное отображаемое имя, а не секретный путь: библиотека не очищает предоставленное имя.
 
 ### 4.3. Политика файлового доступа
 
@@ -441,7 +442,7 @@ interface File : Blob {
 };
 ```
 
-`fileName` преобразуется в USVString. Символ `/` заменяется на `:`. Если `lastModified` отсутствует, используется `Clock::now_unix_millis()`; clock инъецируется для детерминированных тестов. Значение `type` обрабатывается как у Blob.
+`fileName` преобразуется в USVString и сохраняется verbatim, включая `/` (принятый ADR-0048; замена на `:` отменена). Если `lastModified` отсутствует, используется `Clock::now_unix_millis()`; clock инъецируется для детерминированных тестов. Значение `type` обрабатывается как у Blob.
 
 Для host-backed File `name` содержит только предоставленное отображаемое имя. MIME определяется только policy/host metadata либо расширением по явно включённой таблице; эвристическое определение содержимого и добавление charset запрещены.
 
@@ -530,7 +531,7 @@ interface File : Blob {
 ### 6.5. Binary string и Data URL
 
 * `readAsBinaryString`: каждый байт `0x00..0xFF` становится code unit U+0000..U+00FF; метод сохраняется, несмотря на legacy-статус.
-* `readAsDataURL`: результат `data:<media-type>;base64,<payload>`; при пустом type media type опускается (`data:;base64,<payload>`).
+* `readAsDataURL`: результат `data:<media-type>;base64,<payload>`; при пустом type используется `application/octet-stream` у обоих ридеров (принятый ADR-0051, pinned-WPT change-control поверх неоднозначного WD §6.3). Prefix `data:application/octet-stream;base64,` занимает 37 байт и входит в `max_data_url_output`: результат на 24 байта длиннее прежнего, поэтому ранее допустимое чтение у границы квоты может дать `QuotaExceededError`.
 * Base64 не содержит пробелов или переносов строки.
 * Упаковка проверяет итоговый лимит до аллокации.
 
@@ -583,7 +584,7 @@ error = null
 1. Если state = LOADING, синхронно бросить `InvalidStateError` без изменения текущей операции.
 2. Установить LOADING, `result = null`, `error = null`.
 3. Создать operation id/cancellation token и stream reader.
-4. После первого успешного завершения stream read (включая немедленный EOF пустого Blob) поставить `loadstart`.
+4. После первого успешного завершения stream read (включая немедленный EOF пустого Blob) поставить `loadstart`. По принятому ADR-0050 применение первого chunk откладывается до следующего job, чтобы promise reactions из `loadstart` выполнились до завершения чтения.
 5. С ограничением частоты ставить `progress`.
 
 Успешное окончание:
@@ -604,7 +605,7 @@ error = null
 1. увеличить generation/operation id;
 2. отменить reader;
 3. установить DONE, `result = null`, `error = null`;
-4. поставить `abort`, затем `loadend`, если обработчик `abort` не начал новую операцию чтения.
+4. синхронно, до возврата `abort()`, диспатчить `abort`, затем `loadend`, если обработчик `abort` не начал новую операцию чтения и runtime не закрыт (принятый ADR-0049). После shutdown новые события не отправляются, включая оставшийся `loadend` при shutdown из terminal handler.
 
 Любой IO completion со старым operation id игнорируется. Он не может изменить `result/error/state` или отправить события новой операции. После terminal event (`abort`, `load`, `error`) события `progress` для завершённой generation запрещены; для каждой generation допускается не более одного terminal event. Успешное полное чтение обязано поставить итоговый `progress` до `load`.
 
@@ -968,7 +969,7 @@ const file = new File([blob], "dir/name.txt", {
   lastModified: 1234,
 });
 console.assert(file instanceof Blob);
-console.assert(file.name === "dir:name.txt");
+console.assert(file.name === "dir/name.txt");
 console.assert(file.lastModified === 1234);
 
 const reader = new FileReader();

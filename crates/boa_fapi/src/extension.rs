@@ -2,9 +2,10 @@
 //!
 //! Registration is atomic: constructor and prototype objects are built
 //! first, every preflight runs before `globalThis` changes, and a failed
-//! install rolls back so that none of the three globals remains installed.
-//! The chosen re-registration rule is **(b)**: every second call to
-//! `register` on the same context returns [`RegisterError::AlreadyRegistered`].
+//! install rolls back so that none of the globals remains installed.
+//! Re-registration is identity-aware: the same opaque identity is
+//! idempotent, a different identity is rejected with
+//! [`RegisterError::AlreadyRegistered`].
 
 use std::sync::Arc;
 
@@ -105,9 +106,56 @@ pub trait CloneAdapter: Send + Sync + 'static {
     fn decode(&self, bytes: &[u8]) -> Result<FileApiClonePayload, CloneError>;
 }
 
+/// Opaque registration identity for one built [`FileApiExtension`].
+///
+/// Created once per `build()` and preserved by `Clone`: a clone of an
+/// extension carries the same identity, while a separately built
+/// extension — even with identical visible configuration — carries a
+/// different one. The value is never exposed publicly, never derived
+/// from configuration contents, and never compared by value: the
+/// registration compares only opaque identity tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RegistrationIdentity(pub(crate) u64);
+
+impl RegistrationIdentity {
+    /// Mints a fresh identity token.
+    ///
+    /// CAS-guarded and saturating: issues `1..u64::MAX-1` exactly once
+    /// each and never wraps. On u64 exhaustion (practically unreachable:
+    /// 2^64 built extensions) returns the `u64::MAX` sentinel instead of
+    /// `0` or a reused live value; `register` rejects the sentinel with
+    /// `IoIdsExhausted` before any mutation, so exhausted identities can
+    /// never alias two contexts.
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        loop {
+            let candidate = NEXT.load(Ordering::Relaxed);
+            if candidate == 0 || candidate == u64::MAX {
+                NEXT.store(u64::MAX, Ordering::Relaxed);
+                return Self(u64::MAX);
+            }
+            match NEXT.compare_exchange_weak(
+                candidate,
+                candidate.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(candidate),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
 /// Immutable extension configuration.
 #[derive(Clone)]
 pub(crate) struct ExtensionConfig {
+    /// Opaque registration identity: assigned once per built extension
+    /// and preserved by `Clone`. Two separately built extensions never
+    /// share an identity, even with visually identical fields; identity
+    /// is never exposed publicly and never compared by value.
+    pub(crate) identity: RegistrationIdentity,
     /// Clock for `File.lastModified` defaults.
     pub(crate) clock: Arc<dyn Clock>,
     /// M1 resource limits for blob construction and slicing.
@@ -136,6 +184,11 @@ pub(crate) struct ExtensionConfig {
     pub(crate) entropy: Arc<dyn UrlEntropySource>,
     /// Optional host structured-clone bridge.
     pub(crate) clone_adapter: Option<Arc<dyn CloneAdapter>>,
+    /// Optional host file I/O executor (`None` selects the built-in
+    /// bounded pool at registration).
+    pub(crate) io_executor: Option<Arc<dyn crate::io::FileIoExecutor>>,
+    /// Optional host wake hook (`None` selects `NoopWake`).
+    pub(crate) io_wake: Option<Arc<dyn crate::io::FileIoWake>>,
 }
 
 /// The host-controlled environment descriptor selecting which globals the
@@ -219,8 +272,48 @@ pub(crate) struct RegisteredSpecs {
     /// reads, URL creation and pending clone work observe the same closed
     /// state (no longer `fs`-gated: shutdown exists in every configuration).
     pub(crate) shutdown: crate::lifecycle::ShutdownFlag,
+    /// Context-local file I/O bridge (M9-B): quota, completion queue and
+    /// executor/wake handles for promise reads.
+    pub(crate) io: std::sync::Arc<crate::io::IoBridge>,
+    /// Immutable blob payloads of live FileReader operations (M9-C).
+    ///
+    /// Keyed by I/O operation id; inserted at `readAs*` time, removed at
+    /// terminal settlement, abort, or shutdown drain. The worker chunk
+    /// task clones the `Arc` (no copy, no Boa), and removal makes late
+    /// worker chunks stale. Holds no JS values.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) reader_payloads: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, std::sync::Arc<boa_fapi_core::blob::BlobData>>,
+        >,
+    >,
+    /// Immutable blob payloads of live stream operations (M9-D).
+    ///
+    /// Keyed by I/O operation id; inserted at `stream()`/`textStream()`
+    /// time, removed at terminal settlement (EOF/error), at `cancel()`, or
+    /// at shutdown drain. The worker chunk task clones the `Arc` (no copy,
+    /// no Boa), and removal makes late worker chunks stale. Holds no JS
+    /// values.
+    #[cfg(feature = "streams-shim")]
+    pub(crate) stream_payloads: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, std::sync::Arc<boa_fapi_core::blob::BlobData>>,
+        >,
+    >,
+    /// Fairness budget for FileReader chunk completions per `poll_io`
+    /// (M9-C): `None` drains everything queued; `Some(n)` settles at most
+    /// `n` reader chunks and re-queues the rest for the next host-loop
+    /// turn with a fresh wake.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) io_poll_budget: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
+    /// Opaque identity of this registration's I/O context.
+    pub(crate) context_id: crate::io::FileApiContextId,
     /// Extension configuration.
     pub(crate) config: ExtensionConfig,
+    /// Opaque identity stored at registration time: a repeat `register`
+    /// with the same identity is idempotent, a different identity is
+    /// rejected without mutation.
+    pub(crate) identity: RegistrationIdentity,
 }
 
 impl RegisteredSpecs {
@@ -333,6 +426,94 @@ impl RegisteredSpecs {
     pub(crate) fn environment(&self) -> FileApiEnvironment {
         self.config.environment
     }
+
+    /// Returns the context-local I/O bridge.
+    pub(crate) fn io_bridge(&self) -> std::sync::Arc<crate::io::IoBridge> {
+        Arc::clone(&self.io)
+    }
+
+    /// Returns the `poll_io` reader-completion budget (`None` = unbounded).
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn io_poll_budget(&self) -> Option<usize> {
+        self.io_poll_budget.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Returns the immutable payload of a live FileReader operation.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn reader_payload(
+        &self,
+        operation: u64,
+    ) -> Option<std::sync::Arc<boa_fapi_core::blob::BlobData>> {
+        self.reader_payloads
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&operation).cloned())
+    }
+
+    /// Stores the immutable payload of a new FileReader operation.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn store_reader_payload(
+        &self,
+        operation: u64,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    ) {
+        if let Ok(mut map) = self.reader_payloads.lock() {
+            map.insert(operation, data);
+        }
+    }
+
+    /// Drops the payload of a settled FileReader operation.
+    #[cfg(feature = "dom-shim")]
+    pub(crate) fn drop_reader_payload(&self, operation: u64) {
+        if let Ok(mut map) = self.reader_payloads.lock() {
+            map.remove(&operation);
+        }
+    }
+
+    /// Returns the immutable payload of a live stream operation (M9-D).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn stream_payload(
+        &self,
+        operation: u64,
+    ) -> Option<std::sync::Arc<boa_fapi_core::blob::BlobData>> {
+        self.stream_payloads
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&operation).cloned())
+    }
+
+    /// Stores the immutable payload of a new stream operation (M9-D).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn store_stream_payload(
+        &self,
+        operation: u64,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    ) {
+        if let Ok(mut map) = self.stream_payloads.lock() {
+            map.insert(operation, data);
+        }
+    }
+
+    /// Drops the payload of a settled stream operation (M9-D).
+    #[cfg(feature = "streams-shim")]
+    pub(crate) fn drop_stream_payload(&self, operation: u64) {
+        if let Ok(mut map) = self.stream_payloads.lock() {
+            map.remove(&operation);
+        }
+    }
+
+    /// Rebuilds the owning handle from a specs snapshot (test helper).
+    ///
+    /// The handle carries the same context id, bridge and shutdown flag,
+    /// which is all `poll_io` needs. Production code keeps the real handle
+    /// returned by `register`.
+    #[cfg(test)]
+    pub(crate) fn test_handle(&self) -> FileApiHandle {
+        FileApiHandle {
+            specs: self.clone(),
+            shutdown: self.shutdown.clone(),
+        }
+    }
 }
 
 /// Clones the registration state out of the context so that callers never
@@ -361,6 +542,8 @@ pub struct FileApiExtensionBuilder {
     nonce: Option<u64>,
     entropy: Option<Arc<dyn UrlEntropySource>>,
     clone_adapter: Option<Arc<dyn CloneAdapter>>,
+    io_executor: Option<Arc<dyn crate::io::FileIoExecutor>>,
+    io_wake: Option<Arc<dyn crate::io::FileIoWake>>,
 }
 
 impl FileApiExtensionBuilder {
@@ -488,11 +671,34 @@ impl FileApiExtensionBuilder {
         self
     }
 
+    /// Injects the host file I/O executor for promise reads.
+    ///
+    /// Defaults to a built-in bounded thread pool (4 workers, 128 queued
+    /// tasks). The executor must be `Send + Sync + 'static`, must never
+    /// touch Boa, and must have a hard queue/worker bound: thread-per-read
+    /// without a limit is forbidden by contract. Tests inject a controlled
+    /// manual executor that records requests without running them.
+    pub fn io_executor(&mut self, executor: Arc<dyn crate::io::FileIoExecutor>) -> &mut Self {
+        self.io_executor = Some(executor);
+        self
+    }
+
+    /// Injects the host wake hook signalled on I/O completion.
+    ///
+    /// Defaults to [`crate::io::NoopWake`]. The hook only signals the host
+    /// event loop and never touches Boa. Correctness never depends on the
+    /// wake: the host always drives `poll_io` explicitly.
+    pub fn io_wake(&mut self, wake: Arc<dyn crate::io::FileIoWake>) -> &mut Self {
+        self.io_wake = Some(wake);
+        self
+    }
+
     /// Creates the extension.
     #[must_use]
     pub fn build(&self) -> FileApiExtension {
         FileApiExtension {
             config: ExtensionConfig {
+                identity: RegistrationIdentity::fresh(),
                 clock: self.clock.clone().unwrap_or_else(|| Arc::new(SystemClock)),
                 limits: self.limits.clone().unwrap_or_default(),
                 streams_shim: self.streams_shim.unwrap_or(true),
@@ -508,6 +714,8 @@ impl FileApiExtensionBuilder {
                 nonce: self.nonce.unwrap_or(0),
                 entropy: self.entropy.clone().unwrap_or_else(|| Arc::new(OsEntropy)),
                 clone_adapter: self.clone_adapter.clone(),
+                io_executor: self.io_executor.clone(),
+                io_wake: self.io_wake.clone(),
             },
         }
     }
@@ -529,11 +737,31 @@ impl FileApiExtension {
     /// Registers `Blob`, `File` and the internal `FileList` machinery.
     ///
     /// The registration is atomic: when any preflight or installation step
-    /// fails, none of the globals is left installed. A second call on the
-    /// same context returns [`RegisterError::AlreadyRegistered`].
+    /// fails, none of the globals is left installed. Identity-aware
+    /// re-registration: a repeat `register` of the *same* identity (the
+    /// same built extension or its clone) on the same context is
+    /// idempotent — globals are not reinstalled and the returned handle
+    /// points at the already-registered state. A *different* identity,
+    /// even with a visually identical configuration, is rejected with
+    /// [`RegisterError::AlreadyRegistered`] without mutation. A repeat
+    /// after `shutdown` never revives the runtime: the same-identity call
+    /// returns the existing handle (still shut down), a different identity
+    /// is rejected. Different contexts stay independent (per-context
+    /// `RegisteredSpecs`).
     pub fn register(&self, context: &mut Context) -> Result<FileApiHandle, RegisterError> {
-        // Re-registration rule (b): every second call is rejected.
-        if context.has_data::<RegisteredSpecs>() {
+        // Exhausted identity tokens (u64 wraparound guard) never alias two
+        // contexts: fail before any `globalThis` mutation.
+        if self.config.identity == RegistrationIdentity(u64::MAX) {
+            return Err(RegisterError::IoIdsExhausted);
+        }
+        // Identity-aware re-registration: the stored identity decides.
+        if let Some(existing) = context.get_data::<RegisteredSpecs>() {
+            if existing.identity == self.config.identity {
+                return Ok(FileApiHandle {
+                    specs: existing.clone(),
+                    shutdown: existing.shutdown.clone(),
+                });
+            }
             return Err(RegisterError::AlreadyRegistered);
         }
 
@@ -719,6 +947,39 @@ impl FileApiExtension {
             let store = Arc::clone(&url_store);
             shutdown.track(move || store.clear());
         }
+        // The I/O bridge (M9-B): per-registration context id, the
+        // configured (or built-in bounded) executor, and the wake hook.
+        // Shutdown cancels outstanding work, clears queued completions,
+        // and forbids late settlement. The bridge handle is shared (not
+        // duplicated) between the stored specs and the returned handle, so
+        // `poll_io` on the handle observes the same queue the workers push
+        // into. Context ids are never reused: id-space exhaustion (u64)
+        // fails registration instead of aliasing two contexts.
+        let Some(context_id) = crate::io::FileApiContextId::fresh() else {
+            return Err(RegisterError::IoIdsExhausted);
+        };
+        let executor: Arc<dyn crate::io::FileIoExecutor> = self
+            .config
+            .io_executor
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::io::ThreadedFileIoExecutor::default()));
+        let wake: Arc<dyn crate::io::FileIoWake> = self
+            .config
+            .io_wake
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::io::NoopWake));
+        let concurrency = self.config.limits.max_concurrent_reads_per_global;
+        let bridge = crate::io::IoBridge::new(
+            context_id,
+            concurrency,
+            Arc::clone(&executor),
+            Arc::clone(&wake),
+            shutdown.clone(),
+        );
+        {
+            let bridge = Arc::clone(&bridge);
+            shutdown.track(move || bridge.shutdown());
+        }
         let specs = RegisteredSpecs {
             blob: blob_spec,
             file: file_spec,
@@ -735,7 +996,20 @@ impl FileApiExtension {
             url: url_specs,
             url_store: Arc::clone(&url_store),
             shutdown: shutdown.clone(),
+            io: Arc::clone(&bridge),
+            #[cfg(feature = "dom-shim")]
+            reader_payloads: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "streams-shim")]
+            stream_payloads: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "dom-shim")]
+            io_poll_budget: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            context_id,
             config: self.config.clone(),
+            identity: self.config.identity,
         };
         context.insert_data::<RegisteredSpecs>(specs.clone());
 
@@ -1051,7 +1325,10 @@ pub struct FileApiHandle {
 
 impl FileApiHandle {
     /// Returns `true` after [`FileApiHandle::shutdown`].
-    fn is_shutdown(&self) -> bool {
+    ///
+    /// Public so host loops and tests can observe shutdown without
+    /// touching JS state.
+    pub fn is_shutdown(&self) -> bool {
         self.shutdown.is_shutdown()
     }
 
@@ -1081,6 +1358,40 @@ impl FileApiHandle {
     pub fn blob_url_count(&self) -> usize {
         self.specs.url_store.len()
     }
+
+    /// Creates a brand-valid `Blob` object over a host-owned immutable
+    /// [`BlobData`] payload.
+    ///
+    /// The object is indistinguishable from any other `Blob` for brand
+    /// checks and promise reads; it exists so integration tests can drive
+    /// the real `Blob.prototype.text()/arrayBuffer()/bytes()` path with a
+    /// controlled host source (blocking, panicking, filesystem-backed)
+    /// without copying the payload through memory first. The payload stays
+    /// private to the host; JavaScript receives an ordinary `Blob` only.
+    pub fn blob_from_data(
+        &self,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+    ) -> boa_engine::JsObject {
+        blob::create_instance(BlobNative::new(data), self.specs.blob_proto().clone())
+    }
+
+    /// Creates a brand-valid `File` object over a host-owned immutable
+    /// [`BlobData`] payload.
+    ///
+    /// Same purpose as [`Self::blob_from_data`]: imports a pre-built
+    /// host payload without exposing its source implementation to JS.
+    /// `name` is a display name kept verbatim; `last_modified`
+    /// defaults to the injected clock.
+    pub fn file_from_data(
+        &self,
+        data: std::sync::Arc<boa_fapi_core::blob::BlobData>,
+        name: &str,
+        last_modified: Option<i64>,
+    ) -> boa_engine::JsObject {
+        let native =
+            file::native_from_data(data, name, last_modified, self.specs.config.clock.as_ref());
+        boa_engine::JsObject::from_proto_and_data(self.specs.file_proto().clone(), native)
+    }
 }
 
 impl FileApiHandle {
@@ -1106,8 +1417,9 @@ impl FileApiHandle {
 
     /// Creates a `File` from host bytes.
     ///
-    /// `name` is a display name: no basename is computed, but `/` is
-    /// replaced by `:` like the JS constructor. `options.last_modified` of
+    /// `name` is a display name: no basename is computed, and it is stored
+    /// verbatim (WD §4.1 step 4.4, no `/`→`:` replacement).
+    /// `options.last_modified` of
     /// `None` reads the injected clock. After `shutdown` the call fails
     /// before touching JS state.
     pub fn file_from_bytes(
@@ -1138,7 +1450,7 @@ impl FileApiHandle {
     /// The host passes an opaque [`FileResource`](boa_fapi_core::policy::FileResource)
     /// handle (already open, read-only, capability-checked) plus the only
     /// name JS observes, `display_name` (no basename is computed from any
-    /// secret host location; `/` becomes `:` like the JS constructor). The
+    /// secret host location; the supplied name is kept verbatim). The
     /// resource is validated (live snapshot matches the import snapshot,
     /// plus a preflight size check against `max_blob_size`) before any
     /// JS-visible object exists, so a denial leaves no partial state. Name
@@ -1275,6 +1587,237 @@ impl FileApiHandle {
     /// or identities leak into queues, errors, or JS objects.
     pub fn shutdown(&self, context: &mut Context) -> Result<(), RegisterError> {
         crate::lifecycle::shutdown_runtime(&self.shutdown, context)
+    }
+
+    /// Drains queued I/O completions into Boa settlement jobs.
+    ///
+    /// Called only by the owner of `context` as part of the host loop:
+    ///
+    /// ```text
+    /// wait for FileIoWake or other host event
+    /// handle.poll_io(&mut context)
+    /// context.run_jobs()
+    /// repeat until host and File API queues are quiescent
+    /// ```
+    ///
+    /// Validates that `context` carries this handle's registration and
+    /// rejects a foreign context without touching state. Each completion
+    /// passes context/shutdown validation first; only then is the
+    /// operation quota released exactly once and a Boa settlement job
+    /// enqueued. FileReader chunk completions become at most one pump job
+    /// each, stream chunk completions become at most one settlement job
+    /// each (still through `poll_io`, never synchronously from a worker).
+    /// Never calls user JS directly and never holds the bridge
+    /// mutex across Boa calls. Returns the number of completions turned
+    /// into jobs.
+    pub fn poll_io(&self, context: &mut Context) -> Result<usize, crate::io::PollIoError> {
+        use crate::io::PollIoError;
+        // Identity-aware check first: a foreign context is rejected without
+        // touching any bridge state. The snapshot clone ends its borrow
+        // before any Boa call below.
+        let stored = context.get_data::<RegisteredSpecs>().cloned();
+        let Some(stored) = stored else {
+            return Err(PollIoError::NotRegistered);
+        };
+        if stored.context_id != self.specs.context_id || stored.identity != self.specs.identity {
+            return Err(PollIoError::ForeignContext);
+        }
+        let bridge = stored.io_bridge();
+        // Non-blocking by contract: `poll_io` only turns already-queued
+        // DTOs into Boa jobs. Slow workers stay invisible until their
+        // completion lands; the host loop repeats `poll_io` after the next
+        // wake (or its own event) until quiescent.
+        //
+        // M9-C FileReader chunk completions share the same bridge: they
+        // are drained first (FIFO within one reader) and each becomes at
+        // most one pump Boa job; a stale completion (abort/restart/
+        // shutdown) settles nothing. The host may bound completions per
+        // `poll_io` call (`poll_io_budget`) for fairness; leftover chunks
+        // stay queued and re-wake the host loop.
+        //
+        // M9-D stream chunk completions share the same bridge as well: they
+        // drain after FileReader chunks (submission-order within the
+        // shared queue is preserved per operation kind) and each becomes at
+        // most one settlement Boa job; a stale completion (cancel/error/
+        // shutdown) settles nothing.
+        //
+        // M9-D-R2 abandoned/drop arbitration runs before stream chunks:
+        // validated endpoint-drop cleanup records transition operations
+        // whose last JS endpoint went away (no live demand) through the
+        // single abandoned terminal path. Live demand always settles
+        // first: a completion for an endpoint-less epoch with owed demand
+        // settles the demand in the chunk drain below, and the
+        // post-settlement drain re-arms abandonment when the epoch is
+        // still live.
+        //
+        // Ordering caveat (GC-03/GC-04 shape): the pre-chunk drain runs
+        // BEFORE the chunk drain in this same `poll_io`, so an epoch whose
+        // endpoints are already gone but whose demand has not settled yet
+        // is correctly SKIPPED here (live demand defers) and settled below.
+        #[cfg(feature = "streams-shim")]
+        {
+            let _ = crate::streams::drain_stream_cleanups(&stored, context);
+        }
+        #[cfg(feature = "dom-shim")]
+        let budget = stored.io_poll_budget();
+        let reader_completions = bridge.take_reader_completions();
+        let mut settled = 0_usize;
+        let mut reader_left = 0_usize;
+        for completion in reader_completions {
+            #[cfg(feature = "dom-shim")]
+            if budget.is_some_and(|limit| settled >= limit) {
+                reader_left += 1;
+                bridge.requeue_reader_completion(completion);
+                continue;
+            }
+            if self.is_shutdown() || bridge.is_shutdown() {
+                // Shutdown: drop the late chunk and release its quota
+                // exactly once; no job, no telemetry, no JS.
+                bridge.unreserve(completion.operation_id());
+                #[cfg(feature = "dom-shim")]
+                {
+                    stored.drop_reader_payload(completion.operation_id().get());
+                    crate::filereader::drop_pending_for_shutdown(
+                        context,
+                        completion.operation_id().get(),
+                    );
+                }
+                continue;
+            }
+            #[cfg(feature = "dom-shim")]
+            {
+                settled = settled.saturating_add(
+                    crate::filereader::settle_reader_completion(&stored, completion, context)
+                        .unwrap_or(0),
+                );
+            }
+            #[cfg(not(feature = "dom-shim"))]
+            {
+                let _ = completion;
+            }
+        }
+        // Re-queued leftovers (budget) keep the queue pending and re-wake
+        // the host so the next `poll_io` continues without starvation.
+        if reader_left > 0 {
+            bridge.wake_host();
+        }
+        // M9-D stream chunks drain next, in submission order per stream.
+        // Shutdown drops the late chunk, releases its quota exactly once
+        // AND removes the context-table op root/payload/resolvers, so the
+        // (active, payload, ops) triple returns to baseline without a
+        // second drain: late completions after shutdown are strict no-ops
+        // (unknown operation, no JS, no telemetry, no second release).
+        // Stale completions (unknown operation/generation) settle nothing
+        // inside `settle_stream_completion`. A second abandoned drain runs
+        // after chunk settlement: operations whose last demand just
+        // settled while endpoints were already gone abandon now, without
+        // waiting for another host-loop turn.
+        #[cfg(feature = "streams-shim")]
+        {
+            let stream_completions = bridge.take_stream_completions();
+            for completion in stream_completions {
+                if self.is_shutdown() || bridge.is_shutdown() {
+                    let _ = bridge.unreserve(completion.operation_id());
+                    stored.drop_stream_payload(completion.operation_id().get());
+                    crate::streams::drop_pending_for_shutdown(
+                        context,
+                        completion.operation_id().get(),
+                    );
+                    continue;
+                }
+                settled = settled.saturating_add(
+                    crate::streams::settle_stream_completion(&stored, completion, context)
+                        .unwrap_or(0),
+                );
+            }
+            // Post-settlement re-arm: a chunk settlement may have drained
+            // the last demand of an epoch whose sides were already gone
+            // (GC-03/GC-04 shape). The pre-chunk drain above could not
+            // abandon it (demand was still owed); this second drain
+            // observes the now-empty queue and runs the single abandoned
+            // transition in the same `poll_io`, without waiting for
+            // another host-loop turn.
+            let _ = crate::streams::drain_stream_cleanups(&stored, context);
+        }
+        let completions = bridge.take_completions();
+        for completion in completions {
+            if self.is_shutdown() || bridge.is_shutdown() {
+                // Shutdown: drop the late completion and release its quota
+                // exactly once; no job, no telemetry, no JS.
+                bridge.release(completion.operation_id());
+                continue;
+            }
+            let operation = completion.operation_id();
+            let byte_len = completion.byte_len();
+            let result = completion.into_result();
+            bridge.release(operation);
+            // `settle_completion` drops stale operations (unknown id) as a
+            // strict no-op and otherwise enqueues exactly one Boa job.
+            let size = byte_len.map_or(0_u64, |len| len as u64);
+            if crate::promise_read::settle_completion(operation, result, size, context).is_ok() {
+                settled = settled.saturating_add(1);
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Bounds the FileReader chunk completions settled per `poll_io`.
+    ///
+    /// `None` (default) drains everything queued; `Some(n)` settles at
+    /// most `n` reader chunks per call and re-queues the rest for the next
+    /// host-loop turn, so one busy reader cannot starve promise reads or
+    /// other readers. Leftovers re-wake the host (`FileIoWake`).
+    pub fn set_poll_io_budget(&self, budget: Option<usize>) {
+        #[cfg(feature = "dom-shim")]
+        {
+            if let Ok(mut slot) = self.specs.io_poll_budget.lock() {
+                *slot = budget;
+            }
+        }
+        #[cfg(not(feature = "dom-shim"))]
+        {
+            let _ = budget;
+        }
+    }
+
+    /// Returns `true` while I/O work is outstanding or completions wait.
+    ///
+    /// Context-local: only meaningful for the owning registration. The
+    /// host loop uses it together with its own quiescence check.
+    pub fn has_pending_io(&self) -> bool {
+        self.specs.io.has_pending()
+    }
+
+    /// Returns the number of live I/O quota slots of this context.
+    ///
+    /// Count only — no operation, payload or token is revealed. Intended
+    /// for host diagnostics and tests (M9-D-R2 quota/payload/pending
+    /// baselines); it cannot insert, resolve or mutate.
+    pub fn io_active_count(&self) -> usize {
+        self.specs.io.active_count()
+    }
+
+    /// Returns the number of stored stream payloads of this context.
+    ///
+    /// Count only — no payload is revealed. Intended for host diagnostics
+    /// and tests (M9-D-R2 quota/payload/pending baselines).
+    #[cfg(feature = "streams-shim")]
+    pub fn stream_payload_count(&self) -> usize {
+        self.specs
+            .stream_payloads
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
+    /// Returns the number of live stream operations of this context.
+    ///
+    /// Count only — resolved through the owning `Context` tables, hence
+    /// the `&mut Context` borrow. Intended for host diagnostics and tests
+    /// (M9-D-R2 quota/payload/pending baselines).
+    #[cfg(feature = "streams-shim")]
+    pub fn stream_operation_count(&self, context: &mut Context) -> usize {
+        crate::streams::live_stream_operation_count(context)
     }
 
     /// Creates and stores a Blob URL for a brand-validated `Blob`/`File`.
@@ -1644,8 +2187,7 @@ impl FileApiHandle {
     /// Decodes a clone payload into a live `File` object.
     ///
     /// Only `File` payloads are accepted; the stored `name`/`lastModified`
-    /// are reused verbatim (no clock read, no re-sanitization beyond the
-    /// constructor-equivalent slash replacement, which is idempotent).
+    /// are reused verbatim (no clock read, no re-sanitization).
     pub fn file_from_clone(
         &self,
         payload: &FileApiClonePayload,

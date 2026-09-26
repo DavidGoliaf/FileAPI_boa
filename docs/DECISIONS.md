@@ -767,3 +767,615 @@ rustflags не меняются; новых зависимостей и public A
 а web entropy implementation остаётся штатной реализацией upstream. Runtime
 использование File API на wasm по-прежнему не расширяется: M8 проверяет
 только memory-only compilation gate.
+
+## ADR-0036 (M9-A, rework-superseded in part): `sequence<BlobPart>` conversion
+
+Контекст: M2 фиксировал array-only контракт (`JsArray`-проверка); ТЗ
+M9-A §2 требует общую Web IDL sequence conversion для Blob и File:
+`@@iterator` один раз, поддержка Array/custom iterable/boxed String/
+TypedArray-as-sequence, primitive string — conversion error, quota до
+накопления, один converter на оба конструктора.
+
+Решение: единый конвертер; `GetMethod(V, @@iterator)` один раз;
+`Call`/`next`/`done`/`value` слева направо; quota `max_parts`
+проверяется до накопления — бесконечный итератор завершается
+детерминированной quota-ошибкой. Rework-поправка (§6 заказа-rework):
+никакого `return()` при abrupt completion — первоначальный
+`iterator_close_and_propagate` удалён как несоответствующий актуальным
+`sequence<T>` creation steps; quota-ошибка тоже не закрывает итератор
+(observable extension отклонён, см. ADR-0040).
+
+Последствия: M9A-IDL-01/02 и M9A-RW-05 фиксируют поведение;
+расхождение Blob/File запрещено по построению (один путь).
+
+## ADR-0037 (M9-A): exact `BlobPart` union conversion
+
+Контекст: M2 уже́сточал union до `TypeError` для не-объектов (ADR-0008);
+ТЗ M9-A §3 требует точную Web IDL развилку: BufferSource → видимый
+диапазон; branded Blob/File → shared bytes; всё остальное — USVString/
+ToString; forged brand — fallback; throwing `toString` — abrupt rules;
+порядок наблюдаем и одинаков для Blob/File.
+
+Решение: `process_part` — BufferSource, затем бренд, затем USVString
+fallback для любого другого значения (Symbol бросает собственный
+`TypeError` из `ToString`); старые oracle `TypeError` для `[123]`,
+`[null]`, `[{}]` переписаны на размеры USVString (3/4/15), а не удалены.
+BigInt stringifies (`10n` → 2 байта).
+
+Последствия: M9A-IDL-03 фиксирует fallback; ADR-0008 superseded в части
+union fallback, бренд-проверки сохранены.
+
+## ADR-0038 (M9-A, rework-superseded): shared text packaging
+
+Контекст: ТЗ §6.4 краток (label → UTF-8 → BOM → U+FFFD) и не упоминает
+MIME `charset`; W3C File API WD 23.08.2026 packaging-data steps требуют
+промежуточный `charset`-шаг. Первоначально сохранялся `EncodingError`
+для неизвестного пользовательского label.
+
+Решение (rework, см. ADR-0040): `package::resolve_text_encoding(label,
+media_type)` возвращает `TextEncoding` (не `Option`): explicit label →
+MIME `charset` → UTF-8 через точный `get an encoding`
+(`Encoding::for_label`, не `for_label_no_replacement`); `replacement`
+резолвится и декодирует в U+FFFD побайтово. Оба ридера идут обычным
+путем (async — start/read/load, sync — строка). Change control —
+`docs/spec-delta.md`.
+
+Последствия: M9A-TEXT-01/M9A-RW-01/M9A-RW-02 фиксируют алгоритм и
+sync/async-паритет; новых зависимостей нет.
+
+## ADR-0039 (M9-A): opaque registration identity, shutdown never revives
+
+Контекст: ТЗ §4.1 требует identity-aware повторную регистрацию без
+сравнения trait objects по значениям, без публичного сравнения config и
+без раскрытия identity; атомарный preflight/rollback не ослабляется;
+повтор после `shutdown` не оживляет runtime.
+
+Решение: `RegistrationIdentity(u64)` — opaque токен (`AtomicU64`,
+`build()` mint'ит, `Clone` сохраняет); `RegisteredSpecs` хранит identity
+первой регистрации. Повтор той же identity — idempotent (handle на уже
+зарегистрированное состояние, globals не переустанавливаются); другая
+identity — `RegisterError::AlreadyRegistered` без мутации; после
+`shutdown` та же identity возвращает существующий (закрытый) handle, а
+не живой runtime; разные Context независимы. Отдельного typed error для
+post-shutdown не введено: существующий закрытый handle уже несёт
+shutdown-состояние, что фиксирует тест.
+
+Последствия: M9A-REG-01 фиксирует все четыре ветви; публичная
+поверхность не расширена (guard `lib_rs_denies_unsafe` зелёный).
+
+## ADR-0040 (M9-A rework): encoding fallback, argument order, iterator surface
+
+Контекст: заказ-rework `tasks/18_TASK_M9A_REWORK_CONFORMANCE.md`
+переопределяет три M9-A границы и фиксирует два дополнительных defect.
+Web IDL snapshot для rework: `boa_engine 0.22.0` (sequence/iterator
+семантика vendored-крейта; `get an encoding`/`Decode` — `encoding_rs
+0.8.35`, `Encoding::for_label` + `new_decoder()` со sniffing).
+
+Решение:
+
+1. Неизвестный explicit label — failure с fallback (MIME charset →
+   UTF-8), не `EncodingError`; `for_label_no_replacement` заменён
+   точным `for_label`; fail-fast `EncodingError`-ветки удалены из
+   обоих ридеров; M4/M8 oracle переписаны (pure-model `ReadBad` →
+   `ReadAgain`, `TermKind::Error`/`ErrorRestart` удалены,
+   `reentrant_error_handler` — через quota-`SecurityError`,
+   tracing-класс `encoding` — только для `replacement`-label reads).
+2. Порядок аргументов: `Blob(blobParts → options)`,
+   `File(fileBits → fileName → options)`; двухфазная модель
+   (`ConvertedBlobPart`: conversion-time snapshots BufferSource/
+   USVString/brand → `process_converted` с `endings` и итоговым
+   size-accounting); сырые `JsValue` между фазами не хранятся.
+3. Никакого `return()` при abrupt completion, включая quota-лимит
+   (единый Web IDL path без закрытия; observable extension отклонён).
+4. `FileList.prototype[Symbol.iterator] === Array.prototype.values`
+   (тот же function object, `{writable:true, enumerable:false,
+   configurable:true}`); `entries`/`keys`/`values`/`forEach` не
+   добавляются. BOM-sniffing оставлен как есть (`new_decoder()`),
+   provenance-флаг отклонён: Decode заменяет любой fallback.
+5. `docs/spec-delta.md` фиксирует label → MIME → UTF-8 и BOM
+   authority со ссылками; `docs/spec-matrix.md` — M9A/M9A-RW строки с
+   source/test anchors.
+
+Последствия: trace rows M9A-RW-01…06; совокупный M9-A diff — см.
+rework-handoff.
+
+## ADR-0041 (M9-A acceptance remediation): local MIME parser
+
+Контекст: MIME `charset` нельзя извлекать ad hoc-разделением строки по
+`;`: сначала требуется parse type/subtype, после чего параметры обрабатываются
+по permissive WHATWG algorithm — malformed parameter пропускается, quoted
+value может содержать `;`, незакрытая кавычка завершается на EOF, а suffix
+после закрывающей кавычки игнорируется.
+Новая внешняя зависимость не нужна для ограниченного packaging surface.
+
+Решение: использовать небольшой локальный parser в
+`crates/boa_fapi/src/package.rs`. Он проверяет ASCII grammar type/subtype,
+пропускает malformed individual parameters, поддерживает token/quoted
+parameter values включая EOF-terminated quote, выбирает первый duplicate
+parameter и возвращает charset из сформированного MIME record. `mime`/прочие
+crate не добавляются: они были бы шире текущего surface, не дают выигрыша
+для этой фиксированной операции и потребовали бы license/maintenance gate.
+
+Последствия: `Blob.type` по-прежнему нормализуется существующим M1 helper,
+а packaging отдельно валидирует MIME syntax перед charset fallback; Cargo
+граф и `cargo-deny` остаются без новых зависимостей.
+
+## ADR-0042 (M9-B): explicit file I/O executor and completion bridge
+
+Контекст: ТЗ AD-4 требует один JS-поток (Boa объекты только на потоке
+`Context`; I/O отдельно с Rust DTO; материализация в Boa job), а аудит
+A-05 фиксирует расхождение: promise reads материализуют filesystem source
+внутри Boa job. Нужен единственный I/O protocol для M9-C/M9-D без новых
+зависимостей и без `unsafe`/`thread-per-read`.
+
+Решение: `crates/boa_fapi/src/io.rs` (Boa-free по данным, Boa-зависим по
+типам нет — только `std::sync` + core): `FileIoExecutor`/`FileIoWake`
+(`Send + Sync + 'static`, без Boa и без пользовательского JS),
+`FileIoTask`/`FileIoCompletion` (`Send + 'static`, без `JsValue`/
+`JsObject`/`Context`/realm/путей в типах и `Debug`), opaque
+`FileApiContextId`/`FileIoOperationId` (без reuse), per-context `IoBridge`
+(quota `max_concurrent_reads_per_global`, bounded completion queue,
+токены отмены; mutex только для bookkeeping, никогда через I/O/Boa/JS),
+`FileApiHandle::poll_io`/`has_pending_io` (только владелец `Context`,
+чужой отвергается; только DTO → Boa jobs; без пользовательского JS под
+mutex), wake hook только сигнализирует host loop, `shutdown` отменяет
+outstanding work, чистит очередь и запрещает late settlement (quota
+exact-once, late worker безопасно теряет результат).
+`FileApiConfig`/builder получает executor и wake (`io_executor`/
+`io_wake`; default — встроенный `ThreadedFileIoExecutor` 4/128 и
+`NoopWake` с жёсткими границами очереди/workers). `promise_read` хранит
+только Boa-side resolvers в per-context таблице и settles через один Boa
+job после `poll_io`; memory и filesystem идут одним путём.
+Новых зависимостей нет (только `std::thread`/`mpsc`/`sync` — уже часть
+toolchain; отдельный dependency-ADR не нужен); `cargo-deny` не меняется.
+`no_out_of_scope_surface` guard обновлён: `io.rs` — единственное
+разрешённое место `std::thread`.
+
+Последствия: trace rows `M9B-IO-01…04`, `M9B-HOST-01`; M9-C/M9-D
+мигрируют на тот же protocol без special-casing; host loop
+`poll_io`/`run_jobs` задокументирован в `docs/host-integration.md`.
+
+## ADR-0043 (M9-C): async FileReader over the M9-B executor protocol
+
+Контекст: ТЗ M9-C требует перенести асинхронный `FileReader` на
+executor/completion protocol M9-B: `filereader::run_pump` и любой Boa job
+больше не должны вызывать `BlobReader::read_next`,
+`BlobData::materialize` или `ByteSource::read_range` для
+filesystem-backed data. JS state/event semantics, generation guards,
+quota, error mapping и observable FIFO сохраняются; `FileReaderSync` не
+меняется.
+
+Решение: `io.rs` получает `FileReaderChunkTask`/`FileReaderChunkCompletion`
+(`Send + 'static`, только Rust-данные: context/operation id, generation,
+immutable `BlobData`, snapshot лимитов, `[offset, len)`, токен отмены,
+bridge — без `JsValue`/`JsObject`/`Context`/путей) и `FileIoExecutor::
+submit_reader` (default — `WorkerLost`, старые executor fail closed).
+Воркер читает ровно один bounded range через `read_blob_range`
+(`BlobData::segments_slice` в core — единственный новый accessor, без
+identity/position/content API) с panic containment как у whole-blob
+тасков. `IoBridge` держит `reader_completions: HashMap<op, VecDeque>`
+(FIFO внутри одного reader) + общий `order` для cross-reader drain
+порядка; `take_reader_completions` отдаёт в submission order,
+`requeue_reader_completion`/`wake_host` обслуживают fairness-бюджет.
+`filereader.rs`: `start_read` валидирует синхронно, ставит `LOADING`,
+резервирует слот моста, регистрирует reader root
+(`PendingReaderOps`: reader + generation) и packaging state
+(`PumpStates`), сабмитит первый чанк и возвращается до его выполнения;
+`poll_io` дренит чанки и превращает каждый максимум в один pump Boa job
+(`settle_reader_completion` с generation/shutdown/stale валидацией);
+pump пакует инкрементально, шлёт `loadstart`/throttled `progress`/final
+progress/`load`/`error` (+ conditional `loadend`), сабмитит максимум
+один следующий чанк; пустой Blob также submit-ит zero-length task: worker
+производит EOF без `ByteSource::read_range`, а `loadstart` появляется
+только после его completion через `poll_io`. Под «successful completion»
+в M9-C понимается успешная доставка completion в Boa loop: error-completion
+сохраняет историческую M4 последовательность `loadstart → error → loadend`.
+`abort()` бампает generation, канцеллит токен,
+релизит слот ровно один раз; stale completions дропаются без JS
+мутации/события/телеметрии/второго релиза. `set_poll_io_budget`
+ограничивает reader completions за один `poll_io` (leftovers re-wake).
+Новых зависимостей нет; `cargo-deny` не меняется.
+
+Последствия: trace rows `M9C-FR-01…06`; M4-A/`abort_races`/`abort_races_fs`/
+M8 suites зелёные через тот же host loop (`poll_io` + `run_jobs`);
+доказательство отсутствия blocking source calls в Boa jobs — поведенческий
+blocking-source тест + статичный guard в `m9_filereader_io`.
+
+## ADR-0044 (M9-D): ReadableStream chunk I/O over the M9-B executor protocol
+
+Контекст: ТЗ M9-D требует перенести `Blob.stream()`/
+`ReadableStreamDefaultReader.read()` на общий executor/completion protocol
+M9-B: ни Promise read, ни FileReader, ни stream read не выполняют
+filesystem `read_range` внутри Boa job. Минимальный Streams shim при этом
+не превращается в полную WHATWG Streams реализацию: capability boundaries,
+brand checks и descriptors сохраняются.
+
+Решение: `io.rs` получает `StreamChunkTask`/`StreamChunkCompletion`
+(`Send + 'static`, только Rust-данные: context/operation id, generation,
+immutable `BlobData`, snapshot лимитов, `[offset, len)`, токен отмены,
+bridge — без `JsValue`/`JsObject`/`Context`/путей) и
+`FileIoExecutor::submit_stream` (default — `WorkerLost`, старые executor
+fail closed, как `submit_reader` в M9-C). Воркер читает ровно один bounded
+range через общий `read_blob_range` с panic containment как у остальных
+тасков; EOF выводится на воркере (`offset == total`, без source read).
+`IoBridge` держит `stream_completions: HashMap<op, VecDeque>` (FIFO внутри
+одного стрима; при максимум одном in-flight чанке на стрим переупорядочивание
+невозможно по построению) + `chunk_reservations: BTreeSet<op>` (метка
+chunk-резерваций, чтобы `take_completions` пропускал живые chunk id при
+сканировании whole-blob префикса: chunk id никогда не несут whole-blob
+completion, поэтому не блокируют и не входят в promise FIFO — включая
+состояние после drain очереди, пока резервация жива: стримы держат слот
+после EOF, FileReader — между чанками). Built-in pool обслуживает третий
+вид запросов через ту же bounded очередь (`PoolRequest::Stream`).
+`streams.rs`: `create_stream` валидирует синхронно, чекает chunk ceiling
+контекста (`16 KiB..=1 MiB`), резервирует один слот моста на стрим,
+регистрирует stream root (`PendingStreamOps`) и payload
+(`RegisteredSpecs::stream_payloads`), сабмитит ничего — первый запрос
+уходит только по первому `read()`. Каждый `read()` создаёт pending Promise
+и FIFO demand slot (резолверы — в GC-traced `PendingStreamReads` до
+`poll_io`); при пустой очереди и отсутствии in-flight сабмитится ровно один
+bounded запрос (никакого read-ahead: N `read()` — максимум один in-flight).
+`poll_io` дренит stream completions и превращает каждый максимум в один
+settlement Boa job (`settle_stream_completion` с
+operation/generation/shutdown/stale валидацией + восстановлением
+slot+resolvers при generation-mismatch, чтобы demand не исчезал);
+`settle_stream_chunk` пакует чанк (свежий `Uint8Array`/инкрементальный
+UTF-8 без пустых `done:false`), двигает курсор и сабмитит следующий запрос
+при ожидающем спросе; `settle_stream_eof` отдаёт decoder flush как финальный
+value chunk (если непуст) и резолвит все queued/future reads done;
+`fail_stream_with` сохраняет mapped класс (центральный `dom::map_core_error`)
+и реджектит все queued reads + replay для future без новых source reads.
+`cancel()` (stream/reader) выигрывает синхронно на вызывающем стеке:
+сеттлит queued reads done через их jobs, бампает generation, канцеллит
+токен, релизит слот ровно один раз; поздний воркер дропается как stale.
+`releaseLock` отказывает при queued/in-flight demand (late completion не
+теряется). Shutdown дропает pending roots/resolvers без JS и телеметрии.
+Текстовый режим без пустых чанков: чанк без текста re-queue'ит тот же demand
+с тем же sequence key до следующего воркер-чанка. Новых зависимостей нет;
+`cargo-deny` не меняется. Поведенческое отличие от M3-B зафиксировано:
+`cancel()` до I/O сеттлит queued read done (`done:true`), а не чанком —
+M3-B тест `reader_cancel_makes_queued_and_future_reads_done` обновлён под
+нормативный M9-D контракт с объяснением в handoff.
+
+Последствия: trace rows `M9D-STR-01…05`; M3-B/M3-A/M4-A/M4-B/M5/appendix/M8
+suites зелёные через host loop (`poll_io` + `run_jobs`; M3-B сюита
+мигрирована с `run_jobs`-only на host loop без ослабления assertions);
+доказательство отсутствия blocking source calls в Boa jobs — поведенческий
+blocking-source тест + статичный guard `stream_has_no_sync_read_fallback`
+в `guards.rs` (+ дублирующий тест в `m9_stream_io`).
+
+## ADR-0045 (M9-D-R1): terminal EOF lifecycle для Streams I/O
+
+Контекст: приёмка M9-D выявила два P0-дефекта EOF lifecycle в `streams.rs`.
+P0-1: `settle_stream_eof` намеренно оставлял `IoBridge` reservation живой,
+что противоречит M9-D §3 (quota/active counter освобождается ровно один раз
+на EOF/error/cancel/drop): при малом `max_concurrent_reads` следующий stream
+блокируется, пока жив первый объект. P0-2: text-tail EOF (непустой
+`decoder.flush()`) возвращался раньше, не устанавливая terminal state
+(`data = None`, `in_flight = false`, завершение reservation), поэтому
+следующий `read()` не брал корректный terminal fast path и lifecycle
+расходился с обычным EOF.
+
+Решение: общая `transition_stream_eof(shared, operation, context)` в
+`streams.rs` — единственная terminal-EOF transition для обоих путей
+(обычный EOF и text-tail EOF): очистка payload-курсора (`data = None`,
+`in_flight = false`), удаление live operation root и payload, ровно один
+`IoBridge::unreserve` — всё до постановки Promise jobs. Идемпотентна:
+когда operation root уже удалён (late completion в гонке с transition),
+drop payload и bridge release пропускаются, поэтому двойной release и
+второй drop невозможны. Tail остаётся единственным финальным
+`{ value, done: false }` для текущего demand; queued demands получают
+`{ value: undefined, done: true }` FIFO через `drain_queue_done`. После
+transition future `read()` резолвится `done: true` через существующий
+terminal fast path (`data.is_none()`) без worker task, source read, нового
+reservation или telemetry-дубликата (late completion после EOF упирается в
+unknown-operation guard в `settle_stream_completion`: strict no-op без JS
+mutation, telemetry и второго release). Stale-guard в
+`settle_stream_completion` при generation-mismatch больше не восстанавливает
+slot/resolvers и не пересабмитит: demand после terminal transition уже
+засеттлен, восстановление воскресило бы его и погнало бы worker I/O за
+terminal state — теперь strict no-op. Contracts cancel/error/releaseLock,
+public descriptors и Streams capability boundary не меняются; scheduling/
+backpressure за пределами terminal EOF не меняются. Новых зависимостей нет;
+`cargo-deny` не меняется.
+
+Последствия: trace rows `M9D-STR-02` (terminal EOF + text-tail EOF) и
+`M9D-STR-04` (quota recovery именно после EOF, без cancel/drop);
+`quota_recovery_after_eof_error_and_cancel` переписан: доказывает recovery
+после EOF, затем после error, затем после cancel (до R1 доказывал только
+cancel-recovery); новые тесты `text_tail_eof_terminates_state_and_frees_quota`
+и `eof_late_completion_is_strict_noop_without_second_telemetry`.
+
+## ADR-0046 (M9-D-R3): GC/drop lifecycle для Streams I/O
+
+Контекст: приёмка M9A–M9E показала оставшуюся ветку M9-D §3: созданный,
+но брошенный stream (последний доступный JS endpoint недостижим, `read`/
+`cancel` не вызывались) удерживал `IoBridge` reservation и payload до
+shutdown. `StreamNative`/`ReaderNative` не владели lifecycle lease, а
+derived `Finalize` только уничтожал native data, не удаляя context-owned
+operation. При `max_concurrent_reads_per_global = 1` второй stream был
+ошибочно quota-blocked; при стандартном лимите серия недостижимых
+непрочитанных stream занимала все slots навсегда.
+
+Решение — явная endpoint/demand ownership + finalizer-to-Boa-thread
+cleanup boundary + exactly-once arbitration, без `unsafe` и без новых
+зависимостей:
+
+1. Модель JS endpoint/demand ownership: живыми сторонами считаются stream
+   side и reader side (`StreamShared::stream_registered` /
+   `reader_registered`, оба — plain `bool`, не счётчики) плюс lease
+   `StreamLease { context, operation, generation, terminal, released }`
+   (только opaque ids, без `Context`/`JsValue`/`JsObject`/
+   GC-указателей). `create_stream` ставит stream side, `getReader` —
+   reader side (с синхронным rollback при ошибке), `releaseLock` снимает
+   ТОЛЬКО reader side через reader-side claim (`released` проверяется до
+   любого движения shared флага — повторный `releaseLock()` на том же
+   объекте бросает `TypeError`, не трогая stream side; тем самым провал
+   "hook уменьшает обе стороны включая уже released reader", найденный
+   приёмкой, невозможен по построению: claim принадлежит native data, а
+   не хуку). Drop одной стороны не завершает operation, пока
+   зарегистрирована другая. Pending read Promise — самостоятельный живой
+   demand: потеря stream/reader не отменяет достижимый Promise (он обязан
+   получить запрошенный chunk/error); advisory probe
+   `IoBridge::stream_live_demand` + проверка `PendingStreamReads` держат
+   операцию живой до settlement последнего demand, после чего
+   post-settlement drain перевооружает abandonment. На `Rc::strong_count`
+   не полагаемся: context tables и pending entries держат технические
+   `Rc`, не равные JS ownership.
+2. Finalizer-to-Boa-thread cleanup boundary (§3.2 буквально): GC
+   finalizer не мутирует `Context`, не исполняет JS, не делает I/O/worker
+   join и не ждёт никакого lock. Он выполняет только
+   `AtomicBool::store(false)` в одном из двух per-operation сигналов
+   `StreamEndpointSignals` (`stream_alive`/`reader_alive`), разделяемых
+   native data и context-owned `StreamShared` через `Arc`. В finalizer нет
+   очереди, `Mutex`, `RefCell`, аллокации, packing, identity lookup,
+   CAS-цикла или `unsafe`; поэтому нет ни переполнения, ни ограничений на
+   ширину context/operation id, ни global registry/orphan-очереди.
+   Native data не хранит `Rc<RefCell>` вообще (только identity integer и
+   clone атомарных сигналов). `poll_io` (Boa thread, единственное место
+   transition) сначала обходит живые local `PendingStreamOps` и переносит
+   опущенные сигналы в plain side flags. Если `try_borrow_mut()` временно
+   занят, атомарный сигнал остаётся `false`, поэтому следующий `poll_io`
+   повторяет синхронизацию без requeue и без потери claim. Затем sweep
+   валидирует живой op root (ids не reused, см. `IoBridge::reserve`),
+   terminal state, ноль сторон, пустую очередь и отсутствие in-flight
+   работы; demand-first с table/bridge views остаётся defense-in-depth —
+   и только тогда выполняется single abandoned transition. `releaseLock()`
+   использует тот же reader signal до снятия reader-side флага; повторный
+   вызов видит `released` и не изменяет состояние.
+3. Exactly-once arbitration и conditional release: EOF, text-tail EOF,
+   error, cancel, abandoned/drop и shutdown конкурируют за одну terminal
+   ownership transition (флаги `terminal`/`released` в op entry + lease).
+   Только победитель отменяет token при необходимости, удаляет operation
+   root и payload, освобождает quota slot и создаёт не более одного
+   terminal telemetry event. `IoBridge::unreserve`/`release` стали
+   условно-идемпотентными (`-> bool`): повторный release неизвестного id
+   возвращает `false` и не уменьшает `active` чужого запроса (одного
+   `saturating_sub` недостаточно — требуется доказательство существования
+   reservation через token entry). Late completion после abandoned/drop —
+   strict no-op (unknown-operation guard; demand-first settlement: chunk
+   с живым demand settles даже у endpoint-less эпохи, пустая очередь —
+   strict no-op без второго release, payload drop и telemetry).
+4. Поведение telemetry для abandoned stream: отдельный bounded класс не
+   вводится — abandoned transition эмитит одно `stream_read` событие в
+   существующем классе `cancelled` (allow-list M8 неизменна: те же 6
+   полей, те же 10 классов). Abandoned stream без pending Promise не
+   создаёт JS event/error (возвращаемое значение drain — только host
+   diagnostics, jobs не ставятся). Cancel/error/EOF telemetry теперь тоже
+   эмитится только победителем terminal гонки (повторный cancel после
+   решённого transition молчит).
+5. Failure atomicity — честный scope (замечание приёмки): при включённом
+   `streams-shim` (единственная конфигурация тестового билда) внутри
+   `create_stream` после `reserve()` НЕТ достижимого fallible шага:
+   prototype lookup не может упасть (регистрация ставит его атомарно, а
+   `register` падает до `globalThis` мутации иначе), op-root insert и
+   payload store — infallible. Прежний M9D-GC-06-блок "missing prototype"
+   выполнял обычное успешное создание и ложно заявлял инъекцию — он
+   удалён, а не перемаркирован. Rollback helpers
+   (`rollback_stream_reservation`/`rollback_reader_endpoint`) существуют
+   для disabled-shim сборок и покрываются `no-default-features` билдом.
+   Проверяются реально достижимые после-`reserve()` отказы: quota-full
+   creation, locked-`getReader`, queued-demand `releaseLock`, QueueFull
+   submit — каждый оставляет тройку (active, payload, ops) неизменной.
+6. Shutdown: `shutdown_runtime` дополнительно дренит все stream op
+   roots/payloads/resolvers через context tables (quota bulk-релиз идёт
+   через bridge closer ровно один раз); late completions после shutdown —
+   strict no-op с полным (active, payload, ops) baseline.
+
+Безопасная интеграция с Boa GC достигнута текущим публичным API
+(`Trace`/`Finalize` derive + `#[boa_gc(unsafe_no_drop)]` для ручного
+`Drop`, `Cell` для `&self`-мутации в finalizer, без ручного
+`unsafe impl Trace`): вопрос в `docs/QUESTIONS.md` не потребовался.
+Запрет заказа §6 (строка 195) соблюдён буквально: test-only cleanup
+вызовов в M9D-GC-01…06 НЕТ вообще — каждый тест создаёт endpoints в
+блочном eval scope (ссылки умирают с возвратом eval), выполняет
+поддерживаемый deterministic `boa_gc::force_collect()` (запускает
+настоящие native `Finalize`, публикующие записи), затем дренит настоящий
+host `poll_io` loop; `poll_io` — единственное место transition.
+`__test_*` helpers, вызвавшие замечание приёмки, удалены полностью из
+кода, guards и документации. Новых зависимостей нет; `cargo-deny` не
+меняется. Count-only host diagnostics (`io_active_count`,
+`stream_payload_count`, `stream_operation_count`) — публичные счётчики
+без раскрытия операций/payload/token.
+
+Последствия: trace rows `M9D-GC-01…06` в `docs/spec-matrix.md`;
+M9D handoff дополняется новым rework-handoff (исторический
+M9D-EOF-LIFECYCLE-handoff не переписывается); `docs/architecture.md`
+§Layer 2c дополняется GC/drop абзацем.
+
+## ADR-0047 (M9-E-R1): canonical run model, expectations-match vs release-green
+
+Контекст: приёмка M9-E показала, что strict-прогон одновременно назывался
+«release red» и завершался `exit 0`; JSON содержал `strict_pass: true` и не
+содержал `release_green`; три `DYNAMIC:` строки, уже присутствовавшие в
+manifest, добавлялись повторно (420 строк при 417 уникальных); 79
+file-level exclusions не входили в totals; CI считал `defects == 5`
+успешным release condition. Один и тот же raw result нельзя одновременно
+считать release red и успешным status (M9E-R1 §1/§3).
+
+Решение: ввести один validated `CanonicalRun` (`accounting.rs`) —
+единственный источник для console, JSON (schema 2), JUnit и exit code;
+никакой serializer не пересчитывает totals независимо (M9E-R1 §5).
+Два недвусмысленных результата разделены:
+
+1. `expectations_match` — фактические статусы и identity полностью
+   совпали с audited expectations: без duplicate/missing/unexpected/extra
+   и status-drift. Exact identity сравнивается ordinal/case-sensitive по
+   `(upstream_path, test, subtest)`; `DYNAMIC:` не является особым
+   разрешением на дубликат — `tracker_subtests` пропускает id, уже
+   присутствующий в manifest/результате.
+2. `release_green` = `expectations_match && defects == 0 && timeouts == 0`
+   (harness-gap/supported-NOTRUN/expired остаются load-ошибками).
+   `strict_pass` удалён в schema 2; сохранять `true` при
+   `release_green == false` больше нельзя.
+
+Инвентарь: каждый из 115 pinned `FileAPI/**` путей получает ровно одну
+primary disposition (`executed-direct`, `executed-adapted`,
+`excluded-capability`, `unsupported-artifact`), валидируемую как
+bijection до вердикта: executed claims берутся из manifest provenance,
+исключения — из точных file-level exclusion rows. Pure
+`project-acceptance` adapted smoke не претендует на upstream path, поэтому
+FileList host smoke остаётся отдельным `smoke_pass`, а `filelist.html`
+остаётся `excluded-capability`. Missing/extra/duplicate/contradictory
+claims — launch error. 79 exclusions представлены top-level массивом и
+synthetic JUnit suite, входят в totals и несут
+path/capability/reason/owner/issue/review date.
+
+CLI: `--strict` возвращает `0` только при `release_green == true`;
+`--check-expectations` возвращает `0` при `expectations_match == true`, но
+в console/JSON всегда `release_green: false` и не называется
+conformance/release pass. Exit reason классы различаются в JSON:
+`integrity`, `expectation_drift`, `execution_failure`, `release_defects`
+(CLI может использовать один non-zero code). `--smoke` остаётся
+`ADAPTED_SMOKE`, без release terminology и без inventory/expectations.
+
+Последствия: trace rows `M9E-R1-01…07` в `docs/spec-matrix.md`;
+`docs/wpt.md` и `crates/boa_fapi_wpt/README.md` описывают режимы, schema 2,
+inventory disposition и exit semantics; CI получает required
+`m9e-release-conformance` job (без inversion/`continue-on-error`; красный,
+пока пять дефектов не исправлены, и автоматически зелёный после) и
+отдельный `m9e-gate-negative-controls` job с mutation fixtures. Новых
+зависимостей нет; пять product/harness дефектов не менялись.
+
+## ADR-0048 (M9-R1 defect order): File.name сохраняется verbatim
+
+Статус: принято. Supersedes slash replacement в M2 и name sanitization
+в ADR-0032; остальные решения ADR-0032 сохраняются.
+
+Контекст: pinned `File-constructor.any.js` ("No replacement when using
+special character in fileName") ожидает `new File([], 'dummy/foo').name
+=== 'dummy/foo'`, а WD §4.1 шаг 4.4 устанавливает `F.name = n` без
+нормализации. Старый `normalize_file_name` заменял `/` на `:` (устаревшее
+требование), из-за чего crate расходился и со спекой, и с upstream.
+
+Решение: `normalize_file_name` — identity (только USVString-семантика
+вызова); JS-конструктор и host-импорт хранят имя verbatim. M2/M5/M6/
+appendix-A ожидания обновлены (`a/b`, `/leading`, `host/path.txt`).
+Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
+
+## ADR-0049 (M9-R1 defect order): синхронный FileReader.abort()
+
+Статус: принято. Supersedes queued abort в ADR-0018; EMPTY/DONE остаются
+без событий, LOADING диспатчит `abort` и условный `loadend`.
+
+Контекст: WD §6.2.3.5 шаги 5–6 предписывают `abort()` синхронно
+диспатчить `abort` (и условный `loadend`) до возврата; pinned
+`fileReader.any.js` ("FileReader States -- abort") проверяет, что handler
+успевает выполниться до переназначения `onabort`. Продукт ставил
+терминал в очередь через `poll_io`/`run_jobs`, поэтому событие приходило
+позже.
+
+Решение: `abort()` вызывает `dispatch_terminal_now` — синхронный
+диспатч `abort`+`loadend` на вызывающем стеке; условный `loadend`
+подавляется при reentrant-замене generation. Асинхронный pump-путь
+`load`/`error` по-прежнему использует `run_dispatch`; вариант
+`TerminalKind::Abort` удалён. M4-pure-model, M9-C abort-тесты и
+M8-observability лог обновлены под новый порядок.
+Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
+
+## ADR-0050 (M9-R1 defect order): task/microtask boundary после loadstart
+
+Статус: принято. Уточнение: пара abort/loadend ниже относится к LOADING
+без reentrant restart/shutdown; loadend условный по ADR-0049, EMPTY/DONE
+событий не создают.
+
+Контекст: `filereader_abort.any.js` "Aborting after read" в
+`.then()`-продолжении после `wait_for('loadstart')` читает
+`readyState === LOADING`; раннер завершал весь read (включая `load`/
+`loadend`) в том же job, где диспатчился `loadstart`, поэтому continuation
+видел `DONE`.
+
+Решение: `run_pump` после первого `loadstart` переоткладывает уже
+дренированный chunk в следующий job (`JobStep::PumpChunk`) и
+возвращается; promise-реакции, поставленные в очередь во время
+`loadstart`, выполняются раньше применения чанка — браузерная граница
+task/microtask. Порядок событий `loadstart|progress|load|loadend`
+сохраняется; продукт по-прежнему отдаёт ровно одну пару `abort`+`loadend`
+на `abort()`.
+Последствия: trace `M9E-WPT-02`; дефект закрыт, `upstream_pass` +1.
+
+## ADR-0051 (M9-R1 defect order): readAsDataURL пустого типа → octet-stream
+
+Статус: принято. Supersedes empty-type packaging в ADR-0019; общий
+sync/async packaging contract ADR-0023 сохраняется. Новый prefix — 37 байт
+вместо 13, то есть +24 байта в `max_data_url_output`; прежнее чтение у
+границы квоты может теперь дать `QuotaExceededError`.
+
+Контекст: pinned `filereader_readAsDataURL.any.js` ожидает
+`data:application/octet-stream;base64,...` для Blob с пустым type (две
+строки); crate паковал `data:;base64,...`. WD §6.3 текст
+(«otherwise return a Data URL without a media-type») неоднозначен
+(issue #104); upstream WPT — конформанс-цель гейта, и браузеры отдают
+`application/octet-stream`.
+
+Решение (change-control): `package_data_url`/`data_url_len` рендерят
+пустой media type как `application/octet-stream`; M4 async/sync
+packaging-тесты обновлены. Это осознанное следование pinned upstream
+поверх нечёткого текста WD.
+Последствия: trace `M9E-WPT-02`; два дефекта закрыты, `upstream_pass` +2;
+`release_green` становится `true` (0 defects).
+
+## ADR-0052 (M9-R1 audit follow-up): документация, shutdown и preallocation
+
+Статус: remediation принято пользователем и реализовано. Локальные
+fmt/clippy, workspace tests и strict WPT прошли; внешний CI:
+run 35210624376 (commit `56f0261`) зелёный на Linux/macOS/strict WPT,
+Windows упал в llvm-cov (test driver, handoff §8); run 35213828592
+(commit `8d7c1ed`) — все шесть jobs success, включая Windows.
+Исторический зелёный CI commit `9975de5`
+из M9F handoff не является evidence для этого локального follow-up.
+
+Контекст/evidence: принятый аудит выявил stale slash replacement в
+`docs/spec-matrix.md` (M2-FILE-02) и TZ (§5.3, приложение A), отсутствие
+M9-R1 compatibility entries в `CHANGELOG.md` вопреки TZ §13, а также
+неполную очистку таблиц FileReader при shutdown, отсутствие shutdown guard
+после `abort` handler перед `loadend`/enqueue listener error и проверку
+длины в `package_data_url` после allocation base64 payload. Прямое чтение
+документации дополнительно выявило
+тот же stale host/clone-name contract в architecture/host integration и
+empty-type Data URL/queued-abort требования в TZ и spec matrix.
+
+Решение: применить принятые ADR-0048–0051 как точечный change-control,
+не заменяя WD 23.08.2026 целиком; согласовать текущие требования/примеры
+и записать совместимость, включая +24 байта Data URL prefix в квоте.
+Исторические handoff/CI claims не переписывать; текущий pending follow-up
+выделить в M9F handoff §7. Старые ADR-0018/0019/0032 сохраняются как
+история, supersession отмечен в ADR-0049/0051/0048 соответственно.
+
+Точный scope исправления: очистить таблицы FileReader при shutdown,
+включая roots и deferred state на границе `loadstart`; проверить shutdown
+после `abort` handler до dispatch `loadend` и enqueue listener error;
+в `package_data_url` проверять полную выходную длину до allocation base64
+payload. Host byte creation/context validation и изменения telemetry
+не входят в это решение.
+
+Trace mapping по существующей spec matrix: `M9C-FR-03` — cleanup/reentrant
+shutdown; `M4-FR-05` и `M4B-FRS-05` — data URL quota/shared packaging.
+Дополнение повторного ревью: shutdown после промежуточного progress не
+должен восстанавливать PumpState; после финального progress не должен
+публиковать DONE/result. Проверка shutdown выполняется после callback
+до продолжения pump/packaging. Регрессия финального progress дала RED
+на `2:string:null` вместо `1:null:null`, затем GREEN для четырёх методов
+и пустого/непустого Blob. Локальные команды и результаты записаны в M9F
+handoff §7; CI evidence — runs 35210624376/35213828592 (handoff §7–8).
+Новых зависимостей и расширения release/delivery closure нет.

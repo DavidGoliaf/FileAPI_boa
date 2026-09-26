@@ -88,7 +88,7 @@ owns the host bridge; `extension.rs` owns the entry points:
   `MAX_CLONE_STRING_BYTES` / `MAX_CLONE_FILES`: malformed/truncated/
   overflow/unknown-version/unknown-tag/trailing fail without panic or
   partial output; payloads carry materialized bytes + public metadata
-  only (M1-normalized type, sanitized name, stored `lastModified`) —
+  only (M1-normalized type, verbatim name per ADR-0048, stored `lastModified`) —
   never paths, capabilities, OS handles or snapshot identities;
 - `clone_blob`/`clone_file`/`clone_file_list` materialize through the
   existing checked path (`SourceFailed` typed, no partial payload;
@@ -102,34 +102,97 @@ owns the host bridge; `extension.rs` owns the entry points:
   exists by design (host-side capability); `structured-clone` off keeps
   M1–M5 behavior with no partial surface.
 
-### Layer 2b: `boa_fapi` promise reads (M3-A)
-`promise_read.rs` owns the single conversion/packaging/scheduling path for
+### Layer 2b: `boa_fapi` promise reads (M9-B executor)
+
+`io.rs` owns the explicit file I/O executor and completion bridge;
+`promise_read.rs` owns the validation/submit/settle path for
 `Blob.prototype.text()`, `arrayBuffer()`, and `bytes()`:
 
-- brand check (`require_blob`) is synchronous; failures never create a `Promise`;
-- `JsPromise::new_pending` creates the pending promise in the current realm;
-- a `PromiseJob` capturing only `Arc<BlobData>`, cloned limits, and the read
-  mode is enqueued via `Context::enqueue_job`; the job calls the bounded
-  `BlobData::materialize`, packages the result (UTF-8 replacement string,
-  fresh `ArrayBuffer`, or fresh offset-0 `Uint8Array`), and settles once;
-- `MaterializeBytes` and every other read failure reject with the central
-  M4-A mapped `DOMException` (`ResourceLimit` → `QuotaExceededError`,
-  others → the mapped name); the embedder runs `context.run_jobs()`
-  explicitly — the job never calls it itself.
+- brand/Web IDL validation, size preflight and quota reservation run on
+  the Boa thread; failures settle the fresh pending promise through one
+  Boa job without worker contact;
+- the method submits a Send-only `FileIoTask` (shared `BlobData`,
+  limits snapshot, cancellation token, bridge — no `JsValue`/`JsObject`/
+  `Context`/paths) to the context `FileIoExecutor` and returns the
+  pending `Promise` immediately;
+- a worker materializes without Boa, pushes a Rust-only
+  `FileIoCompletion` (bytes or typed `FileApiError`), and signals the
+  `FileIoWake` hook; packaging (`String`/`ArrayBuffer`/`Uint8Array`)
+  happens on the Boa thread after `poll_io`;
+- `FileApiHandle::poll_io` (owner only; foreign contexts rejected)
+  turns DTOs into Boa settlement jobs without calling user JS or holding
+  the bridge mutex across Boa calls; `has_pending_io` reports
+  outstanding work; `shutdown` cancels, clears, and forbids late
+  settlement with exact-once quota release;
+- the built-in `ThreadedFileIoExecutor` is a fixed pool with a bounded
+  queue (thread-per-read without a limit is forbidden); tests inject a
+  controlled manual executor. M9-C (FileReader) reuses the same bridge:
+  one operation slot per read, one chunk request per drained completion
+  (no readahead), FIFO within one reader, stale generations dropped
+  before any JS mutation; the host may bound reader completions per
+  `poll_io` (`set_poll_io_budget`, leftovers re-wake) so a busy reader
+  cannot starve promise reads or other readers.
 
-### Layer 2c: `boa_fapi` streams shim (M3-B)
+### Layer 2c: `boa_fapi` streams shim (M3-B surface, M9-D I/O)
 `streams.rs` owns the branded `ReadableStream` shim:
 
 - `Blob.prototype.stream()`/`textStream()` (Blob-brand only, inherited by
-  `File`) create fresh unlocked streams backed by a bounded `BlobReader`;
-  nothing is read until `reader.read()`;
-- each `read()` creates one pending promise and enqueues exactly one
-  `PromiseJob` that pumps at most one `read_next()` chunk: fresh
-  `Uint8Array` or incremental UTF-8 string, `{value, done}` settlement,
-  EOF with decoder flush, sticky terminal error/cancel states;
+  `File`) create fresh unlocked streams that reserve one `IoBridge` slot
+  and register a stream root; nothing is read until `reader.read()`;
+- each `read()` creates one pending promise plus one FIFO demand slot and
+  submits at most one bounded `StreamChunkTask` when nothing is in flight
+  (no read-ahead): the worker reads exactly one `[loaded, loaded+chunk)`
+  range off-thread through `read_blob_range` and pushes a Rust-only
+  `StreamChunkCompletion` (chunk/EOF/typed error, never a JS object);
+- `FileApiHandle::poll_io` drains stream completions FIFO per stream and
+  turns each into at most one settlement Boa job (fresh `Uint8Array` or
+  incremental UTF-8 string, `{value, done}` settlement, EOF with decoder
+  flush and queued/future done, sticky terminal error/cancel states with
+  stored mapped `DOMException` replay and no further source reads);
+- at most one chunk is in flight per stream; chunk reservations are tracked
+  in `IoBridge::chunk_reservations` so whole-blob promise FIFO never blocks
+  behind live streams; every terminal path (EOF, error, cancel, shutdown)
+  frees its quota exactly once via a shared terminal-EOF transition
+  (`transition_stream_eof`: payload cursor cleared, operation root and
+  payload removed, one `IoBridge::unreserve`, all before any Promise job is
+  queued; idempotent, so a late completion can never double-release). After
+  terminal EOF future `read()` calls resolve done without worker contact;
 - `ReadableStream`/`ReadableStreamDefaultReader` constructors reject direct
-  `new`; `getReader` locks, `releaseLock` unlocks only with no queued read,
-  stream/reader `cancel()` resolve `undefined` idempotently through jobs;
+  `new`; `getReader` locks, `releaseLock` unlocks only with no queued read
+  and no in-flight I/O, stream/reader `cancel()` settle queued reads done
+  synchronously on the calling stack (cancel promise resolves `undefined`
+  through one Boa job) and make the in-flight chunk stale;
+- GC/drop lifecycle (M9-D-R3): every stream epoch owns two explicit
+  sides (`StreamShared::stream_registered` / `reader_registered`, plain
+  `bool`s — never counters, never `Rc::strong_count`) and two matching
+  `StreamEndpointSignals` atomics, plus a lease
+  (`StreamLease { context, operation, generation, terminal, released }` —
+  opaque ids only, no GC pointers). Native data keeps only its operation
+  identity and an `Arc` clone of the signals; its `Finalize`/`Drop` pair
+  claims once with `Cell<bool>` and performs one `AtomicBool::store(false)`.
+  Thus finalization has no `Context`, queue, `Mutex`, `RefCell`, allocation,
+  packing, identity lookup, CAS retry, or `unsafe`. `releaseLock()` shares
+  the reader claim through `take_lease`. `poll_io` (the only transition
+  site) synchronizes false signals into side flags for every live local op;
+  a busy shared `RefCell` leaves the atomic false, so the next poll retries
+  without a requeue and cannot lose the clearing. It then validates (live op
+  root — ids are never reused — not terminal, zero sides, empty queue,
+  not in-flight; demand-first with the table/bridge views as
+  defense-in-depth) and runs the single abandoned transition (token
+  cancel, cursor clear, op root + payload removal, one conditional quota
+  release, one `stream_read` event in the existing `cancelled` class —
+  no JS event/error, no new telemetry class), plus a sweep for sideless
+  demand-less epochs. Live read-promise demand outlives endpoint drops
+  and settles first (terminal-lease check runs AFTER the slot pop);
+  post-settlement drains re-arm abandonment. Error replay for future
+  `read()` calls survives the op entry removal (`PendingStreamErrors`,
+  plain name/message); terminal `read()`/`cancel()`/`releaseLock()`
+  after entry removal stay idempotent and never throw "no longer live".
+  All terminal paths (EOF/error/cancel/abandoned/shutdown) arbitrate one
+  exactly-once ownership; `IoBridge::unreserve` is
+  conditional-idempotent (repeat release of an unknown id never touches
+  another slot); creation failures after `reserve()` roll back
+  synchronously (no hidden slots);
 - after M4-A stream errors reject with the central mapped `DOMException`
   (same mapping as promise reads and FileReader), not a plain `Error`.
 
@@ -152,16 +215,26 @@ asynchronous `FileReader` state machine:
   `readyState`/`result`/`error`, 6 writable `on*` handlers; initial state
   exactly `(EMPTY, null, null)`; `result` only `null`/DOMString/fresh
   `ArrayBuffer`; `error` only `null`/same-realm `DOMException`;
-- one FileReading job per read, chained per operation through the ordinary
-  Boa promise-job queue drained by `context.run_jobs()` (no threads, no
-  `run_jobs()` inside jobs, no JS from source completion); `loadstart`/
-  `progress` dispatch synchronously inside their pump job, terminal
-  `load`/`error`/`abort` (+ conditional `loadend`) through queued dispatch
-  jobs; monotonic generations make stale completions strict no-ops;
-  `progress` throttled to once per 50 ms of the injected `Clock` (one per
-  chunk when chunks are rarer), final `progress(loaded=total)` always
-  before `load`; `max_concurrent_reads_per_global` quota with exact
-  release on every terminal/abort/stale path;
+- `readAs*` validates synchronously, sets `(LOADING, null, null)`,
+  reserves one `IoBridge` slot, and submits the first chunk request to
+  the `FileIoExecutor` before returning — never a source read on the Boa
+  thread (M9-C). A worker reads exactly one bounded `[offset, offset+len)`
+  range off-thread (`FileReaderChunkTask::execute` → `read_blob_range`,
+  panic-contained) and pushes a Rust-only `FileReaderChunkCompletion`
+  (generation + chunk/EOF/typed error, never a JS object);
+- `FileApiHandle::poll_io` drains reader chunks FIFO within one reader
+  and turns each into at most one pump Boa job; the job dispatches
+  `loadstart` on the first completion (including empty-blob EOF),
+  packages bytes/text incrementally, emits throttled `progress` with a
+  final `progress(loaded=total)` before `load`, then enqueues terminal
+  `load`/`error` (+ conditional `loadend`); at most one next chunk
+  request is submitted per drained chunk;
+- `abort()` bumps the generation, cancels the worker token, releases the
+  bridge slot exactly once, and queues `abort` (+ conditional `loadend`);
+  completions of older generations (after abort/restart/shutdown) are
+  dropped in `poll_io` with no JS mutation, event, telemetry, or second
+  release; quota mirrors the bridge (`active` counter) with the same
+  65th-reader `SecurityError` fast path;
 - `readAsText` decodes incrementally through `encoding_rs` (replacement,
   split sequences, BOM); `readAsDataURL` checks `max_data_url_output`
   with checked arithmetic before allocation; memory stays O(chunk + final
@@ -231,7 +304,8 @@ packaging shared with the async reader:
   import plus the weak-platform gate before any JS object, preflights
   `max_blob_size`, tracks the registry for shutdown `close_all`, wraps in
   `ArcResourceSource` (shutdown-aware, per-read snapshot checks),
-  attaches only the display name (`/` → `:`, no basename). Signature
+  attaches only the supplied display name verbatim (including `/`, no
+  basename; accepted ADR-0048). The host must not supply a secret path. Signature
   adaptation (`registry` + `Arc` vs target `&dyn`) recorded in ADR-0024.
 - `boa_fapi::lifecycle` — `ShutdownFlag` (closed bit + cancellation +
   tracked closers) in `RegisteredSpecs`/handle/every fs import;

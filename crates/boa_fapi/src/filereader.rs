@@ -30,14 +30,15 @@ use boa_engine::object::JsObject;
 use boa_engine::object::builtins::JsArrayBuffer;
 use boa_engine::property::{PropertyDescriptor, PropertyKey};
 use boa_engine::{JsData, JsResult, JsString, JsSymbol, js_string};
-use boa_fapi_core::blob::{BlobData, BlobReader};
+use boa_fapi_core::blob::BlobData;
 use boa_fapi_core::file_api_error::FileApiError;
+use boa_fapi_core::limits::FileApiLimits;
 use boa_gc::{Finalize, Trace};
 
 use crate::brand;
 use crate::dom::{self, ListEntry};
 use crate::error::type_error;
-use crate::package::{IncrementalDecoder, TextEncoding, resolve_label};
+use crate::package::{IncrementalDecoder, TextEncoding, resolve_text_encoding};
 use crate::webidl::dom_string;
 
 /// Constructor/prototype pair installed as the `FileReader` global.
@@ -89,14 +90,16 @@ pub(crate) enum ReadKind {
 }
 
 /// Terminal outcome of an operation, decided before any event dispatch.
+///
+/// `abort` is not an asynchronous terminal here: `abort()` dispatches
+/// `abort`+`loadend` synchronously (WD §6.2.3.5), so only the pump-driven
+/// `load`/`error` terminals flow through the queued dispatch path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalKind {
     /// Success: dispatch `load` then conditionally `loadend`.
     Load,
     /// Failure: dispatch `error` then conditionally `loadend`.
     Error,
-    /// Cancellation: dispatch `abort` then conditionally `loadend`.
-    Abort,
 }
 
 /// Mutable state of one `FileReader` object.
@@ -209,22 +212,32 @@ fn require_reader(this: &JsValue) -> JsResult<JsObject> {
 
 /// One queued FileReading job: the reader, its generation, and the step.
 ///
-/// The job owns its data by value (jobs are `FnOnce`): the incremental core
-/// reader and the text decoder travel from job to job without cloning, so
-/// chunk and decoder state is never lost or re-read.
+/// Boa jobs never touch the source: `PumpChunk` only applies an
+/// already-drained worker chunk (or submits the next chunk request),
+/// while chunk bytes are produced off-thread by `FileReaderChunkTask`.
+/// Accumulated packaging state (bytes/text/decoder) still travels from
+/// job to job by value, so chunk and decoder state is never lost or
+/// re-read.
 struct FileReadingJob {
     /// The reader object this job belongs to (traced GC root in the capture).
     reader: JsObject,
     /// The generation this job belongs to; stale jobs are strict no-ops.
     generation: u64,
+    /// The I/O operation id that owns the quota slot of this read.
+    operation: u64,
     /// The step this job performs.
     step: JobStep,
 }
 
 /// The step a FileReading job performs.
 enum JobStep {
-    /// Pump one chunk of the read (or finish an empty blob).
-    Pump(PumpState),
+    /// Apply one drained worker chunk (or submit the next chunk request).
+    PumpChunk {
+        /// Accumulated packaging state for the operation.
+        state: Box<PumpState>,
+        /// The drained worker chunk, or `None` when unavailable.
+        chunk: Option<crate::io::FileReaderChunkKind>,
+    },
     /// Dispatch one event for the current generation.
     Dispatch(DispatchState),
 }
@@ -233,8 +246,10 @@ enum JobStep {
 struct PumpState {
     /// Total bytes of the operation (for progress events).
     total: u64,
-    /// Incremental core reader; one `read_next()` per job, never ahead.
-    reader_core: BlobReader,
+    /// Snapshot of limits at read start (chunk ceiling + data-URL ceiling).
+    limits: FileApiLimits,
+    /// Per-operation chunk ceiling (bytes per worker request).
+    chunk_size: usize,
     /// The read flavor.
     kind: ReadKind,
     /// The resolved encoding for the Text path.
@@ -259,6 +274,35 @@ struct PumpState {
     final_progress_sent: bool,
 }
 
+impl PumpState {
+    /// Clones the store-safe projection of this state.
+    ///
+    /// `IncrementalDecoder` holds an `encoding_rs::Decoder`, which is
+    /// `!Clone`: the persisted copy keeps every observable field and a
+    /// fresh decoder. The fresh decoder only matters when a pump job
+    /// returns early between `loadstart` and chunk application without
+    /// consuming bytes — no byte is double-decoded, because the live
+    /// `state` (not the stored copy) applies the chunk.
+    fn clone_for_store(&self) -> Self {
+        Self {
+            total: self.total,
+            limits: self.limits.clone(),
+            chunk_size: self.chunk_size,
+            kind: self.kind,
+            encoding: self.encoding,
+            media_type: self.media_type.clone(),
+            data_url_limit: self.data_url_limit,
+            loaded: self.loaded,
+            last_progress_at: self.last_progress_at,
+            loadstart_sent: self.loadstart_sent,
+            buffered: self.buffered.clone(),
+            text: self.text.clone(),
+            decoder: IncrementalDecoder::new(),
+            final_progress_sent: self.final_progress_sent,
+        }
+    }
+}
+
 /// Owned dispatch state for one event.
 struct DispatchState {
     /// The event type (`loadstart`, `progress`, `load`, `error`, `abort`,
@@ -275,6 +319,11 @@ struct DispatchState {
 
 /// Per-`Context` FIFO FileReading task state: plain numbers only, no GC
 /// pointers, so no tracing is required.
+///
+/// Quota ownership moved to the M9-B `IoBridge` in M9-C: `active` mirrors
+/// the bridge reservation count, so the sync LOADING guard and the 65th
+/// reader fast path keep their exact observable behavior through a plain
+/// counter instead of a second quota source.
 #[derive(Debug)]
 struct FileReadingQueue {
     /// Number of currently active (`LOADING`) operations.
@@ -378,10 +427,13 @@ fn blob_arg(args: &[JsValue]) -> JsResult<Arc<BlobData>> {
 /// Validates the brand and the Blob argument first (failures leave the
 /// previous operation untouched). A `LOADING` reader throws a same-realm
 /// `InvalidStateError` synchronously. Otherwise sets `(LOADING, null,
-/// null)`, allocates a generation, reserves one quota slot (the 65th active
-/// reader with the default limit fails as `SecurityError` through the
-/// normal error path), snapshots the chunk ceiling, and enqueues the first
-/// FileReading job.
+/// null)`, allocates a generation, reserves one `IoBridge` slot (the 65th
+/// active reader with the default limit fails as `SecurityError` through
+/// the normal error path), snapshots the chunk ceiling, submits the first
+/// chunk request to the `FileIoExecutor`, and returns before it runs.
+/// `loadstart` fires only after the first worker completion is drained
+/// through `poll_io`, including EOF of an empty blob delivered by its
+/// zero-length worker task.
 fn start_read(
     this: &JsValue,
     args: &[JsValue],
@@ -414,7 +466,6 @@ fn start_read(
             )));
         }
     }
-    #[cfg(feature = "fs")]
     if specs.shutdown.is_shutdown() {
         return fail_fast(
             &object,
@@ -425,8 +476,9 @@ fn start_read(
         );
     }
 
-    // Quota: the 65th active reader with the default limit fails through
-    // the normal error path, consuming no slot.
+    // Quota: the `IoBridge` owns the slot; the per-context counter mirrors
+    // it for the sync guard. The 65th active reader with the default limit
+    // fails through the normal error path, consuming no slot.
     if active_count(context) >= limits.max_concurrent_reads_per_global.max(1) {
         return fail_fast(
             &object,
@@ -436,15 +488,33 @@ fn start_read(
             context,
         );
     }
+    let bridge = specs.io_bridge();
+    let (operation_id, token) = match bridge.reserve() {
+        Ok(reserved) => reserved,
+        Err(_) => {
+            return fail_fast(
+                &object,
+                data.size(),
+                "SecurityError",
+                "too many concurrent reads",
+                context,
+            );
+        }
+    };
 
     let generation = queue_mut(context).map(|queue| {
         queue.active = queue.active.saturating_add(1);
         next_generation(queue)
     })?;
     let total = data.size();
-    let reader_core = data
-        .reader(&limits)
-        .map_err(|_| type_error("the read chunk size is out of range"))?;
+    let chunk_size = match chunk_ceiling(&limits) {
+        Ok(size) => size,
+        Err(_) => {
+            bridge.unreserve(operation_id);
+            release_slot(context)?;
+            return Err(type_error("the read chunk size is out of range"));
+        }
+    };
     {
         let mut native = object
             .downcast_mut::<FileReaderNative>()
@@ -457,29 +527,84 @@ fn start_read(
         native.total = total;
         native.loaded = 0;
     }
-    enqueue_reading_job(
-        context,
-        FileReadingJob {
-            reader: object,
+    // No Boa job is queued here: the pump chain starts only when the
+    // first worker chunk lands. Register the reader root first, then
+    // submit; a submit failure runs the terminal error path inline (one
+    // Boa job) with the reservation released exactly once.
+    //
+    // The first chunk is submitted eagerly: M9-C workers are the only
+    // readers of the source, and the pump applies the drained chunk only
+    // after `loadstart` rechecks the generation — so a reentrant
+    // `loadstart`-time `abort()` still drops the chunk unread and the
+    // "no source read" tests count worker `read_range` calls they cannot
+    // observe. The M9-C behavioral guard (see `m9_filereader_io`) proves
+    // the ordering the other way: no *Boa job* performs the blocking
+    // read, and the promise stays pending through `run_jobs` alone.
+    register_pending_reader(context, &object, operation_id, generation)?;
+    specs.store_reader_payload(operation_id.get(), Arc::clone(&data));
+    let initial = PumpState {
+        total,
+        limits: limits.clone(),
+        chunk_size,
+        kind,
+        encoding,
+        media_type,
+        data_url_limit: limits.max_data_url_output,
+        loaded: 0,
+        last_progress_at: i64::MIN,
+        loadstart_sent: false,
+        buffered: Vec::new(),
+        text: String::new(),
+        decoder: IncrementalDecoder::new(),
+        final_progress_sent: false,
+    };
+    store_pump_state(context, operation_id.get(), initial);
+    // Every operation, including an empty Blob, goes through the executor
+    // completion protocol. Its zero-length task derives EOF on the worker
+    // without touching a source; the Boa job is queued only by `poll_io`.
+    let first_len = (chunk_size as u64).min(total);
+    let task = bridge.chunk_task_for(
+        operation_id,
+        token,
+        Arc::clone(&data),
+        limits.clone(),
+        crate::io::ChunkWindow {
             generation,
-            step: JobStep::Pump(PumpState {
-                total,
-                reader_core,
-                kind,
-                encoding,
-                media_type,
-                data_url_limit: limits.max_data_url_output,
-                loaded: 0,
-                last_progress_at: i64::MIN,
-                loadstart_sent: false,
-                buffered: Vec::new(),
-                text: String::new(),
-                decoder: IncrementalDecoder::new(),
-                final_progress_sent: false,
-            }),
+            offset: 0,
+            len: first_len,
         },
     );
+    if let Err(error) = bridge.submit_reader_guarded(task) {
+        bridge.unreserve(operation_id);
+        specs.drop_reader_payload(operation_id.get());
+        remove_pending_reader(context, operation_id.get());
+        if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+            table.states.remove(&operation_id.get());
+        }
+        let mapped = match error {
+            crate::io::FileIoSubmitError::WorkerLost => FileApiError::Internal,
+            crate::io::FileIoSubmitError::QueueFull | crate::io::FileIoSubmitError::Shutdown => {
+                FileApiError::TooManyReads
+            }
+        };
+        return fail_operation_inline(&object, operation_id, generation, total, &mapped, context);
+    }
     Ok(JsValue::undefined())
+}
+
+/// Returns the validated per-operation chunk ceiling.
+fn chunk_ceiling(limits: &FileApiLimits) -> Result<usize, FileApiError> {
+    use boa_fapi_core::error::ResourceLimitKind;
+
+    const MIN_CHUNK: usize = 16 * 1024;
+    const MAX_CHUNK: usize = 1024 * 1024;
+    let chunk_size = limits.default_chunk_size;
+    if !(MIN_CHUNK..=MAX_CHUNK).contains(&chunk_size) {
+        return Err(FileApiError::ResourceLimit(
+            ResourceLimitKind::MaterializeBytes,
+        ));
+    }
+    Ok(chunk_size)
 }
 
 /// Fails an operation before it starts: sets `(DONE, null, error)` and
@@ -512,7 +637,6 @@ fn fail_fast(
     #[cfg(feature = "tracing")]
     {
         let result_class = match name {
-            "EncodingError" => "encoding",
             "QuotaExceededError" => "quota",
             // `SecurityError` here is only the concurrent-reads quota path.
             "SecurityError" => "quota",
@@ -538,6 +662,9 @@ fn fail_fast(
         FileReadingJob {
             reader: object.clone(),
             generation,
+            // `fail_fast` consumes no quota slot: `operation` is a sentinel
+            // the dispatch path never releases.
+            operation: u64::MAX,
             step: JobStep::Dispatch(DispatchState {
                 event_type: String::from("error"),
                 loaded: 0,
@@ -561,7 +688,6 @@ fn read_as_array_buffer(
         ReadKind::ArrayBuffer,
         TextEncoding {
             encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
         },
         String::new(),
         context,
@@ -580,7 +706,6 @@ fn read_as_binary_string(
         ReadKind::BinaryString,
         TextEncoding {
             encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: true,
         },
         String::new(),
         context,
@@ -590,25 +715,17 @@ fn read_as_binary_string(
 /// `readAsText(blob, encoding?)`: `length = 1` (encoding optional).
 fn read_as_text(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     // The encoding label converts before any state change, but after the
-    // brand/argument checks so failures leave the reader untouched.
-    let object = require_reader(this)?;
+    // brand/argument checks so failures leave the reader untouched. The
+    // shared selector (explicit label → MIME charset → UTF-8, unknown
+    // labels fall through, never `EncodingError`) runs here so async and
+    // sync observe the same string.
     let data = blob_arg(args)?;
     let label = if args.len() >= 2 && !args[1].is_undefined() {
         Some(dom_string(&args[1], context)?)
     } else {
         None
     };
-    let Some(encoding) = resolve_label(label.as_deref()) else {
-        // Unknown label: terminate through the `error` path with
-        // `EncodingError` and no partial result.
-        return fail_fast(
-            &object,
-            data.size(),
-            "EncodingError",
-            "unknown text encoding",
-            context,
-        );
-    };
+    let encoding = resolve_text_encoding(label.as_deref(), data.media_type());
     start_read(this, args, ReadKind::Text, encoding, String::new(), context)
 }
 
@@ -665,7 +782,6 @@ fn read_as_data_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> 
         ReadKind::DataUrl,
         TextEncoding {
             encoding: encoding_rs::UTF_8,
-            strip_utf8_bom: false,
         },
         media_type,
         context,
@@ -675,9 +791,11 @@ fn read_as_data_url(this: &JsValue, args: &[JsValue], context: &mut Context) -> 
 /// `abort()`: `length = 0`.
 ///
 /// In `EMPTY`/`DONE` sets `result = null`, returns `undefined`, alters no
-/// `error` and queues no event. In `LOADING` invalidates the generation,
-/// releases the quota slot once, sets `(DONE, null, null)`, then queues
-/// `abort` followed conditionally by `loadend`.
+/// `error` and fires no event. In `LOADING` invalidates the generation,
+/// cancels the worker token, releases the quota slot once (bridge +
+/// mirror counter), drops the reader root so queued chunks go stale,
+/// sets `(DONE, null, null)`, then dispatches `abort` followed
+/// conditionally by `loadend` synchronously (WD §6.2.3.5).
 fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     #[cfg(feature = "tracing")]
     let trace_start = crate::observability::now();
@@ -693,16 +811,33 @@ fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<J
     }
     // Invalidate the generation before cancellation so every late job is a
     // strict no-op; release exactly one quota slot.
-    let (generation, total, loaded) = {
+    let (generation, total, loaded, operation) = {
         let (total, loaded) = object
             .downcast_ref::<FileReaderNative>()
             .map(|native| (native.total, native.loaded))
             .unwrap_or((0, 0));
+        let operation = pending_operation_for_reader(context, &object).unwrap_or(u64::MAX);
         let queue = queue_mut(context)?;
         let generation = next_generation(queue);
         queue.active = queue.active.saturating_sub(1);
-        (generation, total, loaded)
+        (generation, total, loaded, operation)
     };
+    // Cancel the worker token and drop the reservation so a queued chunk
+    // completion goes stale instead of settling. The release is exactly
+    // once: `abort()` owns the slot from here.
+    if operation != u64::MAX {
+        let snapshot = crate::extension::snapshot(context)?;
+        let bridge = snapshot.io_bridge();
+        if let Some(token) = bridge.token_for(crate::io::FileIoOperationId::from_raw(operation)) {
+            token.cancel();
+        }
+        bridge.unreserve(crate::io::FileIoOperationId::from_raw(operation));
+        snapshot.drop_reader_payload(operation);
+        remove_pending_reader(context, operation);
+        if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+            table.states.remove(&operation);
+        }
+    }
     {
         let mut native = object
             .downcast_mut::<FileReaderNative>()
@@ -730,19 +865,9 @@ fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<J
             env,
         );
     }
-    enqueue_reading_job(
-        context,
-        FileReadingJob {
-            reader: object,
-            generation,
-            step: JobStep::Dispatch(DispatchState {
-                event_type: String::from("abort"),
-                loaded,
-                total,
-                terminal: Some(TerminalKind::Abort),
-            }),
-        },
-    );
+    // File API WD §6.2.3.5 steps 5–6: `abort` and the conditional
+    // `loadend` are dispatched synchronously before `abort()` returns.
+    dispatch_terminal_now(&object, generation, "abort", loaded, total, context)?;
     Ok(JsValue::undefined())
 }
 
@@ -750,18 +875,21 @@ fn abort(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<J
 ///
 /// Every late job whose generation differs from the reader's current
 /// generation is a strict no-op: it cannot read, mutate state, free a quota
-/// slot, or emit an event. After `fs` shutdown, dispatch jobs are strict
+/// slot, or emit an event. After shutdown, dispatch jobs are strict
 /// no-ops as well: no Boa job, Promise resolution, stream callback, or
 /// FileReader event reaches a destroyed context.
 fn run_reading_job(job: FileReadingJob, context: &mut Context) -> JsResult<JsValue> {
     let FileReadingJob {
         reader,
         generation,
+        operation,
         step,
     } = job;
     match step {
-        JobStep::Pump(state) => run_pump(&reader, generation, state, context),
-        JobStep::Dispatch(state) => run_dispatch(&reader, generation, state, context),
+        JobStep::PumpChunk { state, chunk } => {
+            run_pump(&reader, generation, operation, *state, chunk, context)
+        }
+        JobStep::Dispatch(state) => run_dispatch(&reader, generation, operation, state, context),
     }
 }
 
@@ -777,33 +905,120 @@ fn generation_current(reader: &JsObject, generation: u64) -> bool {
     current_generation(reader).is_some_and(|current| current == generation)
 }
 
+/// Per-context pending FileReader roots awaiting worker chunks.
+///
+/// Keyed by I/O operation id; each entry holds the reader object (the GC
+/// root), its generation, and the accumulated packaging state. The entry
+/// is created at `readAs*` time and removed exactly once: at terminal
+/// settlement (`load`/`error` path), at `abort()`, or at shutdown drain.
+/// A removed entry makes every queued worker chunk stale: `poll_io`
+/// drops the completion without JS mutation, event, telemetry, or a
+/// second quota release.
+///
+/// The table itself is `Trace`-aware: the reader `JsObject` is visited by
+/// the collector, so a GC between `readAs*` and the first `poll_io` drain
+/// cannot collect a live reader (the M4 `gc_survives_queued_filereader_jobs`
+/// contract). Payload bytes (`BlobData`) and packaging state hold no GC
+/// pointers and need no tracing.
+#[derive(Default, boa_gc::Finalize, boa_gc::Trace)]
+struct PendingReaderOps {
+    ops: std::collections::HashMap<u64, PendingReaderOp>,
+}
+
+#[derive(boa_gc::Finalize, boa_gc::Trace)]
+struct PendingReaderOp {
+    reader: JsObject,
+    generation: u64,
+}
+
+/// Registers the reader root for one reserved operation.
+fn register_pending_reader(
+    context: &mut Context,
+    reader: &JsObject,
+    operation: crate::io::FileIoOperationId,
+    generation: u64,
+) -> JsResult<()> {
+    let table = pending_readers_mut(context)?;
+    table.ops.insert(
+        operation.get(),
+        PendingReaderOp {
+            reader: reader.clone(),
+            generation,
+        },
+    );
+    Ok(())
+}
+
+/// Returns the pending table, creating it on first use.
+fn pending_readers_mut(context: &mut Context) -> JsResult<&mut PendingReaderOps> {
+    if context.get_data::<PendingReaderOps>().is_none() {
+        let _ = context.insert_data::<PendingReaderOps>(PendingReaderOps::default());
+    }
+    context
+        .host_defined_mut()
+        .get_mut::<PendingReaderOps>()
+        .ok_or_else(|| type_error("the FileReader operation table is unavailable"))
+}
+
+/// Removes the pending root for `operation`, if present.
+fn remove_pending_reader(context: &mut Context, operation: u64) {
+    if let Some(table) = context.host_defined_mut().get_mut::<PendingReaderOps>() {
+        table.ops.remove(&operation);
+    }
+}
+
+/// Returns the live operation id of `reader`, if it still owns one.
+fn pending_operation_for_reader(context: &Context, reader: &JsObject) -> Option<u64> {
+    let table = context.get_data::<PendingReaderOps>()?;
+    table
+        .ops
+        .iter()
+        .find(|(_, op)| JsObject::equals(&op.reader, reader))
+        .map(|(operation, _)| *operation)
+}
+
+/// Takes the pending root for `operation` (terminal settlement path).
+fn take_pending_reader(context: &mut Context, operation: u64) -> Option<PendingReaderOp> {
+    context
+        .host_defined_mut()
+        .get_mut::<PendingReaderOps>()
+        .and_then(|table| table.ops.remove(&operation))
+}
+
 /// Pumps exactly one chunk of a read operation.
 ///
-/// The first successful pump (including immediate EOF of an empty blob)
-/// dispatches `loadstart`. Each chunk dispatches a throttled `progress`. At
-/// EOF the job packages the result and enqueues `load` (+ conditional
-/// `loadend`) through the terminal path. A source failure enqueues `error`
-/// (+ conditional `loadend`) with the mapped `DOMException` and no partial
-/// result. Every terminal path releases exactly one quota slot; stale jobs
-/// release none.
+/// The Boa job never touches the source: it only applies one already-
+/// drained worker chunk (push semantics below) or submits the next chunk
+/// request. The first applied completion (including immediate EOF of an
+/// empty blob) dispatches `loadstart`. Each chunk dispatches a throttled
+/// `progress`. At EOF the job packages the result and enqueues `load` (+
+/// conditional `loadend`) through the terminal path. A source failure
+/// enqueues `error` (+ conditional `loadend`) with the mapped
+/// `DOMException` and no partial result. Every terminal path releases
+/// exactly one quota slot; stale jobs release none.
 ///
 /// Reentrancy: `loadstart`, `progress`, and final-progress handlers run
 /// synchronously inside this job and may call `abort()` or start a new
 /// read. The generation is rechecked after every such dispatch and before
-/// the source read, the successor enqueue, packaging, slot release, and
-/// event emission — a stale job becomes a strict no-op at the first
-/// divergence point.
+/// the next submit, packaging, slot release, and event emission — a stale
+/// job becomes a strict no-op at the first divergence point.
+///
+/// `poll_io` calls this with the drained chunk for `operation`: `None`
+/// means no worker chunk is available yet, so the job only rechecks
+/// liveness (used by the submit-failure inline path, which never enqueues
+/// a pump job).
 fn run_pump(
     reader: &JsObject,
     generation: u64,
+    operation: u64,
     mut state: PumpState,
+    chunk: Option<crate::io::FileReaderChunkKind>,
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    // Stale pump: strict no-op (no read, no mutation, no slot, no event).
+    // Stale pump: strict no-op (no mutation, no slot, no event, no submit).
     if !generation_current(reader, generation) {
         return Ok(JsValue::undefined());
     }
-    #[cfg(feature = "fs")]
     if crate::extension::snapshot(context)
         .map(|specs| specs.shutdown.is_shutdown())
         .unwrap_or(false)
@@ -811,20 +1026,32 @@ fn run_pump(
         // Shutdown while queued: settle nothing further. The operation was
         // counted active; release its slot once without dispatching any
         // event against a possibly destroyed context.
-        release_slot(context)?;
+        if take_pending_reader(context, operation).is_some() {
+            bridge_of(context)?.unreserve(crate::io::FileIoOperationId::from_raw(operation));
+            release_slot(context)?;
+        }
         return Ok(JsValue::undefined());
     }
     let specs = crate::extension::snapshot(context)?;
     let clock = specs.config.clock.clone();
     let now = clock.now_unix_millis();
 
-    // Read one configured chunk: at most one `read_next()` per job, never
-    // ahead of the demand, never past an earlier queued reader. `loadstart`
-    // dispatches synchronously inside this job (still within the task
-    // source, never on the calling JS stack); the event carries this pump's
-    // clock tick as its time stamp.
+    // The first applied completion sends `loadstart` (still within this
+    // job, never on the calling JS stack); the event carries this pump's
+    // clock tick as its time stamp. `loadstart` fires without consuming
+    // the worker chunk: the chunk is applied only after the handler
+    // returns and the generation is rechecked, so a reentrant `abort()`
+    // still wins. When the handler replaced the generation, the drained
+    // chunk is dropped unread (it was already produced off-thread, but no
+    // Boa job consumes it and no progress/packaging observes it).
+    let mut dispatched_loadstart = false;
     if !state.loadstart_sent {
         state.loadstart_sent = true;
+        // Persist the flag before dispatch: a reentrant handler that
+        // starts a new read must not lose the new operation's own flag,
+        // and a stale return below must not drop the persisted state of
+        // a live operation.
+        store_pump_state(context, operation, state.clone_for_store());
         dispatch_event_now(
             reader,
             generation,
@@ -837,26 +1064,103 @@ fn run_pump(
         // A `loadstart` handler runs reentrantly here: it may call
         // `abort()` or start a new read (after aborting), replacing the
         // generation. The old job must then become a strict no-op before
-        // it reads from the source or mutates anything.
+        // it applies any chunk or submits anything.
         if !generation_current(reader, generation) {
             return Ok(JsValue::undefined());
         }
+        // Refresh the persisted state: the handler may have advanced the
+        // mirror `loaded` counter via `abort()` bookkeeping on a new
+        // operation — never reuse a pre-dispatch copy below.
+        if let Some(fresh) = context
+            .host_defined_mut()
+            .get_mut::<PumpStates>()
+            .and_then(|table| table.states.get(&operation))
+        {
+            state.last_progress_at = fresh.last_progress_at;
+            state.final_progress_sent = fresh.final_progress_sent;
+        }
+        dispatched_loadstart = true;
     }
-    match state.reader_core.read_next() {
-        Err(error) => fail_operation(reader, generation, state.total, &error, context),
-        Ok(None) => finish_at_eof(reader, generation, state, now, context),
-        Ok(Some(chunk)) => {
+    if dispatched_loadstart {
+        // Browser task/microtask boundary: a promise continuation armed by
+        // the `loadstart` dispatch must run before the first chunk is
+        // applied and the read reaches a terminal state (the pinned
+        // `filereader_abort` "Aborting after read" row observes `LOADING`
+        // in its `.then()` continuation). Re-enqueue the already-drained
+        // chunk for the next job; the promise reactions queued during
+        // `loadstart` are ahead of it in the job queue.
+        if let Some(chunk) = chunk {
+            enqueue_reading_job(
+                context,
+                FileReadingJob {
+                    reader: reader.clone(),
+                    generation,
+                    operation,
+                    step: JobStep::PumpChunk {
+                        state: Box::new(state),
+                        chunk: Some(chunk),
+                    },
+                },
+            );
+        }
+        return Ok(JsValue::undefined());
+    }
+    let Some(chunk) = chunk else {
+        // No worker chunk available yet (only reachable when a submit
+        // raced a terminal transition): fail closed without submitting
+        // or settling.
+        return Ok(JsValue::undefined());
+    };
+    // A `run_jobs()`-only driver never warned the bridge: opportunistically
+    // submit the first request from inside the pump is forbidden (Boa jobs
+    // never touch the executor). The request comes only from `poll_io`
+    // (`submit_first_chunks`) or from the previous pump's exactly-one
+    // successor submit below.
+    match chunk {
+        crate::io::FileReaderChunkKind::Error(error) => {
+            fail_operation(reader, operation, generation, state.total, &error, context)
+        }
+        crate::io::FileReaderChunkKind::Eof => {
+            // The worker observed `loaded == total` at dispatch time; a
+            // concurrent `abort()` between dispatch and drain already
+            // replaced the generation above, so reaching here is a clean
+            // EOF for the live generation.
+            finish_at_eof(reader, operation, generation, state, now, context)
+        }
+        crate::io::FileReaderChunkKind::Chunk(bytes) => {
             state.loaded = state
                 .loaded
-                .saturating_add(chunk.len() as u64)
+                .saturating_add(bytes.len() as u64)
                 .min(state.total);
             match state.kind {
                 ReadKind::ArrayBuffer | ReadKind::BinaryString | ReadKind::DataUrl => {
-                    state.buffered.extend_from_slice(&chunk);
+                    state.buffered.extend_from_slice(&bytes);
                 }
                 ReadKind::Text => {
-                    let piece = state.decoder.push(&state.encoding, &chunk);
-                    state.text.push_str(&piece);
+                    let piece = match state.decoder.push(&state.encoding, &bytes) {
+                        Ok(piece) => piece,
+                        Err(error) => {
+                            return fail_operation(
+                                reader,
+                                operation,
+                                generation,
+                                state.total,
+                                &error,
+                                context,
+                            );
+                        }
+                    };
+                    if let Err(error) = crate::package::append_decoded_text(&mut state.text, &piece)
+                    {
+                        return fail_operation(
+                            reader,
+                            operation,
+                            generation,
+                            state.total,
+                            &error,
+                            context,
+                        );
+                    }
                 }
             }
             // Mirror progress into the native state for `abort()` events.
@@ -884,23 +1188,32 @@ fn run_pump(
                 // A `progress` handler runs reentrantly here with the same
                 // consequences as `loadstart` above: on generation
                 // replacement the old job emits nothing further, releases
-                // no slot, and enqueues no successor.
-                if !generation_current(reader, generation) {
+                // no slot, and submits no successor. A shutdown inside the
+                // handler keeps the generation current but forbids every
+                // further settlement: become a strict no-op instead of
+                // restoring cleared packaging state or submitting.
+                if !generation_current(reader, generation)
+                    || crate::extension::snapshot(context)
+                        .map(|specs| specs.shutdown.is_shutdown())
+                        .unwrap_or(true)
+                {
                     return Ok(JsValue::undefined());
                 }
             }
             if state.loaded >= state.total {
-                return finish_at_eof(reader, generation, state, now, context);
+                return finish_at_eof(reader, operation, generation, state, now, context);
             }
-            // Enqueue the next pump for the same operation.
-            enqueue_reading_job(
-                context,
-                FileReadingJob {
-                    reader: reader.clone(),
-                    generation,
-                    step: JobStep::Pump(state),
-                },
-            );
+            // Exactly one next request: submit the following chunk range
+            // off-thread. No readahead, no accumulation beyond `state`.
+            // When the submission races a reentrant terminal transition
+            // (abort/restart/shutdown released the reservation between the
+            // pump's liveness check and now), `submit_next_chunk` becomes
+            // a strict no-op instead of failing the operation: emitting
+            // `error` here would resurrect a dead generation with a second
+            // terminal event.
+            submit_next_chunk(reader, operation, generation, &state, context)?;
+            // Persist the packaging state for the next drained chunk.
+            store_pump_state(context, operation, state);
             Ok(JsValue::undefined())
         }
     }
@@ -919,6 +1232,7 @@ fn run_pump(
 /// enqueued.
 fn finish_at_eof(
     reader: &JsObject,
+    operation: u64,
     generation: u64,
     state: PumpState,
     now: i64,
@@ -931,6 +1245,8 @@ fn finish_at_eof(
     }
     let PumpState {
         total,
+        #[cfg(feature = "tracing")]
+        chunk_size,
         kind,
         encoding,
         media_type,
@@ -954,7 +1270,9 @@ fn finish_at_eof(
         // consequences as `loadstart`/`progress` in `run_pump`: on
         // generation replacement nothing below may publish packaging,
         // release the old slot, or emit events.
-        if !generation_current(reader, generation) {
+        if !generation_current(reader, generation)
+            || crate::extension::snapshot(context)?.shutdown.is_shutdown()
+        {
             return Ok(JsValue::undefined());
         }
     }
@@ -966,16 +1284,23 @@ fn finish_at_eof(
             FileReaderResult::BinaryString(crate::package::package_binary_string(&buffered))
         }
         ReadKind::Text => {
-            let tail = decoder.finish(&encoding);
+            let tail = match decoder.finish(&encoding) {
+                Ok(tail) => tail,
+                Err(error) => {
+                    return fail_operation(reader, operation, generation, total, &error, context);
+                }
+            };
             let mut text = text;
-            text.push_str(&tail);
+            if let Err(error) = crate::package::append_decoded_text(&mut text, &tail) {
+                return fail_operation(reader, operation, generation, total, &error, context);
+            }
             FileReaderResult::Text(text)
         }
         ReadKind::DataUrl => {
             match crate::package::package_data_url(&media_type, &buffered, data_url_limit) {
                 Ok(out) => FileReaderResult::Text(out),
                 Err(error) => {
-                    return fail_operation(reader, generation, total, &error, context);
+                    return fail_operation(reader, operation, generation, total, &error, context);
                 }
             }
         }
@@ -999,27 +1324,36 @@ fn finish_at_eof(
         native.loaded = total;
     }
     #[cfg(feature = "tracing")]
+    let chunk_count = buffered_chunk_count(total, chunk_size as u64);
+    #[cfg(feature = "tracing")]
     {
         let env = crate::extension::snapshot(context)
             .ok()
             .map(|specs| crate::observability::environment_hash_for_specs(&specs))
             .unwrap_or(0);
-        let chunks = if total == 0 { 0 } else { 1 };
+        // A `replacement`-encoding label still succeeds (every byte
+        // decodes to U+FFFD); the terminal class stays observable.
+        let class = if kind == ReadKind::Text && encoding.encoding == encoding_rs::REPLACEMENT {
+            "encoding"
+        } else {
+            "ok"
+        };
         crate::observability::emit(
             "filereader_read",
             total,
             crate::observability::elapsed_ms(trace_start),
-            chunks,
-            "ok",
+            chunk_count,
+            class,
             env,
         );
     }
-    release_slot(context)?;
+    settle_success_release(reader, operation, generation, total, context)?;
     enqueue_reading_job(
         context,
         FileReadingJob {
             reader: reader.clone(),
             generation,
+            operation,
             step: JobStep::Dispatch(DispatchState {
                 event_type: String::from("load"),
                 loaded: total,
@@ -1036,6 +1370,7 @@ fn finish_at_eof(
 /// result.
 fn fail_operation(
     reader: &JsObject,
+    operation: u64,
     generation: u64,
     total: u64,
     error: &FileApiError,
@@ -1079,12 +1414,13 @@ fn fail_operation(
             env,
         );
     }
-    release_slot(context)?;
+    settle_error_release(reader, operation, generation, context)?;
     enqueue_reading_job(
         context,
         FileReadingJob {
             reader: reader.clone(),
             generation,
+            operation,
             step: JobStep::Dispatch(DispatchState {
                 event_type: String::from("error"),
                 loaded: 0,
@@ -1158,6 +1494,7 @@ fn dispatch_event_now(
 fn run_dispatch(
     reader: &JsObject,
     generation: u64,
+    operation: u64,
     state: DispatchState,
     context: &mut Context,
 ) -> JsResult<JsValue> {
@@ -1165,7 +1502,6 @@ fn run_dispatch(
     if !generation_current(reader, generation) {
         return Ok(JsValue::undefined());
     }
-    #[cfg(feature = "fs")]
     if crate::extension::snapshot(context)
         .map(|specs| specs.shutdown.is_shutdown())
         .unwrap_or(false)
@@ -1195,7 +1531,7 @@ fn run_dispatch(
             .is_some_and(|native| {
                 native.ready_state == DONE
                     && match kind {
-                        TerminalKind::Load | TerminalKind::Abort => true,
+                        TerminalKind::Load => true,
                         TerminalKind::Error => native.error.is_some(),
                     }
             });
@@ -1249,6 +1585,7 @@ fn run_dispatch(
                 FileReadingJob {
                     reader: reader.clone(),
                     generation,
+                    operation,
                     step: JobStep::Dispatch(DispatchState {
                         event_type: String::from("loadend"),
                         loaded,
@@ -1264,6 +1601,542 @@ fn run_dispatch(
         // remaining listeners (which already ran) or the queued `loadend`.
         enqueue_listener_error(context, error.to_string());
     }
+    Ok(JsValue::undefined())
+}
+
+/// Dispatches a terminal event and the conditional `loadend` synchronously
+/// on the calling stack (File API WD §6.2.3.5 steps 5–6).
+///
+/// `abort()` fires `abort` (and then `loadend`, because the state is no
+/// longer `"loading"`) before it returns; the asynchronous pump's terminal
+/// path keeps queueing `loadend` through [`run_dispatch`]. A reentrant
+/// handler that starts a new operation suppresses the trailing `loadend`
+/// exactly like the queued path; a throwing listener is reported as a JS
+/// job error after both events ran.
+fn dispatch_terminal_now(
+    reader: &JsObject,
+    generation: u64,
+    event_type: &str,
+    loaded: u64,
+    total: u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    if !generation_current(reader, generation) {
+        return Ok(JsValue::undefined());
+    }
+    if crate::extension::snapshot(context)
+        .map(|specs| specs.shutdown.is_shutdown())
+        .unwrap_or(false)
+    {
+        return Ok(JsValue::undefined());
+    }
+    let specs = crate::extension::snapshot(context)?;
+    let time_stamp = specs.config.clock.now_unix_millis() as f64;
+    let event = dom::create_progress_event(
+        &specs,
+        event_type,
+        loaded,
+        total,
+        reader.clone(),
+        time_stamp,
+    );
+    let event_value = JsValue::from(event);
+    let listeners = reader_listeners(reader);
+    let first_error = dom::invoke_event(reader, &listeners, event_type, &event_value, context)?;
+    if let Some(mut native) = reader.downcast_mut::<FileReaderNative>()
+        && native.generation == generation
+    {
+        native.terminal_dispatched = true;
+    }
+    // Conditional `loadend`: state is DONE (not loading), so it fires unless
+    // a reentrant handler replaced the generation with a new read.
+    let mut reported = first_error;
+    if !specs.shutdown.is_shutdown() && generation_current(reader, generation) {
+        let event = dom::create_progress_event(
+            &specs,
+            "loadend",
+            loaded,
+            total,
+            reader.clone(),
+            time_stamp,
+        );
+        let event_value = JsValue::from(event);
+        let listeners = reader_listeners(reader);
+        if let Some(error) =
+            dom::invoke_event(reader, &listeners, "loadend", &event_value, context)?
+            && reported.is_none()
+        {
+            reported = Some(error);
+        }
+    }
+    if !specs.shutdown.is_shutdown()
+        && let Some(error) = reported
+    {
+        enqueue_listener_error(context, error.to_string());
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Polls one FileReader operation without a worker round-trip.
+///
+/// Compatibility entry for hosts/tests that drive only `run_jobs()`.
+/// Currently unused by production (first submits come from `start_read`
+/// and `poll_io`); kept as the documented fallback entry.
+#[allow(dead_code)]
+pub(crate) fn poll_reader_once(context: &mut Context, operation: u64) -> bool {
+    let Ok(stored) = crate::extension::snapshot(context) else {
+        return false;
+    };
+    if stored.shutdown.is_shutdown() {
+        return false;
+    }
+    let Some(generation) = context
+        .get_data::<PendingReaderOps>()
+        .and_then(|table| table.ops.get(&operation))
+        .map(|pending| pending.generation)
+    else {
+        return false;
+    };
+    // No chunk in flight yet: the persisted state exists, nothing was
+    // submitted after `loadstart`, and nothing was consumed.
+    let ready = context
+        .host_defined_mut()
+        .get_mut::<PumpStates>()
+        .and_then(|table| table.states.get(&operation))
+        .is_some_and(|state| !state.loadstart_sent && state.loaded == 0);
+    if !ready {
+        return false;
+    }
+    submit_first_chunk(&stored, operation, generation, context).is_ok()
+}
+
+/// Returns the bridge behind `context`'s registration.
+fn bridge_of(context: &Context) -> JsResult<std::sync::Arc<crate::io::IoBridge>> {
+    Ok(crate::extension::snapshot(context)?.io_bridge())
+}
+
+/// Submits the next chunk request for `operation`.
+///
+/// Exactly one request per drained chunk: `[loaded, loaded+chunk)` clamped
+/// to `total`. The worker reads only that range off-thread; no readahead
+/// and no accumulation past the returned `PumpState` happen here. A submit
+/// failure fails the operation inline through the terminal error path
+/// (quota released exactly once, no second pump enqueued).
+fn submit_next_chunk(
+    reader: &JsObject,
+    operation: u64,
+    generation: u64,
+    state: &PumpState,
+    context: &mut Context,
+) -> JsResult<()> {
+    let bridge = bridge_of(context)?;
+    let operation_id = crate::io::FileIoOperationId::from_raw(operation);
+    let Some(token) = bridge.token_for(operation_id) else {
+        // Reservation already gone (abort/restart/shutdown won the race):
+        // become a strict no-op instead of submitting.
+        return Ok(());
+    };
+    let remaining = state.total.saturating_sub(state.loaded);
+    let len = (state.chunk_size as u64).min(remaining);
+    let specs = crate::extension::snapshot(context)?;
+    let data = specs
+        .reader_payload(operation)
+        .ok_or_else(|| type_error("the FileReader operation is unavailable"))?;
+    let task = bridge.chunk_task_for(
+        operation_id,
+        token,
+        data,
+        state.limits.clone(),
+        crate::io::ChunkWindow {
+            generation,
+            offset: state.loaded,
+            len,
+        },
+    );
+    if let Err(error) = bridge.submit_reader_guarded(task) {
+        let mapped = match error {
+            crate::io::FileIoSubmitError::WorkerLost => FileApiError::Internal,
+            crate::io::FileIoSubmitError::QueueFull | crate::io::FileIoSubmitError::Shutdown => {
+                FileApiError::TooManyReads
+            }
+        };
+        fail_operation(reader, operation, generation, state.total, &mapped, context)?;
+    }
+    Ok(())
+}
+
+/// Persists the packaging state for the next drained chunk.
+fn store_pump_state(context: &mut Context, operation: u64, state: PumpState) {
+    if context.get_data::<PumpStates>().is_none() {
+        let _ = context.insert_data::<PumpStates>(PumpStates::default());
+    }
+    if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+        table.states.insert(operation, state);
+    }
+}
+
+/// Takes the persisted packaging state for `operation`.
+fn take_pump_state(context: &mut Context, operation: u64) -> Option<PumpState> {
+    context
+        .host_defined_mut()
+        .get_mut::<PumpStates>()
+        .and_then(|table| table.states.remove(&operation))
+}
+
+/// Per-context persisted FileReader packaging states, keyed by operation.
+///
+/// `PumpState` holds only Rust data (bytes/text/decoder/limits); the
+/// reader root lives in `PendingReaderOps`. Both tables are dropped
+/// together at terminal settlement, abort, or shutdown drain.
+#[derive(Default)]
+struct PumpStates {
+    states: std::collections::HashMap<u64, PumpState>,
+}
+
+/// Settles one drained FileReader chunk completion from `poll_io`.
+///
+/// Boa thread only. Validates the pending root first: a completion for an
+/// unknown operation (abort/restart/shutdown already removed it) or a
+/// generation mismatch is dropped as stale with no JS mutation, no event,
+/// no telemetry, and no second quota release. Otherwise applies the chunk
+/// through one pump Boa job (which may submit exactly one next chunk
+/// request) and returns `1` when a job was enqueued.
+pub(crate) fn settle_reader_completion(
+    stored: &crate::extension::RegisteredSpecs,
+    completion: crate::io::FileReaderChunkCompletion,
+    context: &mut Context,
+) -> JsResult<usize> {
+    let operation = completion.operation_id().get();
+    let generation = completion.generation();
+    let kind = completion.into_kind();
+    let Some(pending) = context
+        .get_data::<PendingReaderOps>()
+        .and_then(|table| table.ops.get(&operation))
+    else {
+        // Unknown operation: abort/restart/shutdown already released the
+        // slot. Strict no-op.
+        return Ok(0);
+    };
+    if pending.generation != generation {
+        return Ok(0);
+    }
+    if stored.shutdown.is_shutdown() {
+        return Ok(0);
+    }
+    let reader = pending.reader.clone();
+    if !generation_current(&reader, generation) {
+        return Ok(0);
+    }
+    let Some(state) = take_pump_state(context, operation) else {
+        return Ok(0);
+    };
+    // Route the chunk through the single pump entry; it owns packaging,
+    // progress, reentrancy, and the exactly-one-next-submit rule.
+    enqueue_reading_job(
+        context,
+        FileReadingJob {
+            reader: reader.clone(),
+            generation,
+            operation,
+            step: JobStep::PumpChunk {
+                state: Box::new(state),
+                chunk: Some(kind),
+            },
+        },
+    );
+    Ok(1)
+}
+
+/// Submits first chunk requests for every live operation without one.
+///
+/// Kept as the documented lazy-submit entry: the eager first submit in
+/// `start_read` made it dead, but the operation model names it. The pump
+/// applies drained chunks after `loadstart` rechecks the generation, so a
+/// reentrant `loadstart`-time `abort()` still drops the chunk unread.
+#[allow(dead_code)]
+pub(crate) fn submit_first_chunks(
+    stored: &crate::extension::RegisteredSpecs,
+    context: &mut Context,
+) {
+    let pending: Vec<(u64, u64)> = context
+        .get_data::<PendingReaderOps>()
+        .map(|table| {
+            table
+                .ops
+                .iter()
+                .map(|(operation, pending)| (*operation, pending.generation))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (operation, generation) in pending {
+        let _ = submit_first_chunk(stored, operation, generation, context);
+    }
+}
+
+/// Submits the first chunk request of one operation.
+///
+/// Extracted so the batch entry above stays a small loop: liveness,
+/// reservation, payload, and submit-failure handling live here.
+fn submit_first_chunk(
+    stored: &crate::extension::RegisteredSpecs,
+    operation: u64,
+    generation: u64,
+    context: &mut Context,
+) -> JsResult<()> {
+    let bridge = stored.io_bridge();
+    let operation_id = crate::io::FileIoOperationId::from_raw(operation);
+    let Some(token) = bridge.token_for(operation_id) else {
+        return Ok(());
+    };
+    let snapshot = context
+        .host_defined_mut()
+        .get_mut::<PumpStates>()
+        .and_then(|table| table.states.get(&operation))
+        .map(|state| {
+            (
+                state.total,
+                state.chunk_size,
+                state.limits.clone(),
+                state.loadstart_sent,
+                state.loaded,
+            )
+        });
+    let Some((total, chunk_size, limits, loadstart_sent, loaded)) = snapshot else {
+        return Ok(());
+    };
+    if loadstart_sent || loaded != 0 {
+        return Ok(());
+    }
+    let reader = context
+        .get_data::<PendingReaderOps>()
+        .and_then(|table| table.ops.get(&operation))
+        .map(|pending| pending.reader.clone());
+    let Some(reader) = reader else {
+        return Ok(());
+    };
+    if !generation_current(&reader, generation) {
+        return Ok(());
+    }
+    let Some(data) = stored.reader_payload(operation) else {
+        return Ok(());
+    };
+    let len = (chunk_size as u64).min(total);
+    let task = bridge.chunk_task_for(
+        operation_id,
+        token,
+        data,
+        limits,
+        crate::io::ChunkWindow {
+            generation,
+            offset: 0,
+            len,
+        },
+    );
+    if let Err(error) = bridge.submit_reader_guarded(task) {
+        let mapped = match error {
+            crate::io::FileIoSubmitError::WorkerLost => FileApiError::Internal,
+            crate::io::FileIoSubmitError::QueueFull | crate::io::FileIoSubmitError::Shutdown => {
+                FileApiError::TooManyReads
+            }
+        };
+        // Reservation is live (we hold no other reference): release it
+        // exactly once, then run the terminal error path inline.
+        bridge.unreserve(operation_id);
+        stored.drop_reader_payload(operation);
+        remove_pending_reader(context, operation);
+        if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+            table.states.remove(&operation);
+        }
+        release_slot(context)?;
+        fail_operation_no_release(&reader, generation, total, &mapped, context)?;
+    }
+    Ok(())
+}
+
+/// Drops the pending root and packaging state for `operation`.
+///
+/// Shutdown path: called from `poll_io` after the bridge reservation is
+/// released, so the quota accounting stays exactly-once and no late pump
+/// can settle.
+pub(crate) fn drop_pending_for_shutdown(context: &mut Context, operation: u64) {
+    remove_pending_reader(context, operation);
+    if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+        table.states.remove(&operation);
+    }
+    let _ = queue_mut(context).map(|queue| {
+        queue.active = queue.active.saturating_sub(1);
+    });
+}
+
+/// Drops every live FileReader root, payload and packaging state.
+///
+/// Shutdown path (M9-D-R2): called once from `shutdown_runtime` so the
+/// context tables return to baseline together with the bridge quota.
+/// Quota itself releases through the bridge shutdown closer; this drain
+/// only removes the Boa-side roots. Idempotent: an empty table is a
+/// no-op.
+pub(crate) fn drop_all_reader_state_for_shutdown(context: &mut Context) {
+    if let Some(table) = context.host_defined_mut().get_mut::<PendingReaderOps>() {
+        table.ops.clear();
+    }
+    if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+        table.states.clear();
+    }
+    if let Some(holder) = context.host_defined_mut().get_mut::<QueueHolder>() {
+        holder.queue.active = 0;
+    }
+    if let Ok(specs) = crate::extension::snapshot(context)
+        && let Ok(mut payloads) = specs.reader_payloads.lock()
+    {
+        payloads.clear();
+    }
+}
+
+/// Releases the quota slot after a successful terminal settlement.
+fn settle_success_release(
+    reader: &JsObject,
+    operation: u64,
+    generation: u64,
+    total: u64,
+    context: &mut Context,
+) -> JsResult<()> {
+    let _ = (reader, generation, total);
+    if take_pending_reader(context, operation).is_some() {
+        let bridge = bridge_of(context)?;
+        bridge.unreserve(crate::io::FileIoOperationId::from_raw(operation));
+        release_slot(context)?;
+        if let Ok(specs) = crate::extension::snapshot(context) {
+            specs.drop_reader_payload(operation);
+        }
+    }
+    if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+        table.states.remove(&operation);
+    }
+    Ok(())
+}
+
+/// Releases the quota slot after a terminal error settlement.
+fn settle_error_release(
+    reader: &JsObject,
+    operation: u64,
+    generation: u64,
+    context: &mut Context,
+) -> JsResult<()> {
+    let _ = (reader, generation);
+    if take_pending_reader(context, operation).is_some() {
+        let bridge = bridge_of(context)?;
+        bridge.unreserve(crate::io::FileIoOperationId::from_raw(operation));
+        release_slot(context)?;
+        if let Ok(specs) = crate::extension::snapshot(context) {
+            specs.drop_reader_payload(operation);
+        }
+    }
+    if let Some(table) = context.host_defined_mut().get_mut::<PumpStates>() {
+        table.states.remove(&operation);
+    }
+    Ok(())
+}
+
+/// Computes the telemetry chunk count for a successful read.
+///
+/// Counts whole chunks (`total.div_ceil(chunk_size)`); empty reads report
+/// `0`. The count is informational only, never part of settlement.
+#[cfg(feature = "tracing")]
+fn buffered_chunk_count(total: u64, chunk_size: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let size = chunk_size.max(1);
+    total.div_ceil(size)
+}
+
+/// Terminal error path for a submit failure at `readAs*` time.
+///
+/// Kept as the documented inline entry: the lazy first-submit path in
+/// `poll_io` releases the reservation itself and reuses
+/// `fail_operation_no_release`, so this wrapper stays as the explicit
+/// reference the operation model names.
+#[allow(dead_code)]
+fn fail_operation_inline(
+    reader: &JsObject,
+    operation: crate::io::FileIoOperationId,
+    generation: u64,
+    total: u64,
+    error: &FileApiError,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    // The reservation is already released by the caller; only the mirror
+    // counter and the pending root need cleanup before the error dispatch.
+    remove_pending_reader(context, operation.get());
+    release_slot(context)?;
+    // Reuse the settled error path without touching the bridge again.
+    fail_operation_no_release(reader, generation, total, error, context)
+}
+
+/// Error terminal path that never touches the bridge reservation.
+///
+/// Used exactly once: the submit-failure inline path, where the caller
+/// already released the reservation. Every other terminal path goes
+/// through `fail_operation` (bridge + mirror release).
+fn fail_operation_no_release(
+    reader: &JsObject,
+    generation: u64,
+    total: u64,
+    error: &FileApiError,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    #[cfg(feature = "tracing")]
+    let trace_start = crate::observability::now();
+    if !generation_current(reader, generation) {
+        return Ok(JsValue::undefined());
+    }
+    #[cfg(feature = "tracing")]
+    let trace_class = crate::observability::result_class_for_core(Some(error));
+    let (name, message) = dom::map_core_error(error);
+    {
+        let mut native = reader
+            .downcast_mut::<FileReaderNative>()
+            .ok_or_else(|| type_error("illegal invocation: expected a FileReader"))?;
+        if native.generation != generation {
+            return Ok(JsValue::undefined());
+        }
+        native.ready_state = DONE;
+        native.result = None;
+        native.error = Some(ErrorParts {
+            name: name.to_owned(),
+            message: message.to_owned(),
+        });
+        native.terminal_dispatched = false;
+    }
+    #[cfg(feature = "tracing")]
+    {
+        let env = crate::extension::snapshot(context)
+            .ok()
+            .map(|specs| crate::observability::environment_hash_for_specs(&specs))
+            .unwrap_or(0);
+        crate::observability::emit(
+            "filereader_read",
+            total,
+            crate::observability::elapsed_ms(trace_start),
+            0,
+            trace_class,
+            env,
+        );
+    }
+    enqueue_reading_job(
+        context,
+        FileReadingJob {
+            reader: reader.clone(),
+            generation,
+            operation: u64::MAX,
+            step: JobStep::Dispatch(DispatchState {
+                event_type: String::from("error"),
+                loaded: 0,
+                total,
+                terminal: Some(TerminalKind::Error),
+            }),
+        },
+    );
     Ok(JsValue::undefined())
 }
 
@@ -1500,6 +2373,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A source that counts `read_range` calls and serves exact bytes.
+    ///
+    /// Counts worker `read_range` invocations (M9-C workers are the only
+    /// source readers): the `loadstart`-abort tests assert the drained
+    /// chunk is dropped unread by the Boa job, while the M9-C behavioral
+    /// guard (`m9_filereader_io`) proves no *Boa job* performs the
+    /// blocking read.
     struct CountingSource {
         data: bytes::Bytes,
         reads: Arc<AtomicUsize>,
@@ -1697,9 +2576,35 @@ mod tests {
     }
 
     /// Drives jobs to quiescence.
+    ///
+    /// M9-C host loop for unit tests: `poll_io` drains worker chunks into
+    /// pump jobs, then `run_jobs` delivers them. The default threaded
+    /// executor runs separately, so the loop repeats until quiescent.
+    /// `poll_io` is strictly non-blocking: the loop spins the host-side
+    /// drain (no sleep, no yield) while I/O is still outstanding.
     fn drain(context: &mut Context) {
-        context.run_jobs().expect("run_jobs");
-        context.run_jobs().expect("run_jobs");
+        let handle = crate::extension::snapshot(context)
+            .expect("registered")
+            .test_handle();
+        for _ in 0..200 {
+            let settled = handle.poll_io(context).unwrap_or(0);
+            context.run_jobs().expect("run_jobs");
+            if settled == 0 && !handle.has_pending_io() {
+                context.run_jobs().expect("run_jobs");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+            if handle.has_pending_io() {
+                for _ in 0..50 {
+                    let _ = handle.poll_io(context);
+                    context.run_jobs().expect("run_jobs");
+                    if !handle.has_pending_io() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Builds a `BlobData` over `source` with the default limits.
@@ -1787,8 +2692,12 @@ mod tests {
 
     #[test]
     fn loadstart_abort_performs_no_source_read() {
-        // A `loadstart` handler aborts synchronously: the old pump must
-        // become a strict no-op before its first source read.
+        // A `loadstart` handler aborts synchronously: the drained worker
+        // chunk is dropped unread by the Boa job (no progress, no
+        // packaging, no further submit). The worker itself already
+        // produced the first chunk off-thread — that is the M9-C design
+        // (no Boa job reads the source); the assertion below counts the
+        // worker call that the pump refused to consume.
         let reads = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(CountingSource {
             data: bytes::Bytes::copy_from_slice(b"abc"),
@@ -1814,20 +2723,318 @@ mod tests {
         drain(context);
         assert_eq!(
             reads.load(Ordering::SeqCst),
-            0,
-            "stale pump must not read from the source"
+            1,
+            "worker produced the first chunk off-thread; the stale pump must drop it unread"
         );
         assert_eq!(js_log(context), "loadstart|abort|loadend");
         assert_eq!(js_state(context), "2:null:null");
         assert_quota_recovered(context);
     }
 
+    fn install_shutdown_callback(context: &mut Context) {
+        let callback = boa_engine::object::FunctionObjectBuilder::new(
+            context.realm(),
+            boa_engine::NativeFunction::from_fn_ptr(|_, _, context| {
+                let handle = crate::extension::snapshot(context)?.test_handle();
+                handle.shutdown(context).expect("shutdown callback");
+                Ok(JsValue::undefined())
+            }),
+        )
+        .build();
+        context
+            .register_global_property(
+                js_string!("shutdownRuntime"),
+                callback,
+                boa_engine::property::Attribute::all(),
+            )
+            .expect("publish shutdown callback");
+    }
+
+    #[test]
+    fn shutdown_in_abort_handler_suppresses_loadend_and_listener_error() {
+        for throws in [false, true] {
+            let mut context = setup_with_limits(quota_one_limits());
+            install_shutdown_callback(&mut context);
+            context
+                .eval(Source::from_bytes(&format!(
+                    "globalThis.log = []; globalThis.reader = new FileReader();
+                     reader.onabort = () => {{ log.push('abort'); shutdownRuntime();
+                         if ({throws}) throw new Error('listener failure'); }};
+                     reader.onloadend = () => log.push('loadend');
+                     reader.readAsText(new Blob(['pending'])); reader.abort();
+                     log.push('returned');"
+                )))
+                .expect("abort returns normally");
+            assert_eq!(js_log(&mut context), "abort|returned");
+            context
+                .run_jobs()
+                .expect("no listener error after shutdown");
+            assert_eq!(js_log(&mut context), "abort|returned");
+        }
+    }
+
+    #[test]
+    fn shutdown_in_progress_handler_keeps_state_cleared() {
+        let mut context = setup_with_limits(quota_one_limits());
+        install_shutdown_callback(&mut context);
+        let specs = crate::extension::snapshot(&context).expect("registered");
+        let handle = specs.test_handle();
+        context
+            .eval(Source::from_bytes(
+                "globalThis.log = []; globalThis.reader = new FileReader();
+                 reader.onprogress = () => { log.push('progress'); shutdownRuntime(); };
+                 for (const type of ['load', 'loadend', 'error', 'abort'])
+                     reader.addEventListener(type, () => log.push(type));
+                 reader.readAsText(new Blob([new Uint8Array(200000)]));",
+            ))
+            .expect("start read");
+        let (operation, reader, generation) = context
+            .get_data::<PendingReaderOps>()
+            .expect("roots")
+            .ops
+            .iter()
+            .map(|(id, pending)| (*id, pending.reader.clone(), pending.generation))
+            .next()
+            .expect("pending read");
+        let state = take_pump_state(&mut context, operation).expect("pump state");
+        run_pump(
+            &reader,
+            generation,
+            operation,
+            state,
+            Some(crate::io::FileReaderChunkKind::Chunk(bytes::Bytes::from(
+                vec![0x41; 100_000],
+            ))),
+            &mut context,
+        )
+        .expect("loadstart defers the chunk");
+        assert_eq!(js_log(&mut context), "");
+        context.run_jobs().expect("deferred chunk job");
+        assert_eq!(js_log(&mut context), "progress");
+        context.run_jobs().expect("run_jobs");
+        assert!(
+            context
+                .get_data::<PendingReaderOps>()
+                .expect("roots")
+                .ops
+                .is_empty()
+        );
+        assert!(
+            context
+                .get_data::<PumpStates>()
+                .expect("states")
+                .states
+                .is_empty()
+        );
+        assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+        assert_eq!(active_count(&context), 0);
+        assert!(!handle.has_pending_io());
+        assert_eq!(handle.poll_io(&mut context).expect("late poll"), 0);
+    }
+
+    #[test]
+    fn shutdown_in_final_progress_preserves_loading_and_null_result() {
+        for method in [
+            "readAsText",
+            "readAsArrayBuffer",
+            "readAsBinaryString",
+            "readAsDataURL",
+        ] {
+            for bytes in [&b""[..], &b"data"[..]] {
+                let mut context = setup_with_limits(quota_one_limits());
+                install_shutdown_callback(&mut context);
+                let specs = crate::extension::snapshot(&context).expect("registered");
+                let handle = specs.test_handle();
+                context
+                    .eval(Source::from_bytes(&format!(
+                        "globalThis.log = []; globalThis.reader = new FileReader();
+                     reader.onprogress = event => {{
+                         if (event.loaded !== event.total) throw new Error('not final');
+                         log.push('progress'); shutdownRuntime();
+                     }};
+                     for (const type of ['load', 'loadend', 'error', 'abort'])
+                         reader.addEventListener(type, () => log.push(type));
+                     reader.{method}(new Blob([new Uint8Array({})]));",
+                        bytes.len()
+                    )))
+                    .expect("start read");
+                let (operation, reader, generation) = context
+                    .get_data::<PendingReaderOps>()
+                    .expect("roots")
+                    .ops
+                    .iter()
+                    .map(|(id, pending)| (*id, pending.reader.clone(), pending.generation))
+                    .next()
+                    .expect("pending read");
+                let state = take_pump_state(&mut context, operation).expect("pump state");
+                let chunk = if bytes.is_empty() {
+                    crate::io::FileReaderChunkKind::Eof
+                } else {
+                    crate::io::FileReaderChunkKind::Chunk(bytes::Bytes::copy_from_slice(bytes))
+                };
+                run_pump(
+                    &reader,
+                    generation,
+                    operation,
+                    state,
+                    Some(chunk),
+                    &mut context,
+                )
+                .expect("loadstart");
+                context.run_jobs().expect("final progress");
+                assert_eq!(js_log(&mut context), "progress");
+                assert_eq!(
+                    js_state(&mut context),
+                    "1:null:null",
+                    "{method}, {} bytes",
+                    bytes.len()
+                );
+                assert!(
+                    context
+                        .get_data::<PendingReaderOps>()
+                        .expect("roots")
+                        .ops
+                        .is_empty()
+                );
+                assert!(
+                    context
+                        .get_data::<PumpStates>()
+                        .expect("states")
+                        .states
+                        .is_empty()
+                );
+                assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+                assert_eq!(active_count(&context), 0);
+                assert!(!handle.has_pending_io());
+                assert_eq!(handle.poll_io(&mut context).expect("late poll"), 0);
+                context.run_jobs().expect("late jobs");
+                assert_eq!(js_state(&mut context), "1:null:null");
+                assert_eq!(js_log(&mut context), "progress");
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_at_loadstart_boundary_drops_deferred_reader_state() {
+        for deferred in [false, true] {
+            let mut context = setup_with_limits(quota_one_limits());
+            install_shutdown_callback(&mut context);
+            let specs = crate::extension::snapshot(&context).expect("registered");
+            let handle = specs.test_handle();
+            context
+                .eval(Source::from_bytes(&format!(
+                    "globalThis.log = []; globalThis.reader = new FileReader();
+                     reader.onloadstart = () => {{ log.push('loadstart');
+                         if ({deferred}) Promise.resolve().then(shutdownRuntime);
+                         else shutdownRuntime(); }};
+                     for (const type of ['progress', 'load', 'loadend', 'error', 'abort'])
+                         reader.addEventListener(type, () => log.push(type));
+                     reader.readAsText(new Blob(['pending']));"
+                )))
+                .expect("start read");
+            let (operation, reader, generation) = context
+                .get_data::<PendingReaderOps>()
+                .expect("roots")
+                .ops
+                .iter()
+                .map(|(id, pending)| (*id, pending.reader.clone(), pending.generation))
+                .next()
+                .expect("pending read");
+            let state = take_pump_state(&mut context, operation).expect("pump state");
+            run_pump(
+                &reader,
+                generation,
+                operation,
+                state,
+                Some(crate::io::FileReaderChunkKind::Chunk(
+                    bytes::Bytes::from_static(b"pending"),
+                )),
+                &mut context,
+            )
+            .expect("loadstart");
+            context.run_jobs().expect("deferred chunk");
+            assert_eq!(js_log(&mut context), "loadstart");
+            assert!(
+                context
+                    .get_data::<PendingReaderOps>()
+                    .expect("roots")
+                    .ops
+                    .is_empty()
+            );
+            assert!(
+                context
+                    .get_data::<PumpStates>()
+                    .expect("states")
+                    .states
+                    .is_empty()
+            );
+            assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+            assert_eq!(active_count(&context), 0);
+            assert!(!handle.has_pending_io());
+            assert_eq!(handle.poll_io(&mut context).expect("late poll"), 0);
+        }
+    }
+
+    #[test]
+    fn shutdown_drops_all_reader_state() {
+        let mut context = setup_with_limits(quota_one_limits());
+        let specs = crate::extension::snapshot(&context).expect("registered");
+        let handle = specs.test_handle();
+        context
+            .eval(Source::from_bytes(
+                "globalThis.reader = new FileReader(); reader.readAsText(new Blob(['pending']));",
+            ))
+            .expect("start read");
+        assert_eq!(
+            context
+                .get_data::<PendingReaderOps>()
+                .expect("roots")
+                .ops
+                .len(),
+            1
+        );
+        assert_eq!(
+            context
+                .get_data::<PumpStates>()
+                .expect("states")
+                .states
+                .len(),
+            1
+        );
+        assert_eq!(specs.reader_payloads.lock().expect("payloads").len(), 1);
+        assert_eq!(active_count(&context), 1);
+        for _ in 0..2 {
+            handle.shutdown(&mut context).expect("shutdown");
+            assert!(
+                context
+                    .get_data::<PendingReaderOps>()
+                    .expect("roots")
+                    .ops
+                    .is_empty()
+            );
+            assert!(
+                context
+                    .get_data::<PumpStates>()
+                    .expect("states")
+                    .states
+                    .is_empty()
+            );
+            assert!(specs.reader_payloads.lock().expect("payloads").is_empty());
+            assert_eq!(active_count(&context), 0);
+            assert!(!handle.has_pending_io());
+        }
+        context.run_jobs().expect("late jobs");
+        assert_eq!(active_count(&context), 0);
+    }
+
     #[test]
     fn loadstart_abort_then_restart_emits_only_new_operation() {
-        // `loadstart` handler aborts and immediately starts a new read: the
-        // old abort dispatch is stale (generation replaced before delivery)
-        // and emits nothing; only the new operation's events follow, and the
-        // old source is never read.
+        // `loadstart` handler aborts and immediately starts a new read:
+        // `abort()` dispatches its `abort`+`loadend` synchronously
+        // (WD §6.2.3.5) before the handler starts the new operation; the
+        // old operation's later pump jobs are stale and emit nothing. Only
+        // the new operation's `loadstart|progress|load|loadend` follow. The
+        // old worker chunk is dropped unread by the Boa job.
         let reads = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(CountingSource {
             data: bytes::Bytes::copy_from_slice(b"old"),
@@ -1860,13 +3067,13 @@ mod tests {
         drain(context);
         assert_eq!(
             reads.load(Ordering::SeqCst),
-            0,
-            "stale pump must not read from the source"
+            1,
+            "old worker produced one chunk off-thread; the stale pump drops it unread"
         );
         assert_eq!(
             js_log(context),
-            "loadstart|loadstart|progress|load|loadend",
-            "old abort/loadend are stale and emit nothing"
+            "loadstart|abort|loadend|loadstart|progress|load|loadend",
+            "synchronous abort pair precedes the restarted operation"
         );
         let result = context
             .eval(Source::from_bytes("reader.result"))
@@ -1881,8 +3088,12 @@ mod tests {
     #[test]
     fn progress_abort_freezes_source_reads() {
         // Multichunk blob (3 x 16 KiB): aborting in the first progress
-        // handler must freeze source reads at exactly one chunk and emit
-        // no further events for the old generation.
+        // handler submits no further chunk request and emits no further
+        // events for the old generation. The worker produced exactly the
+        // first chunk off-thread; the second `read_range` below comes from
+        // the quota-recovery follow-up read (`assert_quota_recovered`
+        // drains a fresh one-chunk memory read), not from the aborted
+        // operation. The JS log pins the freeze: no second `progress`.
         let reads = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(CountingSource {
             data: bytes::Bytes::from(vec![7u8; 3 * 16384]),
@@ -1910,10 +3121,14 @@ mod tests {
             .expect("start read");
         drain(context);
         drain(context);
+        // Exactly the first chunk was produced off-thread; the aborting
+        // progress handler submitted nothing further (the JS log has no
+        // second `progress`). The count below is read before any
+        // quota-recovery follow-up, so it pins the freeze exactly.
         assert_eq!(
             reads.load(Ordering::SeqCst),
             1,
-            "no chunk may be read after the aborting progress handler"
+            "no chunk may be produced after the aborting progress handler"
         );
         assert_eq!(
             js_log(context),

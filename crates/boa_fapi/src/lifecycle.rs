@@ -131,10 +131,24 @@ impl ShutdownFlag {
 /// tracked closers fire at most once in total. New reads,
 /// materializations, stream pulls, and FileReader jobs observe the closed
 /// state and settle nothing after it.
+///
+/// Stream bookkeeping (M9-D-R2): shutdown also drains every live stream
+/// op root, its stored payload and its pending resolvers through the
+/// context tables, so the (active, payload, ops) triple returns to
+/// baseline. Quota itself releases through the bridge shutdown closer
+/// (bulk, exactly once); this drain only removes the Boa-side roots so a
+/// late worker completion finds an unknown operation and stays a strict
+/// no-op. Failures to borrow the tables (e.g. poisoned host state) leave
+/// the roots in place: shutdown still forbids every late settlement, so
+/// the outcome stays fail-closed.
 pub(crate) fn shutdown_runtime(
     flag: &ShutdownFlag,
-    _context: &mut Context,
+    context: &mut Context,
 ) -> Result<(), crate::error::RegisterError> {
     flag.close();
+    #[cfg(feature = "streams-shim")]
+    crate::streams::drop_all_stream_state_for_shutdown(context);
+    #[cfg(feature = "dom-shim")]
+    crate::filereader::drop_all_reader_state_for_shutdown(context);
     Ok(())
 }

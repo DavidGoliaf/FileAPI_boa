@@ -54,20 +54,20 @@ impl Clock for StepClock {
 const FIXED_TIME: i64 = 1_700_000_000_000;
 
 /// Creates a clean context with the extension registered (default limits).
-fn setup() -> Context {
+fn setup() -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a context whose injected clock walks `schedule` on every read.
-fn setup_with_clock(schedule: Vec<i64>) -> Context {
+fn setup_with_clock(schedule: Vec<i64>) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(StepClock {
             schedule,
             cursor: std::sync::atomic::AtomicUsize::new(0),
@@ -75,42 +75,42 @@ fn setup_with_clock(schedule: Vec<i64>) -> Context {
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a context with a small chunk ceiling for multichunk reads.
 ///
 /// The M3-B chunk range (`16 KiB..=1 MiB`) is the smallest observable
 /// multichunk unit through public configuration.
-fn setup_with_chunk(chunk_size: usize) -> Context {
+fn setup_with_chunk(chunk_size: usize) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     let limits = boa_fapi_core::limits::FileApiLimits {
         default_chunk_size: chunk_size,
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Creates a context with `max_data_url_output` overridden.
-fn setup_with_data_url_limit(max_data_url_output: u64) -> Context {
+fn setup_with_data_url_limit(max_data_url_output: u64) -> (Context, boa_fapi::FileApiHandle) {
     let mut context = Context::default();
     let limits = boa_fapi_core::limits::FileApiLimits {
         max_data_url_output,
         ..boa_fapi_core::limits::FileApiLimits::default()
     };
-    FileApiExtension::builder()
+    let handle = FileApiExtension::builder()
         .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
         .limits(limits)
         .build()
         .register(&mut context)
         .expect("registration failed");
-    context
+    (context, handle)
 }
 
 /// Evaluates `source` and asserts that the result is `true`.
@@ -125,14 +125,31 @@ fn assert_eval(context: &mut Context, source: &str) {
     );
 }
 
-/// Drives `context.run_jobs()` until quiescent.
-///
-/// One pass runs every queued FileReading job; the second pass settles
-/// promise reactions chained off those jobs (e.g. `then` continuations
-/// recording verdicts).
-fn drain_jobs(context: &mut Context) {
-    context.run_jobs().expect("run_jobs failed");
-    context.run_jobs().expect("run_jobs failed");
+/// Drives the M9-C host loop until quiescent (bounded).
+fn drain_jobs(context: &mut Context, handle: &boa_fapi::FileApiHandle) {
+    for _ in 0..200 {
+        let settled = handle.poll_io(context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        // The production executor completes on a worker thread. Yield before
+        // checking quiescence so this legacy threaded-fixture driver cannot
+        // exhaust its bounded host turns before that worker is scheduled.
+        std::thread::yield_now();
+        if settled == 0 && !handle.has_pending_io() {
+            context.run_jobs().expect("run_jobs failed");
+            if !handle.has_pending_io() {
+                break;
+            }
+        }
+        if handle.has_pending_io() {
+            for _ in 0..50 {
+                let _ = handle.poll_io(context);
+                context.run_jobs().expect("run_jobs failed");
+                if !handle.has_pending_io() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -141,7 +158,7 @@ fn drain_jobs(context: &mut Context) {
 
 #[test]
 fn dom_globals_have_exact_descriptors_and_prototypes() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -172,7 +189,7 @@ fn dom_globals_have_exact_descriptors_and_prototypes() {
 
 #[test]
 fn dom_constructors_have_exact_name_and_length() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -187,7 +204,7 @@ fn dom_constructors_have_exact_name_and_length() {
 
 #[test]
 fn event_target_listener_dedupe_removal_order_and_isolation() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -226,7 +243,7 @@ fn event_target_listener_dedupe_removal_order_and_isolation() {
 
 #[test]
 fn event_and_progress_event_attributes_are_exact() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -260,11 +277,11 @@ fn event_and_progress_event_attributes_are_exact() {
 
 #[test]
 fn dom_exception_names_and_error_inheritance() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
-        ['InvalidStateError', 'NotReadableError', 'AbortError', 'EncodingError',
+        ['InvalidStateError', 'NotReadableError', 'AbortError',
          'SecurityError', 'NotFoundError', 'QuotaExceededError'].every(name => {
             var e = new DOMException('m', name);
             return (e instanceof DOMException) && (e instanceof Error)
@@ -278,7 +295,7 @@ fn dom_exception_names_and_error_inheritance() {
 
 #[test]
 fn illegal_receivers_throw_type_error_synchronously() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     for source in [
         "EventTarget.prototype.addEventListener.call({}, 'x', () => {})",
         "EventTarget.prototype.dispatchEvent.call({}, new Event('x'))",
@@ -379,7 +396,7 @@ fn dom_shim_disabled_fails_before_global_mutation() {
 
 #[test]
 fn filereader_surface_descriptors_and_initial_state() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -419,7 +436,7 @@ fn filereader_surface_descriptors_and_initial_state() {
 
 #[test]
 fn filereader_constants_are_readonly() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -442,7 +459,7 @@ fn filereader_constants_are_readonly() {
 
 #[test]
 fn filereader_construction_and_receiver_brand_checks() {
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     // Direct call without `new` throws `TypeError`.
     for source in ["FileReader()", "Reflect.construct(FileReader, [], Object)"] {
         let _ = source;
@@ -496,7 +513,7 @@ fn filereader_construction_and_receiver_brand_checks() {
 
 #[test]
 fn read_as_array_buffer_is_exact_and_fresh() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -509,7 +526,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -547,7 +564,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -576,7 +593,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -591,7 +608,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         "new Uint8Array(globalThis.second)[0] === 97 && new Uint8Array(globalThis.first)[0] === 0",
@@ -600,7 +617,7 @@ fn read_as_array_buffer_is_exact_and_fresh() {
 
 #[test]
 fn read_as_binary_string_preserves_nuls_and_high_bytes() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -613,7 +630,7 @@ fn read_as_binary_string_preserves_nuls_and_high_bytes() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -629,7 +646,7 @@ fn read_as_binary_string_preserves_nuls_and_high_bytes() {
 
 #[test]
 fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     // UTF-8 default, BOM handling, replacement for malformed input.
     assert_eval(
         &mut context,
@@ -657,7 +674,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -671,7 +688,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
     // Split 2/3/4-byte sequences across chunk edges stay intact: build a
     // multichunk blob (2 × 16 KiB) with a multibyte char straddling the
     // first chunk edge.
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -690,7 +707,7 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     // 16383 ASCII + € (1 UTF-16 unit) + 'B' + the C-fill: the byte length
     // is 32768 but the string is 2 units shorter (3 bytes -> 1 unit).
     assert_eval(
@@ -715,40 +732,64 @@ fn read_as_text_utf8_bom_replacement_and_split_boundaries() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.latin === 'é'");
-    // Unknown label terminates with `EncodingError` and no partial
-    // result. The failure is fail-fast: `error` is set synchronously and
-    // the `error` event follows after jobs.
-    assert_eval(
-        &mut context,
-        r"
-        (() => {
-            globalThis.failed = null;
+    // Unknown explicit label falls through to MIME/UTF-8 (never
+    // `EncodingError`): success path with the full event sequence, the
+    // MIME charset winning when present, UTF-8 otherwise, and no partial
+    // result concerns since the read itself succeeds.
+    for (label, media, bytes, expected) in [
+        (
+            "not-an-encoding",
+            "text/plain;charset=windows-1252",
+            "[0xE9]",
+            "'é'",
+        ),
+        ("not-an-encoding", "text/plain", "[0x41]", "'A'"),
+        (
+            "not-an-encoding",
+            "text/plain;charset=bogus-charset",
+            "[0xC3, 0xA9]",
+            "'é'",
+        ),
+    ] {
+        assert_eval(
+            &mut context,
+            &format!(
+                r"
+        (() => {{
+            globalThis.failed = 'unset';
+            globalThis.events = [];
             var reader = new FileReader();
-            reader._events = [];
-            reader.onerror = function () { globalThis.failed = this.error; };
-            reader.onload = function () { globalThis.failed = 'unexpected-load'; };
-            reader.readAsText(new Blob(['abc']), 'not-an-encoding');
-            return reader.readyState === 2
-                && (reader.error instanceof DOMException)
-                && reader.error.name === 'EncodingError';
-        })()
-        ",
-    );
-    drain_jobs(&mut context);
-    assert_eval(
-        &mut context,
-        r"
-        (globalThis.failed instanceof DOMException)
-        && globalThis.failed.name === 'EncodingError'
-        ",
-    );
+            for (var type of ['loadstart', 'progress', 'load', 'error', 'loadend']) {{
+                reader.addEventListener(type, (function (t) {{
+                    return function () {{ globalThis.events.push(t); }};
+                }})(type));
+            }}
+            reader.onload = function () {{ globalThis.failed = this.result; }};
+            reader.onerror = function () {{ globalThis.failed = 'unexpected-error'; }};
+            reader.readAsText(new Blob([new Uint8Array({bytes})], {{ type: '{media}' }}), '{label}');
+            return reader.readyState === 1 && reader.error === null;
+        }})()
+        "
+            ),
+        );
+        drain_jobs(&mut context, &handle);
+        assert_eval(
+            &mut context,
+            &format!(
+                r"
+        globalThis.failed === {expected}
+        && globalThis.events.join('|') === 'loadstart|progress|load|loadend'
+        "
+            ),
+        );
+    }
 }
 
 #[test]
 fn read_as_data_url_exact_packaging() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -756,9 +797,9 @@ fn read_as_data_url_exact_packaging() {
             globalThis.urls = [];
             var cases = [
                 [new Blob(['hello'], { type: 'text/plain' }), 'data:text/plain;base64,aGVsbG8='],
-                [new Blob(['hello']), 'data:;base64,aGVsbG8='],
+                [new Blob(['hello']), 'data:application/octet-stream;base64,aGVsbG8='],
                 [new Blob([new Uint8Array([])], { type: 'text/plain' }), 'data:text/plain;base64,'],
-                [new Blob([new Uint8Array([0, 255, 16])]), 'data:;base64,AP8Q'],
+                [new Blob([new Uint8Array([0, 255, 16])]), 'data:application/octet-stream;base64,AP8Q'],
             ];
             globalThis.pending = cases.length;
             for (var [blob, _] of cases) {
@@ -774,15 +815,15 @@ fn read_as_data_url_exact_packaging() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
         globalThis.pending === 0
         && globalThis.urls[0] === 'data:text/plain;base64,aGVsbG8='
-        && globalThis.urls[1] === 'data:;base64,aGVsbG8='
+        && globalThis.urls[1] === 'data:application/octet-stream;base64,aGVsbG8='
         && globalThis.urls[2] === 'data:text/plain;base64,'
-        && globalThis.urls[3] === 'data:;base64,AP8Q'
+        && globalThis.urls[3] === 'data:application/octet-stream;base64,AP8Q'
         && globalThis.urls.every(u => u.indexOf(' ') === -1 && u.indexOf('\n') === -1)
         ",
     );
@@ -794,7 +835,7 @@ fn read_as_data_url_exact_packaging() {
 
 #[test]
 fn empty_blob_full_event_sequence_is_exact() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -818,7 +859,7 @@ fn empty_blob_full_event_sequence_is_exact() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -835,7 +876,7 @@ fn empty_blob_full_event_sequence_is_exact() {
 
 #[test]
 fn multichunk_sequence_has_final_progress_before_load() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -855,7 +896,7 @@ fn multichunk_sequence_has_final_progress_before_load() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -881,7 +922,7 @@ fn progress_throttle_uses_injected_clock() {
     // plus the final progress fire. (The fast-clock twin uses per-pump
     // +50 ms steps; exact counts are asserted on loaded values in the
     // multichunk sequence test above.)
-    let mut slow = setup_with_clock(vec![0, 0, 0, 0, 0, 0, 0, 0]);
+    let (mut slow, slow_handle) = setup_with_clock(vec![0, 0, 0, 0, 0, 0, 0, 0]);
     slow.eval(Source::from_bytes(
         "globalThis.events = []; \
          globalThis.blob = new Blob([new Uint8Array(3 * 16384)]); \
@@ -894,7 +935,7 @@ fn progress_throttle_uses_injected_clock() {
          globalThis.reader.readAsArrayBuffer(globalThis.blob);",
     ))
     .expect("setup eval");
-    drain_jobs(&mut slow);
+    drain_jobs(&mut slow, &slow_handle);
     slow.eval(Source::from_bytes(
         "globalThis.count = globalThis.events.filter(t => t === 'progress').length;",
     ))
@@ -911,7 +952,7 @@ fn progress_throttle_uses_injected_clock() {
     // Slow-chunk exception: one progress per chunk when chunks arrive less
     // often than 50 ms. A single-chunk blob always emits exactly its final
     // progress even with a frozen clock.
-    let mut single = setup_with_clock(vec![0]);
+    let (mut single, single_handle) = setup_with_clock(vec![0]);
     single
         .eval(Source::from_bytes(
             "globalThis.single = []; \
@@ -920,7 +961,7 @@ fn progress_throttle_uses_injected_clock() {
              globalThis.reader.readAsText(new Blob(['hi']));",
         ))
         .expect("setup eval");
-    drain_jobs(&mut single);
+    drain_jobs(&mut single, &single_handle);
     assert_eval(&mut single, "globalThis.single.join(',') === '2'");
 }
 
@@ -930,7 +971,7 @@ fn progress_throttle_uses_injected_clock() {
 
 #[test]
 fn second_read_while_loading_throws_invalid_state() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -952,7 +993,7 @@ fn second_read_while_loading_throws_invalid_state() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         "globalThis.first === 'first' && globalThis.reader.readyState === 2",
@@ -961,7 +1002,7 @@ fn second_read_while_loading_throws_invalid_state() {
 
 #[test]
 fn reentrant_load_starts_new_read_and_suppresses_old_loadend() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -985,8 +1026,8 @@ fn reentrant_load_starts_new_read_and_suppresses_old_loadend() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1002,7 +1043,7 @@ fn reentrant_load_starts_new_read_and_suppresses_old_loadend() {
 
 #[test]
 fn abort_before_first_job_emits_only_abort_loadend() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1022,13 +1063,13 @@ fn abort_before_first_job_emits_only_abort_loadend() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.log.join('|') === 'abort|loadend'");
 }
 
 #[test]
 fn abort_between_chunks_suppresses_stale_events() {
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -1050,8 +1091,8 @@ fn abort_between_chunks_suppresses_stale_events() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1065,11 +1106,19 @@ fn abort_between_chunks_suppresses_stale_events() {
 
 #[test]
 fn reentrant_error_handler_starts_new_read() {
-    // Reentrant `error` case through a public trigger (unknown encoding →
-    // `EncodingError` fail-fast): the `error` handler starts a new read.
-    // Only the old `loadend` is suppressed; the new operation completes
-    // intact with its full event sequence.
-    let mut context = setup();
+    // Reentrant `error` case through a deterministic public trigger: a
+    // Data-URL preflight failure (`QuotaExceededError`, synchronous, no
+    // slot consumed) whose `error` handler starts a new read. Only the old
+    // `loadend` is suppressed; the new operation completes intact with its
+    // full event sequence.
+    //
+    // (The quota-saturation trigger cannot serve here under M9-C: `fail_fast`
+    // dispatches before the 64 threaded filler chunks complete, so a restart
+    // from the handler would racily hit the still-full quota. Quota recovery
+    // itself is covered by `concurrent_read_quota_recovers_after_success_…`.)
+    let prefix = "data:application/octet-stream;base64,";
+    let limit = (prefix.len() + 4) as u64;
+    let (mut context, handle) = setup_with_data_url_limit(limit);
     assert_eval(
         &mut context,
         r"
@@ -1085,19 +1134,20 @@ fn reentrant_error_handler_starts_new_read() {
                     return function () { globalThis.log.push(t); };
                 })(type));
             }
-            globalThis.reader.readAsText(new Blob(['abc']), 'not-an-encoding');
-            // Fail-fast: DONE with the mapped error already synchronously.
+            // 4 bytes need prefix + 8 chars > limit: synchronous preflight
+            // failure, readyState DONE with `error` set, no load yet.
+            globalThis.reader.readAsDataURL(new Blob([new Uint8Array([1, 2, 3, 4])]));
             return globalThis.reader.readyState === 2
                 && (globalThis.reader.error instanceof DOMException);
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
-        globalThis.log.join('|') === 'error:EncodingError|loadstart|progress|load|loadend'
+        globalThis.log.join('|') === 'error:QuotaExceededError|loadstart|progress|load|loadend'
         && globalThis.reader.readyState === 2
         && globalThis.reader.result === 'recovered'
         && globalThis.reader.error === null
@@ -1110,7 +1160,7 @@ fn abort_handler_restart_after_mid_chunk_abort() {
     // Reentrant `abort` case: abort mid-operation (first progress of a
     // 3-chunk blob), then restart from the `abort` handler. The old
     // `loadend` is suppressed; the new operation completes intact.
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -1136,8 +1186,8 @@ fn abort_handler_restart_after_mid_chunk_abort() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1152,7 +1202,7 @@ fn abort_handler_restart_after_mid_chunk_abort() {
 
 #[test]
 fn abort_in_empty_or_done_state_is_silent() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1180,7 +1230,7 @@ fn abort_in_empty_or_done_state_is_silent() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1198,7 +1248,7 @@ fn abort_in_empty_or_done_state_is_silent() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.count === 0");
 }
 
@@ -1207,7 +1257,7 @@ fn stale_completion_after_new_operation_is_noop() {
     // Abort, then start a new operation from the abort handler: the stale
     // first-generation jobs must not emit progress/load/error/loadend, and
     // the new result stays intact.
-    let mut context = setup_with_chunk(16 * 1024);
+    let (mut context, handle) = setup_with_chunk(16 * 1024);
     assert_eval(
         &mut context,
         r"
@@ -1232,8 +1282,8 @@ fn stale_completion_after_new_operation_is_noop() {
         })()
         ",
     );
-    drain_jobs(&mut context);
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1247,7 +1297,7 @@ fn stale_completion_after_new_operation_is_noop() {
 
 #[test]
 fn gc_survives_queued_filereader_jobs() {
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1261,7 +1311,7 @@ fn gc_survives_queued_filereader_jobs() {
         ",
     );
     boa_gc::force_collect();
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     boa_gc::force_collect();
     assert_eval(&mut context, "globalThis.verdict === 'load:gc-alive'");
 }
@@ -1274,12 +1324,12 @@ fn gc_survives_queued_filereader_jobs() {
 fn data_url_quota_boundary() {
     // `== limit` succeeds, `+1` fails before allocation with
     // `QuotaExceededError`, no partial result, then `loadend`.
-    let prefix = "data:;base64,";
+    let prefix = "data:application/octet-stream;base64,";
     // 3 bytes -> 4 payload chars: pick a limit of prefix + 4. The
     // 4-byte blob needs prefix + 8 chars, so it fails in the synchronous
     // preflight (readyState DONE with `error` set, no load yet).
     let limit = (prefix.len() + 4) as u64;
-    let mut context = setup_with_data_url_limit(limit);
+    let (mut context, handle) = setup_with_data_url_limit(limit);
     assert_eval(
         &mut context,
         r"
@@ -1300,10 +1350,10 @@ fn data_url_quota_boundary() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
-        "typeof globalThis.ok === 'string' && globalThis.ok.indexOf('data:;base64,') === 0",
+        "typeof globalThis.ok === 'string' && globalThis.ok.indexOf('data:application/octet-stream;base64,') === 0",
     );
     assert_eval(
         &mut context,
@@ -1318,7 +1368,7 @@ fn data_url_quota_boundary() {
 fn concurrent_read_quota_recovers_after_success_error_abort() {
     // 64 active reads succeed; the 65th emits SecurityError; slots recover
     // through success, error, and abort paths.
-    let mut context = setup();
+    let (mut context, handle) = setup();
     assert_eval(
         &mut context,
         r"
@@ -1338,7 +1388,7 @@ fn concurrent_read_quota_recovers_after_success_error_abort() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(
         &mut context,
         r"
@@ -1361,7 +1411,7 @@ fn concurrent_read_quota_recovers_after_success_error_abort() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    drain_jobs(&mut context, &handle);
     assert_eval(&mut context, "globalThis.again.outcome === 'recovered'");
 }
 
@@ -1371,7 +1421,12 @@ fn concurrent_read_quota_recovers_after_success_error_abort() {
 
 #[test]
 fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
-    let mut context = setup();
+    let mut context = Context::default();
+    let handle = FileApiExtension::builder()
+        .clock(Arc::new(FixedClock { millis: FIXED_TIME }))
+        .build()
+        .register(&mut context)
+        .expect("registration failed");
     assert_eval(
         &mut context,
         r"
@@ -1390,7 +1445,30 @@ fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
         })()
         ",
     );
-    drain_jobs(&mut context);
+    // M9-B host loop: `poll_io` turns the worker completion into a Boa
+    // job, then `run_jobs` settles it. `poll_io` is strictly
+    // non-blocking, so the loop yields briefly (bounded, hang-guard only)
+    // while threaded-executor I/O is still outstanding.
+    for _ in 0..200 {
+        let settled = handle.poll_io(&mut context).unwrap_or(0);
+        context.run_jobs().expect("run_jobs failed");
+        if settled == 0 && !handle.has_pending_io() {
+            break;
+        }
+        if handle.has_pending_io() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while handle.has_pending_io() {
+                let _ = handle.poll_io(&mut context);
+                if !handle.has_pending_io() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
     assert_eval(&mut context, "globalThis.outcome === 'fulfilled:ok'");
 }
 
@@ -1399,6 +1477,9 @@ fn m3_promise_rejections_are_dom_exceptions_with_fixed_mapping() {
 // ──────────────────────────────────────────────
 
 /// Reentrant handler mode installed for a scenario.
+///
+/// (`error` never fires in the unknown-label-free corpus, so there is no
+/// `ErrorRestart` mode: every start path succeeds or aborts.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HandlerMode {
     /// No reentrant handler.
@@ -1409,8 +1490,6 @@ enum HandlerMode {
     ProgressAbort,
     /// `load` handler starts a new text read.
     LoadRestart,
-    /// `error` handler starts a new text read.
-    ErrorRestart,
     /// `abort` handler starts a new text read.
     AbortRestart,
 }
@@ -1420,18 +1499,10 @@ enum HandlerMode {
 enum Action {
     /// `readAsText(blob)` — succeeds unless LOADING (throws).
     ReadOk,
-    /// `readAsText(blob, bad-label)` — fail-fast `EncodingError`, or throws
-    /// when LOADING.
-    ReadBad,
+    /// A second successful start used for double-start coverage; behaves
+    /// exactly like `ReadOk` (throws when LOADING, starts otherwise).
+    ReadAgain,
     /// `abort()` — silent unless LOADING.
-    Abort,
-}
-
-/// Terminal kinds for the pure model queue.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TermKind {
-    Load,
-    Error,
     Abort,
 }
 
@@ -1440,17 +1511,17 @@ enum TermKind {
 enum ModelJob {
     /// One pump of a single-chunk operation.
     Pump { generation: u64 },
-    /// One terminal dispatch.
-    Term { generation: u64, kind: TermKind },
+    /// One `load` terminal dispatch (`abort` is dispatched synchronously).
+    Term { generation: u64 },
 }
 
 /// Small pure model of the single-chunk FileReader state machine.
 ///
-/// Mirrors the normative transitions only: sync guards, fail-fast encoding
-/// errors, generation replacement on `abort()`/new reads, stale-job
-/// no-ops, the single final `progress` before `load`, and conditional
-/// `loadend` suppression on reentrant replacement. It deliberately knows
-/// nothing about chunks, throttling, or packaging.
+/// Mirrors the normative transitions only: sync guards, generation
+/// replacement on `abort()`/new reads, stale-job no-ops, the single
+/// final `progress` before `load`, and conditional `loadend`
+/// suppression on reentrant replacement. It deliberately knows nothing
+/// about chunks, throttling, encodings, or packaging.
 struct PureModel {
     ready: u8,
     generation: u64,
@@ -1496,6 +1567,10 @@ impl PureModel {
         self.queue.push_back(ModelJob::Pump { generation });
     }
 
+    /// `abort()` effect: WD §6.2.3.5 fires `abort` and the conditional
+    /// `loadend` synchronously on the calling stack. A reentrant restart
+    /// handler starts a new generation, which suppresses the trailing
+    /// `loadend`.
     fn abort_effect(&mut self) {
         self.generation += 1;
         self.ready = 2;
@@ -1503,37 +1578,25 @@ impl PureModel {
         self.error = None;
         self.terminal = false;
         let generation = self.generation;
-        self.queue.push_back(ModelJob::Term {
-            generation,
-            kind: TermKind::Abort,
-        });
+        self.emit("abort");
+        self.terminal = true;
+        if !self.restarted && self.handler == HandlerMode::AbortRestart {
+            self.restarted = true;
+            self.start_ok();
+        }
+        if generation == self.generation {
+            self.emit("loadend");
+        }
     }
 
     /// Applies one synchronous driver action, recording sync throws.
     fn act(&mut self, action: Action) {
         match action {
-            Action::ReadOk => {
+            Action::ReadOk | Action::ReadAgain => {
                 if self.ready == 1 {
                     self.events.push("throw:InvalidStateError".to_owned());
                 } else {
                     self.start_ok();
-                }
-            }
-            Action::ReadBad => {
-                if self.ready == 1 {
-                    self.events.push("throw:InvalidStateError".to_owned());
-                } else {
-                    // Fail-fast `EncodingError`: DONE + queued `error`.
-                    self.generation += 1;
-                    self.ready = 2;
-                    self.result = None;
-                    self.error = Some("EncodingError".to_owned());
-                    self.terminal = false;
-                    let generation = self.generation;
-                    self.queue.push_back(ModelJob::Term {
-                        generation,
-                        kind: TermKind::Error,
-                    });
                 }
             }
             Action::Abort => {
@@ -1571,12 +1634,9 @@ impl PureModel {
                     self.result = Some("model".to_owned());
                     self.error = None;
                     let generation = self.generation;
-                    self.queue.push_back(ModelJob::Term {
-                        generation,
-                        kind: TermKind::Load,
-                    });
+                    self.queue.push_back(ModelJob::Term { generation });
                 }
-                ModelJob::Term { generation, kind } => {
+                ModelJob::Term { generation } => {
                     if generation != self.generation {
                         self.stale_jobs += 1;
                         continue;
@@ -1584,21 +1644,12 @@ impl PureModel {
                     if self.terminal {
                         continue;
                     }
-                    let name = match kind {
-                        TermKind::Load => "load",
-                        TermKind::Error => "error",
-                        TermKind::Abort => "abort",
-                    };
-                    self.emit(name);
+                    self.emit("load");
                     self.terminal = true;
                     // Restart handlers are one-shot per scenario.
-                    let restart = !self.restarted
-                        && matches!(
-                            (kind, self.handler),
-                            (TermKind::Load, HandlerMode::LoadRestart)
-                                | (TermKind::Error, HandlerMode::ErrorRestart)
-                                | (TermKind::Abort, HandlerMode::AbortRestart)
-                        );
+                    // (`error` never fires in the unknown-label-free
+                    // corpus: every start path succeeds or aborts.)
+                    let restart = !self.restarted && self.handler == HandlerMode::LoadRestart;
                     if restart {
                         self.restarted = true;
                         self.start_ok();
@@ -1641,9 +1692,6 @@ fn handler_js(mode: HandlerMode) -> &'static str {
         HandlerMode::LoadRestart => {
             "reader.addEventListener('load', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
         }
-        HandlerMode::ErrorRestart => {
-            "reader.addEventListener('error', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
-        }
         HandlerMode::AbortRestart => {
             "reader.addEventListener('abort', function () { if (!restarted) { restarted = true; this.readAsText(blob); } });"
         }
@@ -1653,11 +1701,8 @@ fn handler_js(mode: HandlerMode) -> &'static str {
 /// JavaScript snippet for one driver action (sync throws are logged).
 fn action_js(action: Action) -> &'static str {
     match action {
-        Action::ReadOk => {
+        Action::ReadOk | Action::ReadAgain => {
             "try { reader.readAsText(blob); } catch (e) { log.push('throw:' + e.name); }"
-        }
-        Action::ReadBad => {
-            "try { reader.readAsText(blob, 'not-an-encoding'); } catch (e) { log.push('throw:' + e.name); }"
         }
         Action::Abort => "reader.abort();",
     }
@@ -1666,20 +1711,20 @@ fn action_js(action: Action) -> &'static str {
 #[test]
 fn bounded_operation_sequences_match_pure_model() {
     // Bounded enumerated corpus: every phase-1 sync prefix (start,
-    // fail-fast error, abort-before-first-job, double start, error-then-ok,
-    // abort-then-ok, read-abort-read) x every phase-2 follow-up (none,
-    // abort, restart) x every reentrant handler mode. Each scenario runs
-    // real JS in a fresh Context and its observed state/event log must
-    // equal the pure model summary exactly — any divergence (extra or
-    // missing event, wrong state, leaked generation) fails the assertion.
+    // abort-before-first-job, double start, abort-then-ok,
+    // read-abort-read) x every phase-2 follow-up (none, abort, restart)
+    // x every reentrant handler mode. Each scenario runs real JS in a
+    // fresh Context and its observed state/event log must equal the pure
+    // model summary exactly — any divergence (extra or missing event,
+    // wrong state, leaked generation) fails the assertion.
     let phases: &[&[Action]] = &[
         &[],
         &[Action::ReadOk],
-        &[Action::ReadBad],
+        &[Action::ReadAgain],
         &[Action::Abort],
         &[Action::ReadOk, Action::Abort],
         &[Action::ReadOk, Action::ReadOk],
-        &[Action::ReadBad, Action::ReadOk],
+        &[Action::ReadAgain, Action::ReadOk],
         &[Action::Abort, Action::ReadOk],
         &[Action::ReadOk, Action::Abort, Action::ReadOk],
     ];
@@ -1689,13 +1734,11 @@ fn bounded_operation_sequences_match_pure_model() {
         HandlerMode::LoadstartAbort,
         HandlerMode::ProgressAbort,
         HandlerMode::LoadRestart,
-        HandlerMode::ErrorRestart,
         HandlerMode::AbortRestart,
     ];
     let mut scenarios = 0usize;
     let mut model_stale_total = 0usize;
     let mut js_saw_load = false;
-    let mut js_saw_error = false;
     let mut js_saw_abort = false;
     let mut js_saw_loadend = false;
     let mut js_saw_throw = false;
@@ -1717,7 +1760,7 @@ fn bounded_operation_sequences_match_pure_model() {
                 model_stale_total += model.stale_jobs;
                 let expected = model.summary();
                 // Real JS execution in a fresh Context.
-                let mut context = setup();
+                let (mut context, handle) = setup();
                 let mut setup_js = String::from(
                     "var reader = new FileReader(); \
                      var blob = new Blob(['model']); \
@@ -1743,7 +1786,7 @@ fn bounded_operation_sequences_match_pure_model() {
                             .eval(Source::from_bytes(&script))
                             .expect("model stage eval");
                     }
-                    drain_jobs(&mut context);
+                    drain_jobs(&mut context, &handle);
                 }
                 let observed: String = context
                     .eval(Source::from_bytes(
@@ -1767,8 +1810,6 @@ fn bounded_operation_sequences_match_pure_model() {
                 for entry in events_section.split(',') {
                     if entry.starts_with("load:") {
                         js_saw_load = true;
-                    } else if entry.starts_with("error:") {
-                        js_saw_error = true;
                     } else if entry.starts_with("abort:") {
                         js_saw_abort = true;
                     } else if entry.starts_with("loadend:") {
@@ -1783,19 +1824,22 @@ fn bounded_operation_sequences_match_pure_model() {
             }
         }
     }
-    assert_eq!(scenarios, 9 * 3 * 6, "corpus must not shrink");
-    // The corpus must really exercise every terminal kind, sync throws,
-    // generation replacement, and stale completions — otherwise the
-    // comparison above would be vacuous. Mutation probes performed during
-    // development (removing the LOADING guard, the `loadstart` generation
-    // recheck, or the conditional-`loadend` suppression) each fail at
-    // least one assertion in this file: the guard probe fails the
-    // `throw:InvalidStateError` comparison here, the recheck probe fails
+    assert_eq!(scenarios, 9 * 3 * 5, "corpus must not shrink");
+    // The corpus must really exercise load/abort terminals, sync
+    // throws, generation replacement, and stale completions — otherwise
+    // the comparison above would be vacuous. (`error` terminals stay
+    // covered by the quota/error-path suites; the unknown-label
+    // fail-fast path no longer exists.) Mutation probes performed
+    // during development (removing the LOADING guard, the `loadstart`
+    // generation recheck, or the conditional-`loadend` suppression)
+    // each fail at least one assertion in this file: the guard probe
+    // fails the `throw:InvalidStateError` comparison here, the recheck
+    // probe fails
     // `filereader::tests::loadstart_abort_performs_no_source_read`, so the
     // coverage is not fabricated.
     assert!(
-        js_saw_load && js_saw_error && js_saw_abort && js_saw_loadend,
-        "every terminal kind must be observed in JS logs"
+        js_saw_load && js_saw_abort && js_saw_loadend,
+        "load/abort terminals must be observed in JS logs"
     );
     assert!(js_saw_throw, "sync LOADING-guard throws must be observed");
     assert!(
@@ -1818,7 +1862,7 @@ fn excluded_m4b_apis_are_absent() {
     // of the M4-B sync surface, workers runtime, and full-DOM names. The
     // M6 `URL` namespace (with exactly `createObjectURL`/`revokeObjectURL`)
     // is the expected M6 addition and is pinned by the M6 suites instead.
-    let mut context = setup();
+    let (mut context, _handle) = setup();
     assert_eval(
         &mut context,
         r"
